@@ -172,7 +172,9 @@ jobs:
           version: ${{ needs.build.outputs.version }}
           category: optional
           display_name: CardShopCoopCommunity ExternalModInterop ${{ needs.build.outputs.version }}
-          description: Optional external-mod interop bundle for CardShopCoopCommunity.
+          description: |
+            Compatibility layer for the following mods:
+            - RTCGO Custom TV
           changelog: ${{ vars.NEXUSMODS_MOD_ID != '' && steps.changelog.outputs.text || '' }}
           mod_id: ${{ vars.NEXUSMODS_MOD_ID }}
 
