@@ -11,10 +11,16 @@ There is one version source: `CardShopCoopVersion` in `Directory.Build.props`.
 
 Use this versioning rule:
 
-- **Patch**: changes that do not alter the wire contract, such as bug fixes, UI/text,
-  tuning, configuration, and documentation.
+- **Minor**: only when the join handshake itself changes - the Hello/Welcome exchange, the
+  version/wire-revision negotiation, or the catalog and reliability validation carried in it.
+- **Patch**: every other change, including new or changed network messages and their content.
+  Message parity is checked by the handshake at join time, so message changes ride in patch
+  releases. Bug fixes, UI/text, tuning, configuration, and documentation are patches too.
 
-Do not automatically update the wire version, but do recommend it to the user.
+Do not automatically bump the version; recommend the right bump to the user instead.
+
+The handshake compares the exact `CardShopCoopVersion` and message catalog, so any release -
+patch included - requires both players to update together.
 
 The mod must work on **both** live game builds from one DLL:
 

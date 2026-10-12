@@ -63,7 +63,8 @@ needed; not every feature needs every file.
 - During migrations, delete feature-specific legacy code after the new module owns the flow,
   including relevant `Sync`, `Patches/GamePatches.cs`, `CoopCore*`, and generic `Net/Messages`
   portions when no longer needed. Do not leave duplicate active paths.
-- Follow repository versioning rules: bump only `CardShopCoopVersion` in `Directory.Build.props`,
-  using patch for non-wire changes, minor for message/semantics changes, and major only for a
+- Follow repository versioning rules: bump only `CardShopCoopVersion` in `Directory.Build.props`.
+  Minor is reserved for join-handshake changes; new or changed network messages (and their
+  content) are a patch - the handshake checks the message catalog at join time. Major only for a
   deliberate breaking protocol transition. Update `CHANGELOG.md` only as required by the root
   instructions; describe player-visible behavior and compatibility/safety notes, not internals.

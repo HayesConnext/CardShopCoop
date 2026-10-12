@@ -40,8 +40,9 @@ namespace CardShopCoop.Net
         public const byte CompactTokenKind = 1;
         public const int MaxMessageNameBytes = 4096;
         public const int MaxFrameSize = 64 * 1024 * 1024;
-        // Patch releases must not change the wire revision. A new message or a
-        // substantial change behind an existing message requires a minor bump.
+        // Patch releases must not change the wire revision. The wire revision changes only
+        // when the join handshake changes; new messages and payload changes ride in patches,
+        // because the handshake's catalog exchange checks message parity at join time.
         // 1.2.3 therefore becomes 102 (major * 100 + minor).
         public static readonly int WireVersion = DeriveWireVersion(CoopPlugin.Version);
         private const int DecodeWarningCooldownMs = 2000;
