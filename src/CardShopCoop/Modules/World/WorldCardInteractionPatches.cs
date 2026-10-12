@@ -25,6 +25,8 @@ namespace CardShopCoop.Modules.World
             harmony.CreateClassProcessor(typeof(ReduceCardPatch)).Patch();
             harmony.CreateClassProcessor(typeof(ReduceCardIndexPatch)).Patch();
             harmony.CreateClassProcessor(typeof(RemoveGradedCardPatch)).Patch();
+            harmony.CreateClassProcessor(typeof(BinderTakeScopePatch)).Patch();
+            harmony.CreateClassProcessor(typeof(BinderCloseTakeScopePatch)).Patch();
         }
 
         private static WorldCardInteraction Current => WorldHostBehaviour.ActiveCards
@@ -188,8 +190,17 @@ namespace CardShopCoop.Modules.World
         [HarmonyPatch(typeof(CPlayerData), "RemoveGradedCard")]
         private static class RemoveGradedCardPatch
         {
+            /// <summary>The graded inventory size before vanilla runs. RemoveGradedCard removes
+            /// at most one matching row, so a size that did not shrink means the call changed
+            /// nothing - a stale album slot whose certificate left via another player. That
+            /// matters twice: the removal must not be forwarded (there is no change to sync),
+            /// and its prediction's rollback must not restore a row the client never removed.</summary>
+            [HarmonyPrefix]
+            private static void Prefix(out int __state)
+                => __state = CPlayerData.m_GradedCardInventoryList?.Count ?? 0;
+
             [HarmonyPostfix]
-            private static void Postfix(CardData cardData)
+            private static void Postfix(CardData cardData, int __state)
             {
                 var current = Current;
                 if (current == null)
@@ -213,9 +224,18 @@ namespace CardShopCoop.Modules.World
                     return;
                 }
 
+                var removed = (CPlayerData.m_GradedCardInventoryList?.Count ?? 0) < __state;
                 if (current.IsClient)
                 {
-                    current.PredictClientGradedRemoval(cardData);
+                    current.PredictClientGradedRemoval(cardData, removed);
+                    return;
+                }
+
+                if (!removed)
+                {
+                    // The host's own slot was stale too: the game removed nothing, so there is
+                    // no change to fan out (forwarding one would consume a same-key row on a
+                    // peer's album instead).
                     return;
                 }
 
@@ -239,6 +259,36 @@ namespace CardShopCoop.Modules.World
                     current.ForwardGradedRemoval(cardData);
                 }
             }
+        }
+
+        /// <summary>The binder's open-book take (the generic branch of
+        /// <c>OnRightMouseButtonUp</c>): vanilla reduces the album first and moves the spawned card
+        /// into the hand last. The scope measures the hand before vanilla runs; the prediction
+        /// registered from the ReduceCard/RemoveGradedCard observer inside the scope is paired with
+        /// the card the hand actually gained, so a refusal can despawn exactly that object.
+        /// OnRightMouseButtonUp also drives the binder's selection screens (grading submission,
+        /// bulk donation, deck edit) - those reduce without holding a card, and their bindings stay
+        /// empty.</summary>
+        [HarmonyPatch(typeof(CollectionBinderFlipAnimCtrl), "OnRightMouseButtonUp")]
+        private static class BinderTakeScopePatch
+        {
+            [HarmonyPrefix]
+            private static void Prefix() => WorldCardInteraction.BeginBinderTake();
+
+            [HarmonyFinalizer]
+            private static void Finalizer() => WorldCardInteraction.EndBinderTake();
+        }
+
+        /// <summary>Hiding the album can also move a close-up card into the hand (vanilla
+        /// <c>HideCardAlbum</c>), with the same reduce-then-hold sequence.</summary>
+        [HarmonyPatch(typeof(CollectionBinderFlipAnimCtrl), "HideCardAlbum")]
+        private static class BinderCloseTakeScopePatch
+        {
+            [HarmonyPrefix]
+            private static void Prefix() => WorldCardInteraction.BeginBinderTake();
+
+            [HarmonyFinalizer]
+            private static void Finalizer() => WorldCardInteraction.EndBinderTake();
         }
     }
 }

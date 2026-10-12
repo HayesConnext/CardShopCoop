@@ -234,6 +234,63 @@ namespace CardShopCoop.Modules.World
             return held != null && held.Contains(card3d);
         }
 
+        /// <summary>The game's live held-card object list, or null when the controller or its
+        /// field is unavailable.</summary>
+        internal static List<InteractableCard3d> HeldCards()
+        {
+            if (HoldingCardsField == null)
+            {
+                return null;
+            }
+
+            var controller = SceneRef<InteractionPlayerController>.Get();
+            return controller == null
+                ? null : HoldingCardsField.GetValue(controller) as List<InteractableCard3d>;
+        }
+
+        /// <summary>Removes one exact held card and destroys it through the game's own teardown
+        /// (InteractionPlayerController.RemoveCurrentCard, then InteractableCard3d.OnDestroyed -
+        /// the trash-card path's sequence), for state a prediction is taking back (a refused
+        /// binder pick). The two hand lists are index-aligned AND persisted, so the card is moved
+        /// to slot 0 in both before RemoveCurrentCard runs; if they have drifted apart, refuse
+        /// rather than remove the wrong card's saved data.</summary>
+        internal static bool DespawnHeldCard(InteractableCard3d card3d)
+        {
+            if (card3d == null || !card3d)
+            {
+                return false;
+            }
+
+            var held = HeldCards();
+            var index = held?.IndexOf(card3d) ?? -1;
+            if (held == null || index < 0)
+            {
+                return false;
+            }
+
+            var heldData = CPlayerData.m_HoldCardDataList;
+            if (heldData == null || heldData.Count != held.Count)
+            {
+                CoopPlugin.Log.LogWarning("card despawn: held-card lists are out of sync (objects="
+                    + held.Count + ", data=" + (heldData?.Count ?? -1)
+                    + "); refusing to remove the card through RemoveCurrentCard.");
+                return false;
+            }
+
+            if (index != 0)
+            {
+                held.RemoveAt(index);
+                held.Insert(0, card3d);
+                var paired = heldData[index];
+                heldData.RemoveAt(index);
+                heldData.Insert(0, paired);
+            }
+
+            InteractionPlayerController.RemoveCurrentCard();
+            card3d.OnDestroyed();
+            return true;
+        }
+
         /// <summary>Moves the exact held card object back onto a display slot through the game's
         /// own hold teardown, instead of spawning a second card.</summary>
         internal static bool ReturnHeldCardToShelf(InteractableCardCompartment compartment,

@@ -1738,7 +1738,7 @@ namespace CardShopCoop.Modules.Register
             {
                 var client = _active;
                 if (client == null || !client._joined || !client._context.InGame()
-                    || !(__instance is InteractableCashierCounter counter))
+                    || __instance is not InteractableCashierCounter counter)
                 {
                     return true;
                 }

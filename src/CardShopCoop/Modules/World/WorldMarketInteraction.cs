@@ -63,8 +63,6 @@ namespace CardShopCoop.Modules.World
         // Cached EPL modded-id list (walking the EPL item dictionary + Convert.ToInt32 per key
         // was happening on every snapshot build). The registry is fixed for a session.
         private static List<int> s_eplModdedCache;
-        private static HashSet<int> s_eplModdedSet;
-        private static int s_vanillaItemTypeCount = -1;
 
         // Host: modded-expansion card-market changes (deltas), captured by the
         // AddCardPricePercentChange / SetCardGeneratedMarketPrice postfixes. EPL prefixes
@@ -90,6 +88,7 @@ namespace CardShopCoop.Modules.World
             s_dirty = false;
             InvalidateContentCache();
             s_modCardPending.Clear();
+            s_rawWriteMissLogged = false;
         }
 
         /// <summary>Invalidates the fixed EPL registry only for an explicit content, scene, or
@@ -97,8 +96,6 @@ namespace CardShopCoop.Modules.World
         internal static void InvalidateContentCache()
         {
             s_eplModdedCache = null;
-            s_eplModdedSet = null;
-            s_vanillaItemTypeCount = -1;
         }
 
         internal void Tick()
@@ -364,9 +361,9 @@ namespace CardShopCoop.Modules.World
             ReadFloatsInto(message.GeneratedGameEventPriceList, CPlayerData.m_GeneratedGameEventPriceList);
             ReadFloatsInto(message.GameEventPricePercentChangeList, CPlayerData.m_GameEventPricePercentChangeList);
             ReadFloatsInto(message.GenGradedCardPriceMultiplierList, CPlayerData.m_GenGradedCardPriceMultiplierList);
-            ReadSparseFloatsInto(message.GeneratedMarketPriceList, CPlayerData.m_GeneratedMarketPriceList, ModdedGenMarket);
-            ReadSparseFloatsInto(message.GeneratedCostPriceList, CPlayerData.m_GeneratedCostPriceList, ModdedGenCost);
-            ReadSparseFloatsInto(message.AverageItemCostList, CPlayerData.m_AverageItemCostList, ModdedAvgCost);
+            ReadSparseFloatsInto(message.GeneratedMarketPriceList, CPlayerData.m_GeneratedMarketPriceList, ModdedGenMarket, "generated market price");
+            ReadSparseFloatsInto(message.GeneratedCostPriceList, CPlayerData.m_GeneratedCostPriceList, ModdedGenCost, "generated cost price");
+            ReadSparseFloatsInto(message.AverageItemCostList, CPlayerData.m_AverageItemCostList, ModdedAvgCost, "average item cost");
             ApplyModdedCards(message.ModdedCards);
         }
 
@@ -386,8 +383,8 @@ namespace CardShopCoop.Modules.World
             {
                 if (list[i] != 0f)
                 {
-                    // the index IS a vanilla EItemType; the DTO serializes it by name like every
-                    // other enum, so this whole vanilla half is exactly what it always was
+                    // the index IS the raw-list EItemType id; the gated wire enum carries it
+                    // numerically and the client maps it back by name (CatalogIdMap)
                     out_list.Add(new MarketPercentEntry
                     {
                         ItemType = (EItemType)i,
@@ -427,18 +424,19 @@ namespace CardShopCoop.Modules.World
             }
         }
 
-        private static void ReadSparseFloatsInto(List<MarketSparseEntry> entries, List<float> list, Action<int, float> moddedWrite)
+        private static void ReadSparseFloatsInto(List<MarketSparseEntry> entries, List<float> list,
+            Action<int, float> moddedWrite, string what)
         {
             for (var k = 0; k < entries.Count; k++)
             {
                 var i = (int)entries[k].ItemType;
                 var v = entries[k].Value;
-                if (EplMarketBridge() && i >= VanillaItemTypeCount())
+                if (RoutesToEpl(i))
                 {
                     moddedWrite(i, v);
                     continue;
                 }
-                list[i] = v;
+                WriteRawItem(list, i, v, what);
             }
         }
 
@@ -463,12 +461,12 @@ namespace CardShopCoop.Modules.World
             {
                 var i = (int)entries[k].ItemType;
                 var v = entries[k].Percent / 100f;
-                if (EplMarketBridge() && i >= VanillaItemTypeCount())
+                if (RoutesToEpl(i))
                 {
                     EplSetFloat(i, s_eplPctChange, v);
                     continue;
                 }
-                list[i] = v;
+                WriteRawItem(list, i, v, "item percent change");
             }
         }
 
@@ -576,7 +574,8 @@ namespace CardShopCoop.Modules.World
 
         // EPL IL-weaves the GAME assembly's accesses to the per-item price lists
         // (generated market/cost, percent change, average cost, set price): for
-        // index >= 129 the woven Count/GetItem/SetItem serve its per-item save data
+        // index >= 130 (EItemType.Max, the weave boundary - see EplWeaveBoundary)
+        // the woven Count/GetItem/SetItem serve its per-item save data
         // instead of the list (ItemPriceListHandler). Raw List access from THIS
         // assembly is NOT woven - it sees only the vanilla rows plus shadow rows the
         // game never reads, so modded market data raw-read here never left the host
@@ -587,7 +586,7 @@ namespace CardShopCoop.Modules.World
         // GetAverageItemCost rounds and substitutes cost when out of range); average
         // cost writes ride CPlayerData.SetAverageItemCost, a clean setter whose woven
         // body IS the SetItem path. Wire indexes stay raw EItemType ints: EPL's modded ids
-        // resolve identically on every machine, unlike its alternate [129, 129+modCount)
+        // resolve identically on every machine, unlike its alternate [130, 130+modCount)
         // index space, which is ordered by the LOCALLY installed mod set and would
         // cross-assign prices between machines.
         private static bool s_eplProbed;
@@ -654,42 +653,57 @@ namespace CardShopCoop.Modules.World
         private static int VanillaWalkCount(List<float> list)
         {
             var n = list?.Count ?? 0;
-            return EplMarketBridge() ? Mathf.Min(n, VanillaItemTypeCount()) : n;
+            return EplMarketBridge() ? Mathf.Min(n, EplWeaveBoundary) : n;
         }
 
-        private static int VanillaItemTypeCount()
+        /// <summary>The first id EPL's price-list weave serves from per-item save data:
+        /// ItemPriceListHandler routes index >= 130 into its save-data surface and ItemTypeResolver
+        /// enters its modded band at the same value. 130 is EItemType.Max, one past the last
+        /// vanilla item on both supported builds, so the split is a numeric storage fact of EPL's
+        /// weave - identical on every machine, independent of which content packs are installed.
+        /// It must NOT be derived from the live item set (ItemLibrary.ItemData): the prepatcher
+        /// pins every member it has EVER minted into the enum and never prunes it (see
+        /// EplActiveEnums), while ItemData only holds currently installed packs, so subtracting
+        /// ItemData classifies a stale mint as vanilla and lifts this boundary above every active
+        /// modded id - sending modded ids into the raw list, which throws IndexOutOfRange.</summary>
+        private static int EplWeaveBoundary => (int)EItemType.Max;
+
+        /// <summary>True when this item id must be read/written through EPL's save data rather
+        /// than the raw list. The id has already been translated into this process's enum space by
+        /// the wire layer (CatalogIdMap); which STORE holds its prices is local layout that no
+        /// translator can decide, and EPL decides it numerically.</summary>
+        private static bool RoutesToEpl(int itemType)
+            => EplMarketBridge() && itemType >= EplWeaveBoundary;
+
+        // The raw list only holds rows the game itself indexes (below the weave boundary). An id
+        // that still lands beyond the list's live length - a shorter saved list, e.g. the game's
+        // 100-row pad - can only be dropped: indexing it would abort the whole snapshot for every
+        // later row with an IndexOutOfRangeException.
+        private static bool s_rawWriteMissLogged;
+
+        private static void WriteRawItem(List<float> list, int itemType, float value, string what)
         {
-            if (s_vanillaItemTypeCount >= 0)
+            if (itemType >= 0 && itemType < list.Count)
             {
-                return s_vanillaItemTypeCount;
+                list[itemType] = value;
+                return;
             }
 
-            // Vanilla ids are the defined members EPL did NOT mint. This uses EPL's own registered
-            // item set instead of a numeric "modded floor" range check.
-            var modded = EplModdedSet();
-            var max = -1;
-            foreach (EItemType value in Enum.GetValues(typeof(EItemType)))
+            if (s_rawWriteMissLogged)
             {
-                var id = (int)value;
-                if (id >= 0 && !modded.Contains(id) && id > max)
-                {
-                    max = id;
-                }
+                return;
             }
-
-            s_vanillaItemTypeCount = max + 1;
-            return s_vanillaItemTypeCount;
+            s_rawWriteMissLogged = true;
+            CoopPlugin.Log.LogWarning("[market] dropped " + what + " for item " + itemType
+                + ": the local item price list holds " + list.Count + " rows, so the id cannot be"
+                + " stored (further drops this session are not logged).");
         }
 
-        private static HashSet<int> EplModdedSet()
-        {
-            EplModdedItemTypes(); // populates s_eplModdedCache
-            return s_eplModdedSet ??= new HashSet<int>(s_eplModdedCache);
-        }
-
-        /// <summary>The raw itemType ids of EPL's modded items (ItemLibrary.ItemData keys); empty
-        /// without the bridge. These are real EItemType members EPL registered, so there is no
-        /// numeric range filter - the keys themselves are the authority.</summary>
+        /// <summary>The raw itemType ids of EPL's CURRENTLY LOADED modded items (ItemLibrary.ItemData
+        /// keys); empty without the bridge. Used to zero/track the local content that has EPL save
+        /// rows - never as an id boundary: a storage route is the weave threshold
+        /// (<see cref="EplWeaveBoundary"/>), because this set ignores stale mints the enum still
+        /// carries, and any member absent here is not evidence it is vanilla.</summary>
         private static List<int> EplModdedItemTypes()
         {
             // The EPL registry is fixed after content registration. Populate once and only
@@ -759,7 +773,8 @@ namespace CardShopCoop.Modules.World
             return vals;
         }
 
-        // modded-index writers for ReadSparseFloatsInto (bridge verified by the caller)
+        // modded-index writers consumed by ReadSparseFloatsInto after RoutesToEpl picked the
+        // save-data path
         private static void ModdedGenMarket(int itemType, float v)
         {
             EplSetFloat(itemType, s_eplGenMarket, v);
@@ -771,7 +786,7 @@ namespace CardShopCoop.Modules.World
         private static void ModdedAvgCost(int itemType, float v)
         {
             // the GAME's setter: no math in its body, and its woven form routes
-            // >= 129 into EPL save data exactly like the reflection path
+            // >= 130 (the weave boundary) into EPL save data exactly like the reflection path
             CPlayerData.SetAverageItemCost((EItemType)itemType, v);
         }
     }

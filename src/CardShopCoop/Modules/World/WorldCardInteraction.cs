@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using CardShopCoop.Net;
 using CardShopCoop.Modules.Grading;
+using CardShopCoop.Modules.Prediction;
 using CardShopCoop.Modules.SaveTransfer;
 using CardShopCoop.Runtime;
 
@@ -168,6 +169,7 @@ namespace CardShopCoop.Modules.World
                 Amount = amount,
                 Card = snapshot,
             };
+            var binding = isAdd ? null : CreateBinderTakeBinding();
             WorldPrediction.Predict(WorldPrediction.CardsScope, intent,
                 () =>
                 {
@@ -181,10 +183,14 @@ namespace CardShopCoop.Modules.World
                 },
                 () =>
                 {
-                    // Only THIS removal's own rejection returns the card; a cascade undo of a
-                    // later prediction must not clear a selection that was legitimately reserved.
+                    // Only THIS removal's own rejection returns the card and despawns its hand
+                    // object; a cascade undo of a later prediction must not clear a selection
+                    // that was legitimately reserved or drop a card the game did not spawn here.
                     if (!isAdd)
+                    {
+                        DespawnRejectedBinderTake(binding, snapshot);
                         GradingApi.OnCardRemovalRefused(snapshot, amount);
+                    }
                 });
             return true;
         }
@@ -211,7 +217,7 @@ namespace CardShopCoop.Modules.World
             }
         }
 
-        internal bool PredictClientGradedRemoval(CardData card)
+        internal bool PredictClientGradedRemoval(CardData card, bool removedLocally = true)
         {
             if (_host || ApplyingRemoteCards || card == null
                 || SaveTransferApi.PreloadHold)
@@ -221,18 +227,41 @@ namespace CardShopCoop.Modules.World
             if (GradingApi.Present)
                 snapshot.cardGrade = GradingApi.Encoded(card);
             var intent = new GradedRemoveRequestMessage { Card = snapshot };
-            WorldPrediction.Predict(WorldPrediction.CardsScope, intent,
+            var binding = CreateBinderTakeBinding();
+            // A local removal that changed nothing (a stale album slot whose certificate left
+            // through another player) must never be put back by the rollback: the row is gone in
+            // the shared album, and restoring it would mint a ghost certificate.
+            var guard = new GradedRemovalGuard { Superseded = !removedLocally };
+            var predictionId = WorldPrediction.Predict(WorldPrediction.CardsScope, intent,
                 () =>
                 {
+                    // A superseded pick's net local effect is zero (its row was already gone):
+                    // replaying the removal must not delete a row an authoritative event has
+                    // since put back.
+                    if (guard.Superseded)
+                    {
+                        return;
+                    }
+
                     ApplyPredictedGradedRemoval(snapshot);
                     NotifyCardsChanged();
                 },
                 () =>
                 {
-                    ApplyPredictedCardDelta(snapshot, 1, true);
-                    NotifyCardsChanged();
+                    // A competing accepted removal of this same certificate means the shared row
+                    // is already gone; putting it back would mint a ghost certificate.
+                    if (!guard.Superseded)
+                    {
+                        ApplyPredictedCardDelta(snapshot, 1, true);
+                        NotifyCardsChanged();
+                    }
                 },
-                () => GradingApi.OnCardRemovalRefused(snapshot, 1));
+                () =>
+                {
+                    DespawnRejectedBinderTake(binding, snapshot);
+                    GradingApi.OnCardRemovalRefused(snapshot, 1);
+                });
+            RegisterGradedRemovalGuard(predictionId, guard, snapshot);
             return true;
         }
 
@@ -404,9 +433,27 @@ namespace CardShopCoop.Modules.World
             if (_host && message == null)
                 return false;
 
-            if (!ApplyOrHoldCardDelta(connectionId, message.IsAdd, message.Amount, message.Card,
-                out var relayAnyway, message.PredictionId) && !relayAnyway)
+            var applied = ApplyOrHoldCardDelta(connectionId, message.IsAdd, message.Amount,
+                message.Card, out var relayAnyway, message.PredictionId);
+            if (!applied && !relayAnyway)
             {
+                return false;
+            }
+
+            if (_host && !message.IsAdd && !applied && GradedRemoveUncovered(message.Card))
+            {
+                // A graded removal that traveled on the CardDelta path (a defense for senders
+                // that classify it as a plain reduce): the host has the card set and no matching
+                // certificate left, so the pick lost the race. The authoritative removal goes
+                // out with NO prediction id (sender reconciles to it before the rollback; a
+                // third peer still drops a stale copy), then the sender is refused.
+                Broadcast(new CardDeltaMessage
+                {
+                    PredictionId = Guid.Empty,
+                    IsAdd = false,
+                    Amount = message.Amount,
+                    Card = SnapshotCard(message.Card),
+                });
                 return false;
             }
 
@@ -623,6 +670,22 @@ namespace CardShopCoop.Modules.World
                 return false;
             }
 
+            if (_host && !applied && GradedRemoveUncovered(card))
+            {
+                // The card set is installed and the album has no matching certificate: the
+                // pick lost the race for that row, or the sender's replica drifted. The
+                // authoritative removal still goes out - with NO prediction id, so the sender
+                // applies it (a no-op on its already-removed row) before the generic rollback,
+                // which marks its guard and keeps the row gone, and a third peer at least drops
+                // a stale copy (the documented relay). Then the refusal despawns the hand card.
+                Broadcast(new GradedRemoveMessage
+                {
+                    PredictionId = Guid.Empty,
+                    Card = SnapshotCard(message.Card),
+                });
+                return false;
+            }
+
             if (_host && !relayAnyway)
             {
                 RecordGradingOwnership(connectionId, card, 1);
@@ -665,6 +728,7 @@ namespace CardShopCoop.Modules.World
             _deltaNetThisFrame = 0;
             _deltaLogBuf.Clear();
             ResetBinderMirror();
+            ClearBinderTakeState();
             ApplyingRemoteCards = false;
             _clientCardBatch = null;
             WorldContainerInteraction.ApplyingRemote = false;
@@ -1490,8 +1554,17 @@ namespace CardShopCoop.Modules.World
                 }
                 else if (card.cardGrade > 0)
                 {
+                    var gradedBefore = CPlayerData.m_GradedCardInventoryList?.Count ?? 0;
                     for (var i = 0; i < amount; i++)
                         CPlayerData.RemoveGradedCard(card, ignoreGradedCardIndex: true);
+                    var gradedAfter = CPlayerData.m_GradedCardInventoryList?.Count ?? 0;
+                    if (gradedAfter == gradedBefore)
+                    {
+                        // This authoritative removal consumed a certificate this client had
+                        // already removed itself - one of its own in-flight picks. That pick's
+                        // rollback must not put the row back.
+                        MarkRemoteGradedRemoval(card);
+                    }
                 }
                 else
                 {
@@ -1552,6 +1625,17 @@ namespace CardShopCoop.Modules.World
                 ? ApplyCardDelta(isAdd, amount, card, out relayAnyway)
                 : ApplyTrustedCardDelta(isAdd, amount, card);
         }
+
+        /// <summary>True when a graded removal request could not be applied although this host HAS
+        /// the card set installed: the album simply has no matching certificate, i.e. another
+        /// player's accepted removal consumed the row while the request was in flight (or the
+        /// sender's replica is stale). The request must be refused so the sender's prediction
+        /// rolls back and its held card is despawned - but the authoritative removal is still
+        /// published to every peer (empty prediction id) before that rollback, preserving the
+        /// relay that keeps a third player's stale certificate from ghosting. A host that cannot
+        /// represent the card keeps the plain relay-anyway accept path.</summary>
+        private static bool GradedRemoveUncovered(CardData card)
+            => card != null && card.cardGrade > 0 && CardSetInstalledHere(card);
 
         /// <summary>A private copy of exactly the nine fields the wire carries. Anything that
         /// DEFERS a send must snapshot: AddCardPostfix temporarily writes the
@@ -2163,12 +2247,22 @@ namespace CardShopCoop.Modules.World
 
             {
                 var relayed = _host ? new List<PendingCard>(_pendingCardDeltas.Count) : null;
+                var refused = _host ? new List<PendingCard>() : null;
                 foreach (var p in _pendingCardDeltas)
                 {
                     var relayAnyway = false;
                     var applied = _host
                         ? ApplyCardDelta(p.IsAdd, p.Amount, p.Card, out relayAnyway)
                         : ApplyTrustedCardDelta(p.IsAdd, p.Amount, p.Card);
+                    if (_host && !applied && relayAnyway && GradedRemoveUncovered(p.Card))
+                    {
+                        // Held across the scene load; by the time it could run, the certificate
+                        // was consumed. Sends are deferred past the clear below so a send failure
+                        // cannot leave this batch half-applied for the next tick.
+                        refused.Add(p);
+                        continue;
+                    }
+
                     if (_host && (applied || relayAnyway) && p.IsAdd)
                     {
                         ConsumeGradingOwnership(p.ConnectionId, p.Card, p.Amount);
@@ -2190,6 +2284,39 @@ namespace CardShopCoop.Modules.World
                 }
 
                 _pendingCardDeltas.Clear();
+
+                // The authoritative removal still goes out (with NO prediction id) before the
+                // rollback, so a stale third peer drops the copy and the sender reconciles to
+                // authority - then the refusal rolls back its prediction and despawns the card.
+                if (refused != null)
+                {
+                    for (var i = 0; i < refused.Count; i++)
+                    {
+                        var p = refused[i];
+                        CoopPlugin.Log.LogWarning("graded removal held across loading has no album "
+                            + "row left; refused for connection " + p.ConnectionId + ".");
+                        if (p.IsGradedRemoval)
+                        {
+                            Broadcast(new GradedRemoveMessage
+                            {
+                                PredictionId = Guid.Empty,
+                                Card = SnapshotCard(p.Card),
+                            });
+                        }
+                        else
+                        {
+                            Broadcast(new CardDeltaMessage
+                            {
+                                PredictionId = Guid.Empty,
+                                IsAdd = false,
+                                Amount = p.Amount,
+                                Card = SnapshotCard(p.Card),
+                            });
+                        }
+
+                        PredictionHost.Reject(_context, p.ConnectionId, p.PredictionId);
+                    }
+                }
 
                 // Deltas received while the host was loading are still authoritative events. They
                 // were held before relay, so replay them in their original order now rather than

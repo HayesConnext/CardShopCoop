@@ -3,6 +3,12 @@
 True co-op multiplayer for TCG Card Shop Simulator. Both players must run the
 **same version** — the join handshake enforces it.
 
+## 2.0.6
+- Fixed an issue with EPL synchronization that caused clients to disconnect after joining. Thanks @muck270 on Discord for the report.
+- Fixed an issue where two players taking the same card out of a binder at the same time could duplicate it. Thanks @pawskles on Discord for the report.
+- Fixed a register a player was working going silently out of sync after the other player sold or trashed a different cashier counter: scanning stopped reaching the host, taking the customer's payment was refused, and the register could not be released. Registers are now tied to the counter itself instead of its position in the shop, so selling, moving, or removing another counter no longer affects one that is in use.
+- Fixed a checkout the host and guest disagreed about leaving the guest's register on an empty item list at $0.00, with items that were already scanned clickable again. A rejected finish now returns the register to the give-change screen with the scanned items and total intact.
+
 ## 2.0.5
 **Maintenance release — no in-game changes.**
 

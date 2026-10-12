@@ -1,5 +1,6 @@
 using System;
 using CardShopCoop.Attributes;
+using CardShopCoop.Modules.Prediction;
 using CardShopCoop.Net;
 using CardShopCoop.Net.Connection;
 using CardShopCoop.Runtime;
@@ -41,6 +42,9 @@ namespace CardShopCoop.Modules.World
             {
                 SendOverride = SendWorldCommand
             };
+            // Guards for in-flight graded binder removals live as long as their prediction; the
+            // tracker's retirement event is the one deterministic cleanup point.
+            PredictionApi.PredictionRetired += WorldCardInteraction.OnPredictionRetired;
             _cardInteraction.Containers.SendOp = message => SendWorldCommand(1, message);
             _cardInteraction.Containers.InGameProvider = _context.InGame;
             _cardInteraction.Containers.ReloadingProvider = _context.PreloadHold;
@@ -74,6 +78,7 @@ namespace CardShopCoop.Modules.World
             _boxNetworkInteraction = null;
             _warehouseShelfInteraction?.Reset();
             _warehouseShelfInteraction = null;
+            PredictionApi.PredictionRetired -= WorldCardInteraction.OnPredictionRetired;
             _cardInteraction?.Shutdown();
             _cardInteraction = null;
             CEventManager.RemoveListener<CEventPlayer_GameDataFinishLoaded>(OnWorldReady);
