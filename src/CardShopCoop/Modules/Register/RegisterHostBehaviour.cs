@@ -94,7 +94,7 @@ namespace CardShopCoop.Modules.Register
         {
             var connection = context?.Connection;
             if (_shutdown || connection == null || message == null || !IsJoinPhase(connection.State)
-                || !_context.InGame() || message.Counter >= 250
+                || !_context.InGame() || message.CounterKey == 0
                 || !Enum.IsDefined(typeof(RegisterIntentKind), message.Kind))
             {
                 return;
@@ -103,8 +103,8 @@ namespace CardShopCoop.Modules.Register
             _intentPredictionId = message.PredictionId;
             try
             {
-                var index = message.Counter;
-                var counter = RegisterInterop.Counter(index);
+                var index = message.CounterKey;
+                var counter = RegisterInterop.CounterForKey(index);
                 var station = counter == null ? null : ObservePublishing(index, counter);
                 if (counter == null)
                 {
@@ -388,14 +388,12 @@ namespace CardShopCoop.Modules.Register
             return generation == 0 ? 1u : generation;
         }
 
-        /// <summary>Observe for a live broadcast path: when this index now names a different
-        /// counter object than the station remembered - a destroyed counter shifted the list, or
-        /// the object was replaced - the new generation must reach the clients before the
-        /// caller's delta. Clients gate every non-ownership delta on the generation they hold for
-        /// the index (see <c>HasCounterGeneration</c>), and a list shift is not an add/remove
-        /// event, so without this publish a shifted counter's deltas were deferred forever.
-        /// Prediction-free on purpose: this corrects state, it does not confirm the intent whose
-        /// publish happened to notice the shift.</summary>
+        /// <summary>Observe for a live broadcast path: if the stable key somehow names a different
+        /// counter object than the station remembered (the object was replaced under an identity),
+        /// the new generation must reach the clients before the caller's delta. Clients gate every
+        /// non-ownership delta on the generation they hold for the key (see
+        /// <c>HasCounterGeneration</c>). Prediction-free on purpose: this corrects state, it does
+        /// not confirm the intent whose publish happened to notice the change.</summary>
         private Station ObservePublishing(int index, InteractableCashierCounter counter)
         {
             var station = GetStation(index);
@@ -406,7 +404,7 @@ namespace CardShopCoop.Modules.Register
                 Broadcast(new RegisterDeltaMessage
                 {
                     Kind = RegisterDeltaKind.CounterLifecycle,
-                    Counter = (byte)index,
+                    CounterKey = index,
                     CounterGeneration = observed.CounterGeneration,
                     Exists = true,
                     PredictionId = Guid.Empty,
@@ -420,31 +418,33 @@ namespace CardShopCoop.Modules.Register
         {
             var baseline = new RegisterBaselineMessage();
             var counters = RegisterInterop.Counters;
-            for (var i = 0; counters != null && i < counters.Count && i < 250; i++)
+            for (var i = 0; counters != null && i < counters.Count; i++)
             {
-                baseline.Counters.Add(BuildBaselineCounter(i, counters[i]));
+                var counter = counters[i];
+                var key = counter == null ? 0 : RegisterInterop.Key(counter);
+                if (key == 0)
+                {
+                    continue;
+                }
+
+                baseline.Counters.Add(BuildBaselineCounter(key, counter));
             }
 
             return baseline;
         }
 
-        private RegisterBaselineCounter BuildBaselineCounter(int index,
+        private RegisterBaselineCounter BuildBaselineCounter(int key,
             InteractableCashierCounter counter)
         {
-            var station = counter == null ? GetStation(index) : Observe(index, counter);
+            var station = Observe(key, counter);
             var result = new RegisterBaselineCounter
             {
-                Counter = (byte)index,
+                CounterKey = key,
                 CounterGeneration = station.CounterGeneration,
-                Exists = counter != null,
+                Exists = true,
                 Owner = station.Owner,
                 CustomerIndex = -1,
             };
-            if (counter == null)
-            {
-                return result;
-            }
-
             FillCommon(result, counter, station.Customer);
             return result;
         }
@@ -466,7 +466,7 @@ namespace CardShopCoop.Modules.Register
                 return;
             }
 
-            var station = Observe(RegisterInterop.Index(counter), counter);
+            var station = Observe(RegisterInterop.Key(counter), counter);
             result.CustomerIndex = RegisterInterop.CustomerIndex(customer);
             result.CustomerGeneration = (int)station.CustomerGeneration;
             result.CustomerFemale = customer.m_IsFemale;
@@ -529,12 +529,12 @@ namespace CardShopCoop.Modules.Register
 
         private RegisterDeltaMessage NewDelta(int index, RegisterDeltaKind kind)
         {
-            var counter = RegisterInterop.Counter(index);
+            var counter = RegisterInterop.CounterForKey(index);
             var station = counter == null ? GetStation(index) : ObservePublishing(index, counter);
             return new RegisterDeltaMessage
             {
                 Kind = kind,
-                Counter = (byte)index,
+                CounterKey = index,
                 CounterGeneration = station.CounterGeneration,
                 PredictionId = _intentPredictionId,
             };
@@ -542,7 +542,7 @@ namespace CardShopCoop.Modules.Register
 
         private void PublishOwnership(int index)
         {
-            var counter = RegisterInterop.Counter(index);
+            var counter = RegisterInterop.CounterForKey(index);
             var delta = NewDelta(index, RegisterDeltaKind.Ownership);
             delta.Owner = counter == null ? 0 : Observe(index, counter).Owner;
             Broadcast(delta);
@@ -550,7 +550,7 @@ namespace CardShopCoop.Modules.Register
 
         private void PublishCustomerLifecycle(int index, bool force = false)
         {
-            if (index < 0 || index >= 250)
+            if (index == 0)
             {
                 return;
             }
@@ -560,7 +560,7 @@ namespace CardShopCoop.Modules.Register
                 return;
             }
 
-            var counter = RegisterInterop.Counter(index);
+            var counter = RegisterInterop.CounterForKey(index);
             var delta = NewDelta(index, RegisterDeltaKind.CustomerLifecycle);
             var station = counter == null ? GetStation(index) : Observe(index, counter);
             var customer = counter?.m_CurrentCustomer;
@@ -582,7 +582,7 @@ namespace CardShopCoop.Modules.Register
 
         private void PublishScan(int index, bool isCard, int slot)
         {
-            var counter = RegisterInterop.Counter(index);
+            var counter = RegisterInterop.CounterForKey(index);
             if (counter == null || counter.m_CurrentCustomer == null || slot < 0)
             {
                 return;
@@ -600,7 +600,7 @@ namespace CardShopCoop.Modules.Register
 
         private void PublishPhase(int index, bool force = false)
         {
-            if (index < 0 || index >= 250)
+            if (index == 0)
             {
                 return;
             }
@@ -610,7 +610,7 @@ namespace CardShopCoop.Modules.Register
                 return;
             }
 
-            var counter = RegisterInterop.Counter(index);
+            var counter = RegisterInterop.CounterForKey(index);
             if (counter == null)
             {
                 return;
@@ -629,12 +629,12 @@ namespace CardShopCoop.Modules.Register
         /// the host's authoritative paid amount and kind, then presents the cash/card choice.</summary>
         private void PublishPaidAmount(int index)
         {
-            if (index < 0 || index >= 250)
+            if (index == 0)
             {
                 return;
             }
 
-            var counter = RegisterInterop.Counter(index);
+            var counter = RegisterInterop.CounterForKey(index);
             var customer = counter?.m_CurrentCustomer;
             if (counter == null || customer == null)
             {
@@ -645,7 +645,7 @@ namespace CardShopCoop.Modules.Register
             var delta = new RegisterDeltaMessage
             {
                 Kind = RegisterDeltaKind.PaidAmount,
-                Counter = (byte)index,
+                CounterKey = index,
                 CounterGeneration = station.CounterGeneration,
                 HasCustomer = true,
                 CustomerIndex = RegisterInterop.CustomerIndex(customer),
@@ -681,8 +681,8 @@ namespace CardShopCoop.Modules.Register
         private void PublishChange(InteractableCounterMoneyChange change, bool takeBack)
         {
             var counter = change?.m_CashierCounter;
-            var index = RegisterInterop.Index(counter);
-            if (index < 0 || change == null)
+            var index = RegisterInterop.Key(counter);
+            if (index == 0 || change == null)
             {
                 return;
             }
@@ -712,39 +712,51 @@ namespace CardShopCoop.Modules.Register
 
         private void PublishCounterLifecycle(InteractableCashierCounter counter)
         {
-            var index = RegisterInterop.Index(counter);
-            if (index < 0 || index >= 250 || counter == null)
+            var key = counter == null ? 0 : RegisterInterop.Key(counter);
+            if (key == 0)
             {
                 return;
             }
 
-            Observe(index, counter);
-            var delta = NewDelta(index, RegisterDeltaKind.CounterLifecycle);
+            var delta = NewDelta(key, RegisterDeltaKind.CounterLifecycle);
             delta.Exists = true;
             Broadcast(delta);
         }
 
-        private void Tombstone(int index)
+        /// <summary>Publishes a removed register. The key comes from the station already bound to
+        /// this counter rather than being re-derived: at removal the placement identity may already
+        /// be forgotten, and re-deriving on the host would assign a fresh key and tombstone the
+        /// wrong register.</summary>
+        private void Tombstone(InteractableCashierCounter counter)
         {
-            if (index < 0 || index >= 250)
+            if (counter == null)
             {
                 return;
             }
 
-            var station = GetStation(index);
-            if (station.Counter == null)
+            var key = 0;
+            foreach (var pair in _stations)
+            {
+                if (ReferenceEquals(pair.Value.Counter, counter))
+                {
+                    key = pair.Key;
+                    break;
+                }
+            }
+
+            if (key == 0)
             {
                 return;
             }
 
-            station.Counter = null;
-            station.Owner = 0;
-            station.Customer = null;
+            var station = _stations[key];
+            var generation = station.CounterGeneration;
+            _stations.Remove(key);
             var delta = new RegisterDeltaMessage
             {
                 Kind = RegisterDeltaKind.CounterLifecycle,
-                Counter = (byte)index,
-                CounterGeneration = station.CounterGeneration,
+                CounterKey = key,
+                CounterGeneration = generation,
                 Exists = false,
                 PredictionId = _intentPredictionId,
             };
@@ -772,7 +784,7 @@ namespace CardShopCoop.Modules.Register
 
         private static void LogIntentReject(string reason, RegisterIntentMessage message)
             => CoopPlugin.Log.LogWarning("[register] rejected " + message?.Kind + " counter="
-                + (message?.Counter ?? 255) + " slot=" + (message?.Slot ?? -1) + ": " + reason);
+                + (message?.CounterKey ?? 0) + " slot=" + (message?.Slot ?? -1) + ": " + reason);
 
         private void Reject(int connectionId, Guid predictionId)
         {
@@ -830,8 +842,8 @@ namespace CardShopCoop.Modules.Register
 
         private void OnDestroy() => Shutdown();
 
-        private static int Index(InteractableCashierCounter counter)
-            => RegisterInterop.Index(counter);
+        private static int Key(InteractableCashierCounter counter)
+            => RegisterInterop.Key(counter);
 
         [HarmonyPatch(typeof(InteractableCashierCounter), "OnMouseButtonUp")]
         private static class ManningPatch
@@ -849,8 +861,8 @@ namespace CardShopCoop.Modules.Register
                     return true;
                 }
 
-                var index = Index(__instance);
-                if (index < 0 || index >= 250)
+                var index = Key(__instance);
+                if (index == 0)
                 {
                     return true;
                 }
@@ -874,8 +886,8 @@ namespace CardShopCoop.Modules.Register
                     return;
                 }
 
-                var index = Index(__instance);
-                if (index >= 0 && index < 250)
+                var index = Key(__instance);
+                if (index != 0)
                 {
                     _active.ObservePublishing(index, __instance).Owner = -1;
                     _active.PublishOwnership(index);
@@ -900,8 +912,8 @@ namespace CardShopCoop.Modules.Register
                     return true;
                 }
 
-                var index = Index(counter);
-                if (index >= 0 && active._stations.TryGetValue(index, out var station)
+                var index = Key(counter);
+                if (index != 0 && active._stations.TryGetValue(index, out var station)
                     && station.Owner > 0)
                 {
                     RegisterHighlight.Clear(counter);
@@ -918,8 +930,8 @@ namespace CardShopCoop.Modules.Register
             [HarmonyPostfix]
             private static void Postfix(InteractableCashierCounter __instance)
             {
-                var index = Index(__instance);
-                if (_active != null && index >= 0 && _active.GetStation(index).Owner == -1
+                var index = Key(__instance);
+                if (_active != null && index != 0 && _active.GetStation(index).Owner == -1
                     && !__instance.IsMannedByPlayer())
                 {
                     _active.GetStation(index).Owner = 0;
@@ -933,7 +945,7 @@ namespace CardShopCoop.Modules.Register
         {
             [HarmonyPostfix]
             private static void Postfix(InteractableCashierCounter __instance)
-                => _active?.PublishCustomerLifecycle(Index(__instance));
+                => _active?.PublishCustomerLifecycle(Key(__instance));
         }
 
         [HarmonyPatch(typeof(InteractableCashierCounter), "UpdateCashierCounterState")]
@@ -942,14 +954,14 @@ namespace CardShopCoop.Modules.Register
             [HarmonyPostfix]
             private static void Postfix(InteractableCashierCounter __instance)
             {
-                _active?.PublishPhase(Index(__instance));
+                _active?.PublishPhase(Key(__instance));
                 if (__instance != null
                     && __instance.m_CashierCounterState == ECashierCounterState.TakingCash)
                 {
                     // Entering TakingCash is where vanilla reveals the cash/card choice. Publish the
                     // prediction-free paid delta here so the guest applies the host's rolled amount
                     // and kind even when this state change came from applying the guest's own scan.
-                    _active?.PublishPaidAmount(Index(__instance));
+                    _active?.PublishPaidAmount(Key(__instance));
                 }
             }
         }
@@ -959,7 +971,7 @@ namespace CardShopCoop.Modules.Register
         {
             [HarmonyPostfix]
             private static void Postfix(InteractableCashierCounter __instance)
-                => _active?.PublishPhase(Index(__instance));
+                => _active?.PublishPhase(Key(__instance));
         }
 
         [HarmonyPatch(typeof(InteractableCashierCounter), "StartGivingChange")]
@@ -967,7 +979,7 @@ namespace CardShopCoop.Modules.Register
         {
             [HarmonyPostfix]
             private static void Postfix(InteractableCashierCounter __instance)
-                => _active?.PublishPhase(Index(__instance));
+                => _active?.PublishPhase(Key(__instance));
         }
 
         [HarmonyPatch(typeof(InteractableScanItem), "OnMouseButtonUp")]
@@ -985,8 +997,8 @@ namespace CardShopCoop.Modules.Register
                 InteractableCashierCounter __state)
             {
                 var counter = __state;
-                var index = Index(counter);
-                if (_active != null && index >= 0 && counter?.m_CurrentCustomer != null)
+                var index = Key(counter);
+                if (_active != null && index != 0 && counter?.m_CurrentCustomer != null)
                 {
                     var items = counter.m_CurrentCustomer.GetItemInBagList();
                     for (var i = 0; items != null && i < items.Count; i++)
@@ -1016,8 +1028,8 @@ namespace CardShopCoop.Modules.Register
                 InteractableCashierCounter __state)
             {
                 var counter = __state;
-                var index = Index(counter);
-                if (_active != null && index >= 0 && counter?.m_CurrentCustomer != null)
+                var index = Key(counter);
+                if (_active != null && index != 0 && counter?.m_CurrentCustomer != null)
                 {
                     var cards = counter.m_CurrentCustomer.GetCardInBagList();
                     for (var i = 0; cards != null && i < cards.Count; i++)
@@ -1053,7 +1065,7 @@ namespace CardShopCoop.Modules.Register
         {
             [HarmonyPostfix]
             private static void Postfix(InteractableCashierCounter __instance)
-                => _active?.PublishPhase(Index(__instance));
+                => _active?.PublishPhase(Key(__instance));
         }
 
         [HarmonyPatch(typeof(ShelfManager), "InitCashierCounter")]
@@ -1070,8 +1082,7 @@ namespace CardShopCoop.Modules.Register
         private static class CounterRemovedPatch
         {
             [HarmonyPrefix]
-            private static void Prefix(InteractableCashierCounter __0)
-                => _active?.Tombstone(RegisterInterop.Index(__0));
+            private static void Prefix(InteractableCashierCounter __0) => _active?.Tombstone(__0);
         }
 
         [HarmonyPatch(typeof(InteractableCashierCounter), "OnDestroyed")]
@@ -1079,7 +1090,7 @@ namespace CardShopCoop.Modules.Register
         {
             [HarmonyPrefix]
             private static void Prefix(InteractableCashierCounter __instance)
-                => _active?.Tombstone(RegisterInterop.Index(__instance));
+                => _active?.Tombstone(__instance);
         }
 
         [HarmonyPatch(typeof(InteractableCashierCounter), "ForceResetCounter")]
@@ -1101,8 +1112,8 @@ namespace CardShopCoop.Modules.Register
                     return;
                 }
 
-                var index = Index(__instance);
-                if (index < 0 || index >= 250 || active.GetStation(index).Owner == 0)
+                var index = Key(__instance);
+                if (index == 0 || active.GetStation(index).Owner == 0)
                 {
                     return;
                 }

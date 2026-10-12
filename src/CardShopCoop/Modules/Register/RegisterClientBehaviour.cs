@@ -5,6 +5,7 @@ using CardShopCoop.Modules.Hud;
 using CardShopCoop.Modules.Npc;
 using CardShopCoop.Modules.Prediction;
 using CardShopCoop.Modules.Presence;
+using CardShopCoop.Modules.World;
 using CardShopCoop.Net;
 using CardShopCoop.Net.Connection;
 using CardShopCoop.Runtime;
@@ -24,6 +25,7 @@ namespace CardShopCoop.Modules.Register
         private sealed class LocalStation
         {
             public Customer Carrier;
+            public InteractableCashierCounter Counter;
             public int CustomerIndex = -1;
             public int CustomerGeneration;
             public uint CounterGeneration;
@@ -118,7 +120,7 @@ namespace CardShopCoop.Modules.Register
 
             foreach (var index in new List<int>(active._claims))
             {
-                var counter = RegisterInterop.Counter(index);
+                var counter = RegisterInterop.CounterForKey(index);
                 if (counter != null && counter.IsMannedByPlayer())
                 {
                     // Let the game perform the exit; the ExitPatch observes it and registers the
@@ -155,6 +157,10 @@ namespace CardShopCoop.Modules.Register
             SceneManager.sceneLoaded += OnSceneLoaded;
             NpcClientBehaviour.CustomerManagerReady += OnReadinessSignal;
             NpcClientBehaviour.CustomerPoolChanged += OnReadinessSignal;
+            // Registers are addressed by their stable placement key; the key only resolves once
+            // the placement channel has bound this peer's counter identities, so retry the register
+            // baseline/deltas whenever that structure changes.
+            PlacementApi.StructureChanged += OnPlacementStructureChanged;
             OnReadinessSignal();
         }
 
@@ -170,7 +176,10 @@ namespace CardShopCoop.Modules.Register
 
         private bool IsSceneReady()
             => RegisterInterop.Counters != null
-                && SceneRef<CustomerManager>.Get()?.GetCustomerList() != null;
+                && SceneRef<CustomerManager>.Get()?.GetCustomerList() != null
+                && PlacementApi.IsPlacementIdentityReady;
+
+        private void OnPlacementStructureChanged(int _) => OnReadinessSignal();
 
         private void OnReadinessSignal()
         {
@@ -185,7 +194,7 @@ namespace CardShopCoop.Modules.Register
                 if (ApplyDelta(pair.Value))
                 {
                     CoopPlugin.Log.LogInfo("[register] applied deferred delta kind="
-                        + pair.Value.Kind + " counter=" + pair.Value.Counter + " pred="
+                        + pair.Value.Kind + " counter=" + pair.Value.CounterKey + " pred="
                         + pair.Value.PredictionId);
                     _deferredDeltas.Remove(pair.Key);
                 }
@@ -263,7 +272,7 @@ namespace CardShopCoop.Modules.Register
             if (!ApplyDelta(message))
             {
                 CoopPlugin.Log.LogInfo("[register] deferring delta kind=" + message.Kind
-                    + " counter=" + message.Counter + " counterGen=" + message.CounterGeneration
+                    + " counter=" + message.CounterKey + " counterGen=" + message.CounterGeneration
                     + " customer=" + message.CustomerIndex + " customerGen="
                     + message.CustomerGeneration + " pred=" + message.PredictionId);
                 var key = DeltaKey(message);
@@ -297,7 +306,7 @@ namespace CardShopCoop.Modules.Register
             }
 
             if (message.Kind != RegisterDeltaKind.Ownership
-                && !HasCounterGeneration(message.Counter, message.CounterGeneration))
+                && !HasCounterGeneration(message.CounterKey, message.CounterGeneration))
             {
                 return false;
             }
@@ -344,10 +353,10 @@ namespace CardShopCoop.Modules.Register
 
         private bool HasCounterGeneration(int index, uint generation)
             => _counterGenerations.TryGetValue(index, out var current)
-                && current == generation && RegisterInterop.Counter(index) != null;
+                && current == generation && RegisterInterop.CounterForKey(index) != null;
 
         private bool HasCustomer(RegisterDeltaMessage message)
-            => _stations.TryGetValue(message.Counter, out var station)
+            => _stations.TryGetValue(message.CounterKey, out var station)
                 && station.Carrier != null && station.CustomerIndex == message.CustomerIndex
                 && station.CustomerGeneration == message.CustomerGeneration;
 
@@ -359,23 +368,23 @@ namespace CardShopCoop.Modules.Register
 
         private void ApplyBaseline(RegisterBaselineCounter baseline)
         {
-            _owners[baseline.Counter] = baseline.Owner;
-            _counterGenerations[baseline.Counter] = baseline.CounterGeneration;
-            var index = (int)baseline.Counter;
+            _owners[baseline.CounterKey] = baseline.Owner;
+            _counterGenerations[baseline.CounterKey] = baseline.CounterGeneration;
+            var index = (int)baseline.CounterKey;
             if (IsRemoteOwner(baseline.Owner))
             {
                 // A late join can land while the player already aims at this counter, so clear a
                 // highlight that started before the authoritative owner was known.
-                RegisterHighlight.Clear(RegisterInterop.Counter(index));
+                RegisterHighlight.Clear(RegisterInterop.CounterForKey(index));
             }
 
-            if (!baseline.Exists || RegisterInterop.Counter(index) == null)
+            if (!baseline.Exists || RegisterInterop.CounterForKey(index) == null)
             {
                 ReleaseStation(index);
                 return;
             }
 
-            var counter = RegisterInterop.Counter(index);
+            var counter = RegisterInterop.CounterForKey(index);
             if (!baseline.HasCustomer)
             {
                 ReleaseStation(index);
@@ -401,7 +410,7 @@ namespace CardShopCoop.Modules.Register
 
         private void ApplyDeltaCore(RegisterDeltaMessage message, bool confirmedOwnPrediction)
         {
-            var index = (int)message.Counter;
+            var index = (int)message.CounterKey;
             switch (message.Kind)
             {
                 case RegisterDeltaKind.CounterLifecycle:
@@ -433,22 +442,27 @@ namespace CardShopCoop.Modules.Register
 
         private void ApplyCounterLifecycle(RegisterDeltaMessage message)
         {
-            _counterGenerations[message.Counter] = message.CounterGeneration;
-            if (!message.Exists)
+            if (message.Exists)
             {
-                _owners[message.Counter] = 0;
-                _claims.Remove(message.Counter);
-                ReleaseStation(message.Counter);
+                _counterGenerations[message.CounterKey] = message.CounterGeneration;
+                return;
             }
+
+            // Tombstone: the stable key names exactly this register, so clear its state directly.
+            // No re-keying is needed because identity does not depend on the live list order.
+            _owners[message.CounterKey] = 0;
+            _claims.Remove(message.CounterKey);
+            ReleaseStation(message.CounterKey);
+            _counterGenerations.Remove(message.CounterKey);
         }
 
         private void ApplyCustomerLifecycle(RegisterDeltaMessage message)
         {
-            var index = (int)message.Counter;
-            var counter = RegisterInterop.Counter(index);
+            var index = (int)message.CounterKey;
+            var counter = RegisterInterop.CounterForKey(index);
             if (!message.HasCustomer)
             {
-                var existing = _stations.TryGetValue(message.Counter, out var existingStation)
+                var existing = _stations.TryGetValue(message.CounterKey, out var existingStation)
                     ? existingStation : null;
                 ApplyPhase(counter, existing?.Carrier, message.State, message.UsingCard, message.Paid,
                     message.Total, message.CustomerTotal, message.Change, message.ChangeReady,
@@ -472,7 +486,7 @@ namespace CardShopCoop.Modules.Register
 
         private void ApplyScan(RegisterDeltaMessage message, bool confirmedOwnPrediction)
         {
-            if (!_stations.TryGetValue(message.Counter, out var station) || station.Carrier == null)
+            if (!_stations.TryGetValue(message.CounterKey, out var station) || station.Carrier == null)
             {
                 return;
             }
@@ -520,7 +534,7 @@ namespace CardShopCoop.Modules.Register
                 return;
             }
 
-            var counter = RegisterInterop.Counter(message.Counter);
+            var counter = RegisterInterop.CounterForKey(message.CounterKey);
             ApplyPhase(counter, customer, message.State, message.UsingCard, message.Paid, message.Total,
                 message.CustomerTotal, message.Change, message.ChangeReady, message.ChangeStarted,
                 message.TooMuchChange);
@@ -528,8 +542,8 @@ namespace CardShopCoop.Modules.Register
 
         private void ApplyPhaseDelta(RegisterDeltaMessage message)
         {
-            var counter = RegisterInterop.Counter(message.Counter);
-            var station = _stations.TryGetValue(message.Counter, out var value) ? value : null;
+            var counter = RegisterInterop.CounterForKey(message.CounterKey);
+            var station = _stations.TryGetValue(message.CounterKey, out var value) ? value : null;
             ApplyPhase(counter, station?.Carrier, message.State, message.UsingCard, message.Paid,
                 message.Total, message.CustomerTotal, message.Change, message.ChangeReady,
                 message.ChangeStarted, message.TooMuchChange);
@@ -548,11 +562,11 @@ namespace CardShopCoop.Modules.Register
                 return;
             }
 
-            var change = RegisterInterop.FindChange(RegisterInterop.Counter(message.Counter), message.Slot,
+            var change = RegisterInterop.FindChange(RegisterInterop.CounterForKey(message.CounterKey), message.Slot,
                 message.IsCoin);
             RegisterInterop.SetGivenAmount(change, message.ChangeCount);
-            var counter = RegisterInterop.Counter(message.Counter);
-            var station = _stations.TryGetValue(message.Counter, out var value) ? value : null;
+            var counter = RegisterInterop.CounterForKey(message.CounterKey);
+            var station = _stations.TryGetValue(message.CounterKey, out var value) ? value : null;
             ApplyPhase(counter, station?.Carrier, message.State, message.UsingCard, message.Paid,
                 message.Total, message.CustomerTotal, message.Change, message.ChangeReady,
                 message.ChangeStarted, message.TooMuchChange);
@@ -638,6 +652,7 @@ namespace CardShopCoop.Modules.Register
             var station = new LocalStation
             {
                 Carrier = carrier,
+                Counter = counter,
                 CustomerIndex = customerIndex,
                 CustomerGeneration = customerGeneration,
                 CounterGeneration = counterGeneration,
@@ -755,7 +770,7 @@ namespace CardShopCoop.Modules.Register
                         // becomes visible so a "customer shows cash but the counter expects card"
                         // report can be traced to the delta that set it.
                         CoopPlugin.Log.LogInfo("[register] offer counter="
-                            + RegisterInterop.Index(counter) + " "
+                            + RegisterInterop.Key(counter) + " "
                             + (usingCard ? "card" : "cash") + " (was "
                             + (wasCard ? "card" : "cash") + "), customer="
                             + (customer.name ?? "?"));
@@ -771,7 +786,7 @@ namespace CardShopCoop.Modules.Register
             if (Math.Abs(total - diagnosticBefore) > 0.005
                 || Math.Abs(customerTotal - diagnosticBeforeCustomer) > 0.005)
             {
-                CoopPlugin.Log.LogInfo("[register] phase counter=" + RegisterInterop.Index(counter)
+                CoopPlugin.Log.LogInfo("[register] phase counter=" + RegisterInterop.Key(counter)
                     + " state=" + wantedState + " card=" + usingCard
                     + " total=" + diagnosticBefore.ToString("F3") + "->" + total.ToString("F3")
                     + " customer=" + diagnosticBeforeCustomer.ToString("F3")
@@ -879,21 +894,35 @@ namespace CardShopCoop.Modules.Register
         {
             if (IsRemoteOwner(owner))
             {
-                RegisterHighlight.Clear(RegisterInterop.Counter(index));
+                RegisterHighlight.Clear(RegisterInterop.CounterForKey(index));
             }
         }
 
         private void ApplyOwnership(int index, int owner)
         {
             _owners[index] = owner;
-            ApplyOwner(index, RegisterInterop.Counter(index), owner);
+            ApplyOwner(index, RegisterInterop.CounterForKey(index), owner);
             RefreshOwnershipHighlight(index, owner);
         }
 
         private LocalStation Station(InteractableCashierCounter counter, out int index)
         {
-            index = RegisterInterop.Index(counter);
-            return index >= 0 && _stations.TryGetValue(index, out var station) ? station : null;
+            index = RegisterInterop.Key(counter);
+            if (counter != null)
+            {
+                // The counter object is the stable identity; a key is only a locator. Matching by
+                // object also covers the brief window before the placement channel has bound the
+                // key on this peer, so a capture never silently misses its own station.
+                foreach (var pair in _stations)
+                {
+                    if (ReferenceEquals(pair.Value.Counter, counter))
+                    {
+                        return pair.Value;
+                    }
+                }
+            }
+
+            return index != 0 && _stations.TryGetValue(index, out var station) ? station : null;
         }
 
         private CheckoutUndo CaptureUndo(InteractableCashierCounter counter, Customer customer)
@@ -1026,6 +1055,14 @@ namespace CardShopCoop.Modules.Register
                 }
 
                 RebuildCashScreen(counter, customer);
+                // OnPressSpaceBar reset the cash screen to its item-list group. Restoring the
+                // giving-change phase must restore that panel too, or the register shows the
+                // (repopulated) scan list instead of the change screen the player was just using.
+                if (undo.State == ECashierCounterState.GivingChange && !undo.UsingCard)
+                {
+                    RegisterInterop.CashScreen(counter)?.OnStartGivingChange();
+                }
+
                 RegisterInterop.CashScreen(counter)?.UpdateMoneyChangeAmount(undo.ChangeReady,
                     undo.Paid, undo.Total, undo.Change);
                 // A predicted payment/card action runs the game's own StartGivingChange, which can
@@ -1045,7 +1082,7 @@ namespace CardShopCoop.Modules.Register
                     {
                         controller.ExitUIMode();
                         CoopPlugin.Log.LogInfo("[register] rollback released the counter UI mode "
-                            + "for counter=" + RegisterInterop.Index(counter) + ".");
+                            + "for counter=" + RegisterInterop.Key(counter) + ".");
                     }
                 }
 
@@ -1061,7 +1098,7 @@ namespace CardShopCoop.Modules.Register
                     {
                         creditScreen.ResetCounter();
                         CoopPlugin.Log.LogInfo("[register] rollback reset the credit card screen "
-                            + "for counter=" + RegisterInterop.Index(counter) + ".");
+                            + "for counter=" + RegisterInterop.Key(counter) + ".");
                     }
                 }
             }
@@ -1112,6 +1149,17 @@ namespace CardShopCoop.Modules.Register
                     continue;
                 }
 
+                // An item that is already scanned must stay scanned: its scan customer is null and
+                // it is hidden at the scanned lerp position. Re-activating and re-registering it
+                // (as this used to do for every item) cleared that state, so a rollback after a
+                // finish returned the register to a scanning list with every line un-scanned and
+                // the total reset to $0.00.
+                if (item.m_InteractableScanItem != null && !item.m_InteractableScanItem.IsNotScanned())
+                {
+                    itemSlot++;
+                    continue;
+                }
+
                 item.transform.SetParent(counter.transform);
                 item.transform.position = counter.m_CustomerPlaceItemPos.position
                     + counter.m_CustomerPlaceItemPos.forward * (-0.025f * (itemSlot++ % 8));
@@ -1134,6 +1182,13 @@ namespace CardShopCoop.Modules.Register
                 var card = cards[i];
                 if (card == null)
                 {
+                    continue;
+                }
+
+                // Card counterpart of the item guard above: keep an already-scanned card scanned.
+                if (!card.IsNotScanned())
+                {
+                    cardSlot++;
                     continue;
                 }
 
@@ -1208,7 +1263,7 @@ namespace CardShopCoop.Modules.Register
                 id => Send(new RegisterIntentMessage
                 {
                     PredictionId = id,
-                    Counter = (byte)index,
+                    CounterKey = index,
                     Kind = RegisterIntentKind.Claim,
                 }),
                 () => WithPrediction(counter.OnMouseButtonUp),
@@ -1232,7 +1287,7 @@ namespace CardShopCoop.Modules.Register
                 id => Send(new RegisterIntentMessage
                 {
                     PredictionId = id,
-                    Counter = (byte)index,
+                    CounterKey = index,
                     Kind = RegisterIntentKind.Release,
                 }),
                 () =>
@@ -1271,7 +1326,7 @@ namespace CardShopCoop.Modules.Register
                 id => Send(new RegisterIntentMessage
                 {
                     PredictionId = id,
-                    Counter = (byte)capture.Index,
+                    CounterKey = capture.Index,
                     Kind = isCard ? RegisterIntentKind.ScanCard : RegisterIntentKind.ScanItem,
                     Slot = slot,
                 }),
@@ -1327,7 +1382,7 @@ namespace CardShopCoop.Modules.Register
                 id => Send(new RegisterIntentMessage
                 {
                     PredictionId = id,
-                    Counter = (byte)capture.Index,
+                    CounterKey = capture.Index,
                     Kind = RegisterIntentKind.TakePayment,
                     IsCard = capture.Cash.m_IsCard,
                 }),
@@ -1361,7 +1416,7 @@ namespace CardShopCoop.Modules.Register
                 id => Send(new RegisterIntentMessage
                 {
                     PredictionId = id,
-                    Counter = (byte)capture.Index,
+                    CounterKey = capture.Index,
                     Kind = RegisterIntentKind.CardPayment,
                     Value = capture.Value,
                 }),
@@ -1392,7 +1447,7 @@ namespace CardShopCoop.Modules.Register
                 id => Send(new RegisterIntentMessage
                 {
                     PredictionId = id,
-                    Counter = (byte)capture.Index,
+                    CounterKey = capture.Index,
                     Kind = RegisterIntentKind.Change,
                     Slot = change.m_Index,
                     IsCoin = change.m_IsCoin,
@@ -1439,7 +1494,7 @@ namespace CardShopCoop.Modules.Register
                 id => Send(new RegisterIntentMessage
                 {
                     PredictionId = id,
-                    Counter = (byte)capture.Index,
+                    CounterKey = capture.Index,
                     Kind = RegisterIntentKind.Complete,
                 }),
                 () => WithPrediction(() =>
@@ -1463,7 +1518,7 @@ namespace CardShopCoop.Modules.Register
             }
 
             CoopPlugin.Log.LogWarning("[register] blocked cash click: counter="
-                + (counter == null ? "none" : RegisterInterop.Index(counter).ToString())
+                + (counter == null ? "none" : RegisterInterop.Key(counter).ToString())
                 + " cashCustomer=" + (cashCustomer == null ? "null" : cashCustomer.name)
                 + " counterCustomer=" + (counter == null || counter.m_CurrentCustomer == null
                     ? "null" : counter.m_CurrentCustomer.name)
@@ -1479,7 +1534,7 @@ namespace CardShopCoop.Modules.Register
         {
             CoopPlugin.Log.LogWarning("[register] ignored " + action + " for a checkout whose "
                 + "counter customer is not the station carrier; counter="
-                + (counter == null ? "null" : RegisterInterop.Index(counter).ToString())
+                + (counter == null ? "null" : RegisterInterop.Key(counter).ToString())
                 + " counterCustomer=" + (counter == null || counter.m_CurrentCustomer == null
                     ? "null" : counter.m_CurrentCustomer.name));
         }
@@ -1509,12 +1564,14 @@ namespace CardShopCoop.Modules.Register
 
         private void ReleaseStation(int index)
         {
-            var counter = RegisterInterop.Counter(index);
             if (!_stations.TryGetValue(index, out var station))
             {
                 return;
             }
 
+            // Prefer the counter the station was actually bound to: the key is the wire identity,
+            // and the station's own counter is the exact object it was built for.
+            var counter = station.Counter != null ? station.Counter : RegisterInterop.CounterForKey(index);
             if (station.Carrier != null)
             {
                 station.Carrier.m_CustomerCash?.gameObject.SetActive(false);
@@ -1537,16 +1594,16 @@ namespace CardShopCoop.Modules.Register
             {
                 // Value is no longer part of the denomination's identity (m_Index + coin is), so it
                 // must not split the deferred key.
-                return message.Counter + ":" + message.CounterGeneration + ":change:"
+                return message.CounterKey + ":" + message.CounterGeneration + ":change:"
                     + message.Slot + ":" + message.IsCoin;
             }
             if (message.Kind == RegisterDeltaKind.Scan)
             {
-                return message.Counter + ":" + message.CounterGeneration + ":scan:"
+                return message.CounterKey + ":" + message.CounterGeneration + ":scan:"
                     + message.CustomerGeneration + ":" + message.Slot + ":" + message.IsCard;
             }
 
-            return message.Counter + ":" + (byte)message.Kind + ":" + message.CounterGeneration
+            return message.CounterKey + ":" + (byte)message.Kind + ":" + message.CounterGeneration
                 + ":" + message.CustomerGeneration;
         }
 
@@ -1561,7 +1618,7 @@ namespace CardShopCoop.Modules.Register
         {
             foreach (var index in new List<int>(_claims))
             {
-                var counter = RegisterInterop.Counter(index);
+                var counter = RegisterInterop.CounterForKey(index);
                 if (counter != null && counter.IsMannedByPlayer())
                 {
                     WithPrediction(counter.OnPressEsc);
@@ -1593,6 +1650,7 @@ namespace CardShopCoop.Modules.Register
             ShutdownContents();
             NpcClientBehaviour.CustomerManagerReady -= OnReadinessSignal;
             NpcClientBehaviour.CustomerPoolChanged -= OnReadinessSignal;
+            PlacementApi.StructureChanged -= OnPlacementStructureChanged;
             SceneManager.sceneLoaded -= OnSceneLoaded;
             _context?.Messages.UnregisterAttributedHandlers(this);
             if (ReferenceEquals(_active, this))
@@ -1632,8 +1690,8 @@ namespace CardShopCoop.Modules.Register
                     return true;
                 }
 
-                var index = RegisterInterop.Index(__instance);
-                if (index < 0 || !client._joined || !client._context.InGame())
+                var index = RegisterInterop.Key(__instance);
+                if (index == 0 || !client._joined || !client._context.InGame())
                 {
                     return true;
                 }
@@ -1659,8 +1717,8 @@ namespace CardShopCoop.Modules.Register
                     return;
                 }
 
-                var index = RegisterInterop.Index(__instance);
-                if (index >= 0 && client._joined && client._context.InGame())
+                var index = RegisterInterop.Key(__instance);
+                if (index != 0 && client._joined && client._context.InGame())
                 {
                     client.ObserveClaim(__instance, index);
                 }
@@ -1685,7 +1743,7 @@ namespace CardShopCoop.Modules.Register
                     return true;
                 }
 
-                if (client.IsRemoteOwned(RegisterInterop.Index(counter)))
+                if (client.IsRemoteOwned(RegisterInterop.Key(counter)))
                 {
                     RegisterHighlight.Clear(counter);
                     return false;
@@ -1709,8 +1767,8 @@ namespace CardShopCoop.Modules.Register
                     return;
                 }
 
-                var index = RegisterInterop.Index(__instance);
-                if (index < 0 || !client._claims.Contains(index))
+                var index = RegisterInterop.Key(__instance);
+                if (index == 0 || !client._claims.Contains(index))
                 {
                     return;
                 }
@@ -1728,8 +1786,8 @@ namespace CardShopCoop.Modules.Register
                     return;
                 }
 
-                var index = RegisterInterop.Index(__instance);
-                if (index >= 0)
+                var index = RegisterInterop.Key(__instance);
+                if (index != 0)
                 {
                     client.ObserveRelease(__instance, index);
                 }
@@ -2128,7 +2186,7 @@ namespace CardShopCoop.Modules.Register
                 CoopPlugin.Log.LogWarning("[register] blocked OnCashTaken for a customer with no "
                     + "matching counter; customer=" + (__instance == null ? "null" : __instance.name)
                     + " counter=" + (counter == null ? "null"
-                        : RegisterInterop.Index(counter).ToString()));
+                        : RegisterInterop.Key(counter).ToString()));
                 return false;
             }
         }
@@ -2160,7 +2218,7 @@ namespace CardShopCoop.Modules.Register
 
         private int ItemSlot(InteractableScanItem item, int counterIndex)
         {
-            var items = RegisterInterop.Counter(counterIndex)?.m_CurrentCustomer?.GetItemInBagList();
+            var items = RegisterInterop.CounterForKey(counterIndex)?.m_CurrentCustomer?.GetItemInBagList();
             for (var i = 0; items != null && i < items.Count; i++)
             {
                 if (items[i]?.m_InteractableScanItem == item)
@@ -2174,7 +2232,7 @@ namespace CardShopCoop.Modules.Register
 
         private int CardSlot(InteractableCard3d card, int counterIndex)
         {
-            var cards = RegisterInterop.Counter(counterIndex)?.m_CurrentCustomer?.GetCardInBagList();
+            var cards = RegisterInterop.CounterForKey(counterIndex)?.m_CurrentCustomer?.GetCardInBagList();
             for (var i = 0; cards != null && i < cards.Count; i++)
             {
                 if (cards[i] == card)

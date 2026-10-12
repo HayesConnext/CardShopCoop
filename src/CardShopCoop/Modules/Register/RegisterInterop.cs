@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Reflection;
+using CardShopCoop.Modules.World;
 using CardShopCoop.Runtime;
 using CardShopCoop.Util;
 using UnityEngine;
@@ -45,17 +46,23 @@ namespace CardShopCoop.Modules.Register
             field?.SetValue(target, value);
         }
 
-        internal static int Index(InteractableCashierCounter counter)
-        {
-            var counters = Counters;
-            return counters == null || counter == null ? -1 : counters.IndexOf(counter);
-        }
+        internal const int CashierKind = 4;
 
-        internal static InteractableCashierCounter Counter(int index)
-        {
-            var counters = Counters;
-            return counters == null || index < 0 || index >= counters.Count ? null : counters[index];
-        }
+        /// <summary>The stable placement key of a cashier counter, or 0 when it has none. The key
+        /// (kind + placement identity) is independent of the live list order, so it survives a
+        /// counter being sold or moved while another register is in use. The host assigns an
+        /// identity on first use; a client only answers for identities the placement channel has
+        /// already bound to its own counter objects.</summary>
+        internal static int Key(InteractableCashierCounter counter)
+            => counter != null && PlacementApi.TryMakeObjectKey(CashierKind, counter, out var key)
+                ? key : 0;
+
+        /// <summary>The live counter a stable key names, or null when this peer does not hold it
+        /// (yet). Never adopts a different object: the placement channel binds one identity per
+        /// entity, so an unresolved key simply waits instead of addressing the wrong register.</summary>
+        internal static InteractableCashierCounter CounterForKey(int key)
+            => key != 0 && PlacementApi.ResolveObjectByKey(key) is InteractableCashierCounter counter
+                ? counter : null;
 
         internal static UI_CashCounterScreen CashScreen(InteractableCashierCounter counter)
             => Read(counter, "m_UICashCounterScreen") as UI_CashCounterScreen;

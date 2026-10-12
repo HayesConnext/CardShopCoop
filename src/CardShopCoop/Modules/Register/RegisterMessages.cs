@@ -13,7 +13,7 @@ namespace CardShopCoop.Modules.Register
             get; set;
         }
 
-        public byte Counter;
+        public int CounterKey;
         public RegisterIntentKind Kind;
         public int Slot = -1;
         public bool IsCard;
@@ -66,7 +66,7 @@ namespace CardShopCoop.Modules.Register
         }
 
         public RegisterDeltaKind Kind;
-        public byte Counter;
+        public int CounterKey;
         public uint CounterGeneration;
         public bool Exists;
         public int Owner;
@@ -98,7 +98,7 @@ namespace CardShopCoop.Modules.Register
 
     public sealed class RegisterBaselineCounter
     {
-        public byte Counter;
+        public int CounterKey;
         public uint CounterGeneration;
         public bool Exists;
         public int Owner;
