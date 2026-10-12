@@ -54,5 +54,6 @@ This mod is based off of [CardShopCoop](https://github.com/DeliriumPulse/CardSho
 ## Special Thanks
 
 A huge thank you to our alpha testers **communicated_**, **universetaken**, **lalegge97_**,
-and **lmonstro** for spending their time testing 2.0.0 before release and helping us catch
-the rough edges early. Your reports and patience made this update far better.
+**lmonstro**, and **christianbutnot** for spending their time testing 2.0.0 before release
+and helping us catch the rough edges early. Your reports and patience made this update far
+better.
