@@ -251,10 +251,12 @@ namespace CardShopCoop.Modules.Register
             }
         }
 
-        /// <summary>Applies the deltas the register was not ready for. The pending set is taken out
-        /// before applying so a synchronous event raised by one of the applies can never re-apply
-        /// the entries this pass owns; anything still not applicable goes back for the next
-        /// signal.</summary>
+        /// <summary>Applies the deltas the register was not ready for. A snapshot of the keys is
+        /// taken so a synchronous event that queues a NEW delta is left for the next signal instead
+        /// of being applied by this pass; each entry is removed only AFTER its apply returns true,
+        /// so an apply that throws leaves that entry and everything after it queued (and their
+        /// predictions unretired) rather than dropping authoritative state. Anything still not
+        /// applicable stays for the next signal.</summary>
         private void DrainDeferredDeltas()
         {
             if (_deferredDeltas.Count == 0)
@@ -263,20 +265,25 @@ namespace CardShopCoop.Modules.Register
             }
 
             var pending = new List<KeyValuePair<string, RegisterDeltaMessage>>(_deferredDeltas);
-            _deferredDeltas.Clear();
             for (var i = 0; i < pending.Count; i++)
             {
                 var pair = pending[i];
-                if (ApplyDelta(pair.Value))
+                if (!ApplyDelta(pair.Value))
                 {
-                    CoopPlugin.Log.LogInfo("[register] applied deferred delta kind="
-                        + pair.Value.Kind + " counter=" + pair.Value.CounterKey + " pred="
-                        + pair.Value.PredictionId);
+                    continue;
                 }
-                else
+
+                // Remove only if this pass's instance is still the one stored: a replacement queued
+                // under the same key during the apply must survive.
+                if (_deferredDeltas.TryGetValue(pair.Key, out var current)
+                    && ReferenceEquals(current, pair.Value))
                 {
-                    _deferredDeltas[pair.Key] = pair.Value;
+                    _deferredDeltas.Remove(pair.Key);
                 }
+
+                CoopPlugin.Log.LogInfo("[register] applied deferred delta kind="
+                    + pair.Value.Kind + " counter=" + pair.Value.CounterKey + " pred="
+                    + pair.Value.PredictionId);
             }
         }
 

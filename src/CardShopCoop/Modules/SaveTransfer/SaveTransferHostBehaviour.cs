@@ -62,8 +62,12 @@ namespace CardShopCoop.Modules.SaveTransfer
         private readonly HashSet<int> _aborted = new();
         private readonly Dictionary<int, float> _completionDeadlines = new();
         private readonly object _sendingLock = new();
-        // This is a bounded transfer-lifecycle timer, not a scan of world or module state.
-        private const float CompletionDeadlineSeconds = 120f;
+        // This is a bounded transfer-lifecycle timer, not a scan of world or module state. It must
+        // cover a full-size transfer (up to MaxTransferBytes compressed, MaxExpandedBytes expanded)
+        // on a slow link, or a legitimate join is aborted mid-stream with "transfer_timeout". The
+        // deadline is armed once at authorization and not refreshed per chunk, so it is the whole
+        // transfer's budget: 1200 s is ~2 Mbit/s for a 256 MiB payload.
+        private const float CompletionDeadlineSeconds = 1200f;
         private CoopRuntimeContext _context;
         private bool _shutdown;
 

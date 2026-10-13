@@ -164,8 +164,10 @@ namespace CardShopCoop.Modules.Catalog
 
         /// <summary>True once the peer's enum identity is known for the current session. The
         /// pre-send gate refuses only while this is true: no session, no peer yet, or a disconnected
-        /// peer must never block a local purchase.</summary>
-        internal static bool HasPeerIdentity => _peerNames != null;
+        /// peer must never block a local purchase. An EMPTY identity is "no peer" too - the handshake
+        /// tolerates a peer that resolved no enum members, and treating that as a known peer whose
+        /// every type is unrepresentable would refuse every furniture purchase for the session.</summary>
+        internal static bool HasPeerIdentity => _peerNames != null && _peerNames.Count > 0;
 
         /// <summary>Record the PEER's enum identity on the HOST, after the joining client's Hello
         /// passed admission. The host has no value map (the wire is its own space); this identity is
@@ -201,9 +203,11 @@ namespace CardShopCoop.Modules.Catalog
         internal static bool CanPeerRepresent(EnumKind kind, int value)
         {
             var peer = _peerNames;
-            if (peer == null || !peer.TryGetValue(kind, out var peerNames))
+            if (peer == null || peer.Count == 0 || !peer.TryGetValue(kind, out var peerNames))
             {
-                return false;
+                // No peer, or the peer advertised no members of this kind: nothing is known to be
+                // unrepresentable, so the gate must not refuse (it is a guard, not an authority).
+                return true;
             }
 
             var name = LocalName(kind, value);

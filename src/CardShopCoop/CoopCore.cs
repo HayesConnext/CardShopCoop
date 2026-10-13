@@ -409,8 +409,33 @@ namespace CardShopCoop
                 // entry) can report back after this session has ended and a new one has started, and
                 // that late result must not touch the new session.
                 var generation = SessionGeneration;
-                var id = backend.Connect(mode, values,
-                    (handle, result) => OnBackendConnectResult(backend, handle, result, generation));
+
+                // A backend may settle Connect SYNCHRONOUSLY (IP rejects a malformed address before it
+                // returns; Steam's catch settles a failed lobby entry). Running the result callback
+                // then would race the bookkeeping below: OnBackendFailed would find no _connections
+                // entry, skip the backend's own teardown (so Steam's transport stayed "active" and the
+                // next attempt failed), tear the session down, and then this method would re-add the
+                // dead connection and flip the status back to "Connecting...". Defer a synchronous
+                // result until the handle is recorded, so the failure path sees the connection and
+                // disconnects the backend it belongs to.
+                var connectReturned = false;
+                var hasPendingResult = false;
+                ConnectionId pendingHandle = default;
+                ConnectResult pendingResult = default;
+
+                var id = backend.Connect(mode, values, (handle, result) =>
+                {
+                    if (!connectReturned)
+                    {
+                        pendingHandle = handle;
+                        pendingResult = result;
+                        hasPendingResult = true;
+                        return;
+                    }
+
+                    OnBackendConnectResult(backend, handle, result, generation);
+                });
+
                 lock (_sessionLock)
                 {
                     _connections[backend] = id;
@@ -422,6 +447,12 @@ namespace CardShopCoop
                 }
 
                 SetStatus(hosting ? "Hosting..." : "Connecting...");
+
+                connectReturned = true;
+                if (hasPendingResult)
+                {
+                    OnBackendConnectResult(backend, pendingHandle, pendingResult, generation);
+                }
             }
             catch (Exception error)
             {

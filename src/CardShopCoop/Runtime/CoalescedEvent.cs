@@ -152,6 +152,14 @@ namespace CardShopCoop.Runtime
         internal void EnqueueNew(TValue value, Action<int, TValue> deliver)
             => Enqueue(_nextKey++, value, deliver);
 
+        /// <summary>Drop anything still queued. A session boundary uses this so a raise that was
+        /// never delivered cannot reach the next session's subscribers.</summary>
+        internal void Clear()
+        {
+            _queued?.Clear();
+            _order?.Clear();
+        }
+
         private void Merge(int key, TValue value)
         {
             _queued ??= new Dictionary<int, TValue>();
@@ -171,20 +179,29 @@ namespace CardShopCoop.Runtime
                 return false;
             }
 
-            var batch = new List<KeyValuePair<int, TValue>>(_queued.Count);
-            for (var i = 0; i < _order.Count; i++)
+            // Deliver in raise order, removing each entry only AFTER its handler returns. A handler
+            // that throws therefore leaves that entry (and every entry after it) queued - the throw
+            // still propagates - so a one-shot cleanup named by a queued raise is never silently
+            // dropped, which is the whole reason this queue preserves every raise. The consumed
+            // prefix is compacted only once the pass reaches the end.
+            var index = 0;
+            while (index < _order.Count)
             {
-                if (_queued.TryGetValue(_order[i], out var value))
+                var key = _order[index];
+                if (!_queued.TryGetValue(key, out var value))
                 {
-                    batch.Add(new KeyValuePair<int, TValue>(_order[i], value));
+                    index++;
+                    continue;
                 }
+
+                deliver(key, value);
+                _queued.Remove(key);
+                index++;
             }
 
-            _queued.Clear();
-            _order.Clear();
-            for (var i = 0; i < batch.Count; i++)
+            if (index > 0)
             {
-                deliver(batch[i].Key, batch[i].Value);
+                _order.RemoveRange(0, index);
             }
 
             return true;
@@ -223,5 +240,9 @@ namespace CardShopCoop.Runtime
         internal event Action<TValue> Handlers;
 
         internal void Raise(TValue value) => _delivery.EnqueueNew(value, _deliver);
+
+        /// <summary>Drop anything still queued, so a raise left pending at a session boundary does
+        /// not get delivered into the next session.</summary>
+        internal void Clear() => _delivery.Clear();
     }
 }

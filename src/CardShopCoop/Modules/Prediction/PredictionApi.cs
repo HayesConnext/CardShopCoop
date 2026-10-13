@@ -372,6 +372,9 @@ namespace CardShopCoop.Modules.Prediction
             ById.Clear();
             ByKey.Clear();
             Deferred.Clear();
+            // A retirement queued but not yet delivered is session-scoped state too: without this a
+            // stale id would be handed to the next session's PredictionRetired subscribers.
+            Retired.Clear();
             _reconciling = false;
             _applying = 0;
         }

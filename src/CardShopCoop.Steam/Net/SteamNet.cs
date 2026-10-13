@@ -115,7 +115,11 @@ namespace CardShopCoop.Net
                     return; // result from an abandoned CreateLobby operation
                 }
 
-                _createLobby = null;
+                // Deliberately NOT disposed or nulled here: this runs inside Steamworks' callback
+                // dispatch, and unregistering a handle mid-dispatch is not safe. The completed
+                // CallResult is released by the next AbortPendingOperation (Host/Join/Leave) or by
+                // SteamLobby.Dispose at unload - nulling it without disposing (as this used to do)
+                // leaked the native handle on every host attempt.
                 if (ioFail || e.m_eResult != EResult.k_EResultOK)
                 {
                     var error = "Steam lobby creation failed: " + e.m_eResult;
@@ -171,6 +175,21 @@ namespace CardShopCoop.Net
         public void Leave()
         {
             AbortPendingOperation();
+        }
+
+        /// <summary>Release the long-lived Steamworks callback handles and any in-flight create
+        /// result. Idempotent. Called from the transport plugin's unload: without it the two
+        /// <see cref="Callback{T}"/> handles (which live for the whole process) and the last
+        /// <see cref="CallResult{T}"/> survive a BepInEx script reload and can deliver callbacks
+        /// into a bridge that has already been torn down.</summary>
+        public void Dispose()
+        {
+            _createLobby?.Dispose();
+            _createLobby = null;
+            _cbEnter?.Dispose();
+            _cbEnter = null;
+            _cbJoinRequested?.Dispose();
+            _cbJoinRequested = null;
         }
 
         public bool IsCurrentLobby(CSteamID lobby, long operation)
@@ -732,6 +751,25 @@ namespace CardShopCoop.Net
             };
             _lobby.OnInviteAccepted = id => QueueGlobal(
                 () => OnInviteAccepted?.Invoke(id.m_SteamID));
+        }
+
+        /// <summary>Release the lobby's Steamworks callback handles and stop the bridge's pump.
+        /// Called from the transport plugin's unload; the pump holds a delegate into this bridge, so
+        /// leaving it alive would keep invoking a bridge that has already been torn down.</summary>
+        public void Dispose()
+        {
+            _lobby.Dispose();
+            if (_pump != null)
+            {
+                UnityEngine.Object.Destroy(_pump);
+                _pump = null;
+            }
+
+            lock (_transportGate)
+            {
+                _tx = null;
+                _datagrams = null;
+            }
         }
 
         public bool SteamAvailable()

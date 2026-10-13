@@ -53,13 +53,56 @@ namespace CardShopCoop.Steam
         {
             var bridge = new SteamBridgeImpl();
             bridge.Init();
-            return CoopApi.RegisterNetworkingBackend(new SteamNetworkingBackend(bridge));
+            var registration = CoopApi.RegisterNetworkingBackend(new SteamNetworkingBackend(bridge));
+            return new SteamRegistration(registration, bridge);
         }
 
         private void OnDestroy()
         {
             _registration?.Dispose();
             _registration = null;
+        }
+
+        /// <summary>Disposes the backend registration AND the Steam bridge's native callback
+        /// handles. Its own type keeps the JIT of <see cref="OnDestroy"/> free of any Steam-bearing
+        /// type: on a build carrying a Steamworks stub this instance is never created, so this
+        /// Steam-naming Dispose is never JITted - the same reason <see cref="Register"/> is
+        /// separate and NoInlining.</summary>
+        private sealed class SteamRegistration : IDisposable
+        {
+            private IDisposable _registration;
+            private SteamBridgeImpl _bridge;
+
+            internal SteamRegistration(IDisposable registration, SteamBridgeImpl bridge)
+            {
+                _registration = registration;
+                _bridge = bridge;
+            }
+
+            public void Dispose()
+            {
+                var registration = _registration;
+                var bridge = _bridge;
+                _registration = null;
+                _bridge = null;
+                try
+                {
+                    registration?.Dispose();
+                }
+                catch (Exception error)
+                {
+                    CoopPlugin.Log?.LogWarning("Steam backend unregister failed: " + error.Message);
+                }
+
+                try
+                {
+                    bridge?.Dispose();
+                }
+                catch (Exception error)
+                {
+                    CoopPlugin.Log?.LogWarning("Steam bridge dispose failed: " + error.Message);
+                }
+            }
         }
     }
 }

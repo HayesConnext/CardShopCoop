@@ -3,13 +3,13 @@
 True co-op multiplayer for TCG Card Shop Simulator. Both players must run the
 **same version** — the join handshake enforces it.
 
-## 2.0.7
+## 2.1.0
 - Fixed a freeze and crash that could happen shortly after joining when the host was in the middle of serving customers: the register's join catch-up could re-enter itself while applying the host's checkout state and loop until the game locked up. The catch-up now runs once and queues anything that arrives while it is applying. Thanks @muck270 on Discord for the report and logs!
 - Moved Direct IP connection details to remove invite codes and instead just use password / IP[:port].
 - Migrated networking modes to support hosting via two different methods e.g. Steam and Direct IP.
 - Enabled cross-build support, allowing Xbox and Steam clients to connect to each other. Deluxe furniture is now coalesced into rough equivalents when a client is missing them.
 - Fixed a rare error that could appear when leaving a session or stopping hosting.
-- Fixerd the hue slider in Character Creator being backwards. Thanks @zydesian on Discord for the report!
+- Fixed the hue slider in Character Creator being backwards. Thanks @zydesian on Discord for the report!
 - No longer disconnects for handler_failed, tries to gracefully continue. Reports of errors would still be helpful on our Discord!
 
 ## 2.0.6

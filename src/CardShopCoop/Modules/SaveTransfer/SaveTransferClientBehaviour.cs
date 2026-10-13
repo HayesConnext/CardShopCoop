@@ -20,7 +20,7 @@ namespace CardShopCoop.Modules.SaveTransfer
         private CoopRuntimeContext _context;
         private MemoryStream _saveBuffer;
         private MemoryStream _bundleBuffer;
-        private byte[] _pendingSave;
+        private MemoryStream _pendingSave;
         private int _saveExpected;
         private int _bundleExpected;
         private int _sessionGeneration;
@@ -198,9 +198,14 @@ namespace CardShopCoop.Modules.SaveTransfer
 
             try
             {
-                _pendingSave = SaveTransferStorage.GunzipCapped(_saveBuffer.ToArray(),
+                _saveBuffer.Position = 0;
+                _pendingSave = SaveTransferStorage.GunzipCapped(_saveBuffer,
                     SaveTransferStorage.MaxExpandedBytes);
-                SaveTransferStorage.ValidateSavePayload(_pendingSave);
+                if (!_pendingSave.TryGetBuffer(out var expanded) || expanded.Array == null)
+                {
+                    throw new InvalidDataException("The received world buffer is not accessible.");
+                }
+                SaveTransferStorage.ValidateSavePayload(expanded.Array, (int)_pendingSave.Length);
                 _saveDone = true;
                 _saveBuffer.Dispose();
                 _saveBuffer = null;
@@ -252,9 +257,19 @@ namespace CardShopCoop.Modules.SaveTransfer
             byte[] bundle;
             try
             {
-                bundle = _bundleExpected == 0 ? new byte[0]
-                    : SaveTransferStorage.GunzipCapped(_bundleBuffer.ToArray(),
-                        SaveTransferStorage.MaxExpandedBytes);
+                if (_bundleExpected == 0)
+                {
+                    bundle = new byte[0];
+                }
+                else
+                {
+                    _bundleBuffer.Position = 0;
+                    using (var expanded = SaveTransferStorage.GunzipCapped(_bundleBuffer,
+                        SaveTransferStorage.MaxExpandedBytes))
+                    {
+                        bundle = ToExactArray(expanded);
+                    }
+                }
             }
             catch (Exception error)
             {
@@ -300,7 +315,7 @@ namespace CardShopCoop.Modules.SaveTransfer
             }
         }
 
-        private void ApplySave(byte[] save, int generation)
+        private void ApplySave(MemoryStream save, int generation)
         {
             if (_shutdown || !SaveTransferRuntime.IsSessionGeneration(generation))
             {
@@ -315,6 +330,25 @@ namespace CardShopCoop.Modules.SaveTransfer
             {
                 RejectTransfer("could not start world apply: " + error.Message);
             }
+        }
+
+        /// <summary>Returns a byte[] whose Length is exactly the stream's length. A MemoryStream that
+        /// grew by doubling usually over-allocates its backing array, so when the exposed segment is
+        /// not exactly sized this is the single unavoidable copy the sidecar bundle needs.</summary>
+        private static byte[] ToExactArray(MemoryStream stream)
+        {
+            if (!stream.TryGetBuffer(out var segment) || segment.Array == null)
+            {
+                return stream.ToArray();
+            }
+            var length = (int)stream.Length;
+            if (segment.Offset == 0 && segment.Array.Length == length)
+            {
+                return segment.Array;
+            }
+            var exact = new byte[length];
+            Buffer.BlockCopy(segment.Array, segment.Offset, exact, 0, length);
+            return exact;
         }
 
         private bool CanReceive()
@@ -334,6 +368,7 @@ namespace CardShopCoop.Modules.SaveTransfer
             _bundleBuffer?.Dispose();
             _saveBuffer = null;
             _bundleBuffer = null;
+            _pendingSave?.Dispose();
             _pendingSave = null;
             SaveTransferRuntime.SetReloading(false);
             SetStatus("World transfer failed: " + reason);
@@ -382,6 +417,7 @@ namespace CardShopCoop.Modules.SaveTransfer
             _bundleBuffer?.Dispose();
             _saveBuffer = null;
             _bundleBuffer = null;
+            _pendingSave?.Dispose();
             _pendingSave = null;
             _sidecarWarning = null;
             _disconnectAfterFailureAt = 0f;

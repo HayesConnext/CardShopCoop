@@ -52,6 +52,7 @@ namespace CardShopCoop.Modules.SaveTransfer
         // injects this payload straight into CSaveLoad.m_SavedGame with the same Unity parser the host
         // serialized with, so the world loads identically on both backends. Main-thread only.
         private static byte[] _borrowedWorldPayload;
+        private static int _borrowedWorldPayloadLength;
         private static int _borrowedWorldSlot = NoSlot;
 
         public static int CoopSlot
@@ -340,23 +341,41 @@ namespace CardShopCoop.Modules.SaveTransfer
 
         internal static void ValidateSavePayload(byte[] bytes)
         {
-            if (bytes == null || bytes.Length < 32)
+            if (bytes == null)
             {
                 throw new InvalidDataException("Save payload is empty or too small.");
             }
-            var json = new UTF8Encoding(false).GetString(bytes).TrimStart('\uFEFF', ' ', '\r', '\n', '\t');
+            ValidateSavePayload(bytes, bytes.Length);
+        }
+
+        /// <summary>Validates only the leading bytes of a save payload. The world JSON is a single
+        /// object whose first non-whitespace character is '{', so decoding the whole 512 MiB payload
+        /// into a string just to inspect that character would allocate the entire world twice.</summary>
+        internal static void ValidateSavePayload(byte[] buffer, int length)
+        {
+            const int prefixBytes = 64;
+            if (buffer == null || length < 32)
+            {
+                throw new InvalidDataException("Save payload is empty or too small.");
+            }
+            var json = new UTF8Encoding(false).GetString(buffer, 0, Math.Min(length, prefixBytes))
+                .TrimStart('\uFEFF', ' ', '\r', '\n', '\t');
             if (!json.StartsWith("{", StringComparison.Ordinal))
             {
                 throw new InvalidDataException("Save payload is not a JSON world.");
             }
         }
 
-        public static void ApplyAndLoadAsync(byte[] saveBytes, int sessionGeneration,
+        public static void ApplyAndLoadAsync(MemoryStream save, int sessionGeneration,
             Action completed, Action<Exception> failed)
         {
-            ValidateSavePayload(saveBytes);
-            var copy = new byte[saveBytes.Length];
-            Buffer.BlockCopy(saveBytes, 0, copy, 0, saveBytes.Length);
+            if (!save.TryGetBuffer(out var segment) || segment.Array == null)
+            {
+                throw new InvalidOperationException("The received world buffer is not accessible.");
+            }
+            var buffer = segment.Array;
+            var length = (int)save.Length;
+            ValidateSavePayload(buffer, length);
             var thread = new Thread(() =>
             {
                 try
@@ -381,7 +400,13 @@ namespace CardShopCoop.Modules.SaveTransfer
                             throw new IOException("A previous co-op save could not be cleared.");
                         }
 
-                        File.WriteAllBytes(path, copy);
+                        // Stream the buffer straight to disk; the expanded world is never copied
+                        // into a second full-size array.
+                        using (var file = new FileStream(path, FileMode.Create, FileAccess.Write,
+                            FileShare.None))
+                        {
+                            file.Write(buffer, 0, length);
+                        }
                     }
 
                     if (!SaveTransferRuntime.IsSessionGeneration(sessionGeneration))
@@ -398,7 +423,7 @@ namespace CardShopCoop.Modules.SaveTransfer
                         }
                         try
                         {
-                            ApplyAndLoad(copy);
+                            ApplyAndLoad(buffer, length);
                             completed?.Invoke();
                         }
                         catch (Exception error)
@@ -428,9 +453,9 @@ namespace CardShopCoop.Modules.SaveTransfer
         }
 
         /// <summary>Apply the borrowed world on Unity's main thread and enter vanilla's load path.</summary>
-        public static void ApplyAndLoad(byte[] saveBytes)
+        public static void ApplyAndLoad(byte[] buffer, int length)
         {
-            ValidateSavePayload(saveBytes);
+            ValidateSavePayload(buffer, length);
             var manager = SceneRef<CGameManager>.Get();
             if (manager == null)
             {
@@ -446,20 +471,22 @@ namespace CardShopCoop.Modules.SaveTransfer
             // successful on BOTH backends, so EPL's per-slot load prefix and the game's
             // PropagateLoadData both still run exactly as they do for a local save.
             manager.m_ForceNoCloudSaveLoad = true;
-            CoopPlugin.Log.LogInfo("Coop save received (" + saveBytes.Length / 1024 + " KB), loading world...");
+            CoopPlugin.Log.LogInfo("Coop save received (" + length / 1024 + " KB), loading world...");
             // One-shot: the native load that follows is the host's save, whose gated enum ids are
             // in the host's space; translate them before the game propagates them.
             SaveEnumRemap.Arm();
-            ArmBorrowedWorld(saveBytes, CoopSlot);
+            ArmBorrowedWorld(buffer, length, CoopSlot);
             ForceLoadSlot(CoopSlot);
         }
 
         /// <summary>Arm the one-shot borrowed-world payload the CSaveLoad.Load prefix consumes.
-        /// Called on Unity's main thread immediately before the load of the borrowed world.</summary>
-        internal static void ArmBorrowedWorld(byte[] saveBytes, int slot)
+        /// Called on Unity's main thread immediately before the load of the borrowed world. The
+        /// buffer is referenced, not copied; <paramref name="length"/> is the valid prefix.</summary>
+        internal static void ArmBorrowedWorld(byte[] buffer, int length, int slot)
         {
             _borrowedWorldSlot = slot;
-            _borrowedWorldPayload = saveBytes;
+            _borrowedWorldPayload = buffer;
+            _borrowedWorldPayloadLength = length;
         }
 
         /// <summary>
@@ -478,7 +505,9 @@ namespace CardShopCoop.Modules.SaveTransfer
                 return false;
             }
 
+            var length = _borrowedWorldPayloadLength;
             _borrowedWorldPayload = null;
+            _borrowedWorldPayloadLength = 0;
             _borrowedWorldSlot = NoSlot;
 
             var field = typeof(CSaveLoad).GetField("m_SavedGame",
@@ -489,7 +518,7 @@ namespace CardShopCoop.Modules.SaveTransfer
                     "CSaveLoad.m_SavedGame was not found, so the borrowed world cannot be injected.");
             }
 
-            var json = new UTF8Encoding(false).GetString(payload)
+            var json = new UTF8Encoding(false).GetString(payload, 0, length)
                 .TrimStart('\uFEFF', ' ', '\r', '\n', '\t');
             var world = JsonUtility.FromJson(json, field.FieldType);
             if (world == null)
@@ -508,6 +537,7 @@ namespace CardShopCoop.Modules.SaveTransfer
         internal static void ResetBorrowedWorld()
         {
             _borrowedWorldPayload = null;
+            _borrowedWorldPayloadLength = 0;
             _borrowedWorldSlot = NoSlot;
         }
 
@@ -567,33 +597,45 @@ namespace CardShopCoop.Modules.SaveTransfer
             return _startSceneName;
         }
 
-        internal static byte[] GunzipCapped(byte[] compressed, int cap)
+        /// <summary>Gunzips a compressed transfer into a freshly grown <see cref="MemoryStream"/>
+        /// positioned at 0, enforcing the same transfer and decompression caps as before. The stream
+        /// is returned without a final <c>ToArray()</c>: callers read it through
+        /// <see cref="MemoryStream.TryGetBuffer"/> so the expanded world is never duplicated.</summary>
+        internal static MemoryStream GunzipCapped(Stream compressed, int cap)
         {
             if (compressed == null || compressed.Length == 0)
             {
-                return new byte[0];
+                return new MemoryStream();
             }
             if (compressed.Length > MaxTransferBytes || cap <= 0 || cap > MaxExpandedBytes)
             {
                 throw new InvalidDataException("Compressed transfer exceeds its safety limit.");
             }
 
-            using (var source = new MemoryStream(compressed, false))
-            using (var gzip = new System.IO.Compression.GZipStream(source,
-                System.IO.Compression.CompressionMode.Decompress))
-            using (var destination = new MemoryStream())
+            var destination = new MemoryStream();
+            try
             {
-                var buffer = new byte[64 * 1024];
-                int read;
-                while ((read = gzip.Read(buffer, 0, buffer.Length)) > 0)
+                using (var gzip = new System.IO.Compression.GZipStream(compressed,
+                    System.IO.Compression.CompressionMode.Decompress, leaveOpen: true))
                 {
-                    if (destination.Length + read > cap)
+                    var buffer = new byte[64 * 1024];
+                    int read;
+                    while ((read = gzip.Read(buffer, 0, buffer.Length)) > 0)
                     {
-                        throw new InvalidDataException("Compressed transfer exceeds decompression limit.");
+                        if (destination.Length + read > cap)
+                        {
+                            throw new InvalidDataException("Compressed transfer exceeds decompression limit.");
+                        }
+                        destination.Write(buffer, 0, read);
                     }
-                    destination.Write(buffer, 0, read);
                 }
-                return destination.ToArray();
+                destination.Position = 0;
+                return destination;
+            }
+            catch
+            {
+                destination.Dispose();
+                throw;
             }
         }
     }
