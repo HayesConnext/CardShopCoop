@@ -12,6 +12,7 @@ True co-op multiplayer for TCG Card Shop Simulator. Both players must run the
 - Fixed a rare error that could appear when leaving a session or stopping hosting.
 - Fixed the hue slider in Character Creator being backwards. Thanks @zydesian on Discord for the report!
 - No longer disconnects for handler_failed, tries to gracefully continue. Reports of errors would still be helpful on our Discord!
+- Updated register pathways for NPC puppets to cause less of a jolt when they enter the register and place items down
 
 ## 2.0.6
 - Fixed an issue with EPL synchronization that caused clients to disconnect after joining. Thanks @muck270 on Discord for the report.

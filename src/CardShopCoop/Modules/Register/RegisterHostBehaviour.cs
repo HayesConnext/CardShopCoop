@@ -30,7 +30,15 @@ namespace CardShopCoop.Modules.Register
         private CoopRuntimeContext _context;
         private Harmony _harmony;
         private bool _shutdown;
+        private bool _buildingBaseline;
         private Guid _intentPredictionId;
+        // True while vanilla runs Customer.WaypointEndUpdate's paying-position block. Vanilla
+        // announces the customer (UpdateCurrentCustomer) before it registers the bag for scanning
+        // (RegisterScanItem), so a customer lifecycle built from the announcement reads every
+        // never-registered item as already scanned and every guest scanned the whole bag the
+        // moment the customer set it down. CustomerArrivalPatch suppresses that publish and owns
+        // the arrival publish instead, from after the registration loop has run.
+        private bool _insideCustomerArrival;
         private readonly Dictionary<int, Station> _stations = new();
 
         private void OnEnable()
@@ -47,6 +55,7 @@ namespace CardShopCoop.Modules.Register
             Patch(typeof(ManningPatch));
             Patch(typeof(ExitPatch));
             Patch(typeof(CustomerPatch));
+            Patch(typeof(CustomerArrivalPatch));
             Patch(typeof(StatePatch));
             Patch(typeof(PaymentPatch));
             Patch(typeof(ChangePhasePatch));
@@ -158,7 +167,7 @@ namespace CardShopCoop.Modules.Register
                             + connection.Id, message);
                     }
 
-                    Reject(connection.Id, message.PredictionId);
+                    RejectCheckout(connection.Id, index, message.PredictionId);
                     return;
                 }
 
@@ -367,6 +376,11 @@ namespace CardShopCoop.Modules.Register
                         + station.CustomerGeneration + " -> " + generation
                         + " (pooled customer reused).");
                     station.CustomerGeneration = (uint)generation;
+                    // Re-syncing the generation is only half the promise: the client rebuilds its
+                    // carrier when it learns the new generation, so the advance has to be published.
+                    // Without this the guest kept the old generation, every customer-gated delta was
+                    // deferred against it, and its carrier stayed on the previous customer's bag.
+                    PublishObservedCustomer(index, station, customer);
                 }
             }
 
@@ -418,16 +432,27 @@ namespace CardShopCoop.Modules.Register
         {
             var baseline = new RegisterBaselineMessage();
             var counters = RegisterInterop.Counters;
-            for (var i = 0; counters != null && i < counters.Count; i++)
+            // Building the join baseline observes every counter, and an observation can notice a
+            // pooled customer's generation advance. The baseline already carries each counter's
+            // current generation, so the live resync broadcast must not fire from this path.
+            _buildingBaseline = true;
+            try
             {
-                var counter = counters[i];
-                var key = counter == null ? 0 : RegisterInterop.Key(counter);
-                if (key == 0)
+                for (var i = 0; counters != null && i < counters.Count; i++)
                 {
-                    continue;
-                }
+                    var counter = counters[i];
+                    var key = counter == null ? 0 : RegisterInterop.Key(counter);
+                    if (key == 0)
+                    {
+                        continue;
+                    }
 
-                baseline.Counters.Add(BuildBaselineCounter(key, counter));
+                    baseline.Counters.Add(BuildBaselineCounter(key, counter));
+                }
+            }
+            finally
+            {
+                _buildingBaseline = false;
             }
 
             return baseline;
@@ -477,6 +502,17 @@ namespace CardShopCoop.Modules.Register
 
         private static void AddLines(List<RegisterLine> lines, Customer customer)
         {
+            // A bag item is registered for scanning (InteractableScanItem.m_CurrentCustomer set)
+            // only once the customer reaches the paying position, and IsNotScanned() is
+            // m_CurrentCustomer != null - so an item that was simply never registered reads
+            // exactly like "already scanned". Two windows can publish a lifecycle while the bag is
+            // not yet registered: a re-anchor sent while the customer is still walking to the
+            // counter, and the arrival announcement itself (UpdateCurrentCustomer runs before
+            // RegisterScanItem in Customer.WaypointEndUpdate - see CustomerArrivalPatch, which
+            // owns the arrival publish). Gate the flag on the customer actually being at the
+            // paying position so both windows read every line as un-scanned.
+            var atPayingPosition = RegisterInterop.Read(customer, "m_IsAtPayingPosition") is bool atPaying
+                && atPaying;
             var items = customer.GetItemInBagList();
             for (var i = 0; items != null && i < items.Count; i++)
             {
@@ -485,7 +521,7 @@ namespace CardShopCoop.Modules.Register
                 {
                     ItemType = item == null ? EItemType.None : item.GetItemType(),
                     Price = item == null ? 0f : item.GetCurrentPrice(),
-                    Scanned = item != null && item.m_InteractableScanItem != null
+                    Scanned = atPayingPosition && item != null && item.m_InteractableScanItem != null
                         && !item.m_InteractableScanItem.IsNotScanned(),
                 });
             }
@@ -499,7 +535,7 @@ namespace CardShopCoop.Modules.Register
                     IsCard = true,
                     Card = card?.m_Card3dUI?.m_CardUI?.GetCardData(),
                     Price = card == null ? 0f : card.GetCurrentPrice(),
-                    Scanned = card != null && !card.IsNotScanned(),
+                    Scanned = atPayingPosition && card != null && !card.IsNotScanned(),
                 });
             }
         }
@@ -674,6 +710,79 @@ namespace CardShopCoop.Modules.Register
             }
         }
 
+        /// <summary>Builds the full authoritative customer + phase state for one counter as a
+        /// <see cref="RegisterDeltaKind.CustomerLifecycle"/> delta. Used both to re-anchor a guest
+        /// whose station has gone stale (a reused pooled customer, or a checkout the host refused)
+        /// and by the join baseline's live equivalent. The guest rebuilds its carrier from
+        /// <see cref="RegisterDeltaMessage.Lines"/> and applies the phase, so a divergent bag,
+        /// cash/card offer or total is replaced by authority instead of lingering.</summary>
+        private RegisterDeltaMessage BuildCustomerState(int index, Station station, Customer customer,
+            Guid predictionId)
+        {
+            var counter = RegisterInterop.CounterForKey(index);
+            var delta = new RegisterDeltaMessage
+            {
+                Kind = RegisterDeltaKind.CustomerLifecycle,
+                CounterKey = index,
+                CounterGeneration = station.CounterGeneration,
+                PredictionId = predictionId,
+                HasCustomer = customer != null,
+            };
+            if (customer != null)
+            {
+                delta.CustomerIndex = RegisterInterop.CustomerIndex(customer);
+                delta.CustomerGeneration = (int)station.CustomerGeneration;
+                delta.CustomerTotal = Convert.ToDouble(RegisterInterop.Read(customer,
+                    "m_TotalScannedItemCost") ?? 0f);
+                AddLines(delta.Lines, customer);
+            }
+
+            FillPhase(delta, counter);
+            return delta;
+        }
+
+        /// <summary>Answers a rejected checkout with this counter's authoritative customer and
+        /// phase under the rejected prediction id, then sends the generic rollback (the store-access
+        /// pattern). The requester's handler <c>Confirm</c> retires the rejected action and applies
+        /// this authority, so the trailing rollback is ignored as already-resolved instead of
+        /// inverting a snapshot the host has moved past. Broadcast rather than sent to the requester
+        /// alone: every guest mirrors every counter's customer, and the id is unknown to the others,
+        /// so their <c>Confirm</c> simply applies the authority too. This is what corrects a checkout
+        /// the host refused: without it the guest kept its own stale bag, cash/card offer and total
+        /// until some later delta happened to land - the negative balance due and the "customer
+        /// holds neither cash nor card" report.</summary>
+        private void PublishRejectionState(int connectionId, int index, Guid predictionId)
+        {
+            if (_shutdown || !_context.InGame() || index == 0)
+            {
+                return;
+            }
+
+            var counter = RegisterInterop.CounterForKey(index);
+            if (counter == null)
+            {
+                return;
+            }
+
+            var station = ObservePublishing(index, counter);
+            CoopPlugin.Log.LogInfo("[register] re-anchoring counter " + index + " after rejecting "
+                + "conn " + connectionId + " pred=" + predictionId + ".");
+            Broadcast(BuildCustomerState(index, station, counter.m_CurrentCustomer, predictionId));
+        }
+
+        /// <summary>Re-anchors every guest after <see cref="Observe"/> advanced a station's
+        /// generation for a reused pooled customer. Prediction-free: this corrects state, it does
+        /// not confirm an intent.</summary>
+        private void PublishObservedCustomer(int index, Station station, Customer customer)
+        {
+            if (_shutdown || _buildingBaseline || !_context.InGame() || index == 0)
+            {
+                return;
+            }
+
+            Broadcast(BuildCustomerState(index, station, customer, Guid.Empty));
+        }
+
         private void PublishChange(InteractableCounterMoneyChange change, bool takeBack)
         {
             var counter = change?.m_CashierCounter;
@@ -788,6 +897,15 @@ namespace CardShopCoop.Modules.Register
             {
                 PredictionApi.Rollback(_context, connectionId, predictionId);
             }
+        }
+
+        /// <summary>A rejected checkout first carries the counter's authoritative state back to
+        /// every guest, then sends the generic rollback (see <see cref="PublishRejectionState"/>).
+        /// Claim/release rejections are ownership only and carry no checkout state to re-anchor.</summary>
+        private void RejectCheckout(int connectionId, int index, Guid predictionId)
+        {
+            PublishRejectionState(connectionId, index, predictionId);
+            Reject(connectionId, predictionId);
         }
 
         private static void CreditGuestCheckout()
@@ -941,7 +1059,77 @@ namespace CardShopCoop.Modules.Register
         {
             [HarmonyPostfix]
             private static void Postfix(InteractableCashierCounter __instance)
-                => _active?.PublishCustomerLifecycle(Key(__instance));
+            {
+                var active = _active;
+                // The one non-null announcement in vanilla is the customer's arrival, and it is
+                // always mid-block (before the bag is registered for scanning), so its lifecycle
+                // is owned by CustomerArrivalPatch. Only the customer-left and counter-reset
+                // announcements (null, no lines) publish from here.
+                if (active != null && !active._insideCustomerArrival)
+                {
+                    active.PublishCustomerLifecycle(Key(__instance));
+                }
+            }
+        }
+
+        [HarmonyPatch(typeof(Customer), "WaypointEndUpdate")]
+        private static class CustomerArrivalPatch
+        {
+            // Vanilla announces the arrival and registers the bag in one paying-position block, in
+            // that order: UpdateCurrentCustomer runs before RegisterScanItem/RegisterScanCard, so
+            // a lifecycle built from the announcement read IsNotScanned() == false ("already
+            // scanned") for every line that was merely not-yet-registered, and guests scanned the
+            // customer's whole bag the moment it was placed on the counter. Publish once the block
+            // has run instead - at that point the bag is registered and "un-scanned" means the
+            // item is waiting on the counter, exactly what the guest must show. Gated on the
+            // paying-position transition (false -> true) so the frames where the method
+            // early-returns for a customer already at the counter publish nothing.
+            [HarmonyPrefix]
+            [HarmonyPriority(Priority.First)]
+            private static void Prefix(Customer __instance, out bool __state)
+            {
+                var active = _active;
+                if (active == null)
+                {
+                    __state = true;
+                    return;
+                }
+
+                __state = RegisterInterop.Read(__instance, "m_IsAtPayingPosition") is bool atPaying
+                    && atPaying;
+                active._insideCustomerArrival = true;
+            }
+
+            [HarmonyPostfix]
+            private static void Postfix(Customer __instance, bool __state)
+            {
+                var active = _active;
+                if (active == null)
+                {
+                    return;
+                }
+
+                active._insideCustomerArrival = false;
+                if (__state
+                    || !(RegisterInterop.Read(__instance, "m_IsAtPayingPosition") is bool atPaying
+                        && atPaying))
+                {
+                    return;
+                }
+
+                active.PublishCustomerLifecycle(
+                    RegisterInterop.Key(RegisterInterop.CounterFor(__instance)));
+            }
+
+            [HarmonyFinalizer]
+            private static void Finalizer()
+            {
+                var active = _active;
+                if (active != null)
+                {
+                    active._insideCustomerArrival = false;
+                }
+            }
         }
 
         [HarmonyPatch(typeof(InteractableCashierCounter), "UpdateCashierCounterState")]

@@ -346,6 +346,36 @@ namespace CardShopCoop.Modules.Npc
             => !string.IsNullOrEmpty(charName)
                 && charName.StartsWith("Female", StringComparison.Ordinal);
 
+        /// <summary>Dresses the real pooled customer for an identity in place - the same
+        /// name-based resolution the puppet clones run (CharacterName + Initialize, which
+        /// re-resolves the preset and destroys/replaces each hair and apparel slot), so the
+        /// actual NPC object carries the synced look. Borrowers then reuse the dressed NPC
+        /// directly instead of cloning a lookalike. A member already wearing the name is left
+        /// untouched - no re-dress churn on repeat visits. Runs under Redress's _dressing
+        /// guard.</summary>
+        private static void DressRealCustomer(ushort index, string charName)
+        {
+            if (string.IsNullOrEmpty(charName))
+            {
+                return;
+            }
+
+            var customers = NpcInterop.CustomerManager?.GetCustomerList();
+            if (customers == null || index >= customers.Count)
+            {
+                return;
+            }
+
+            var custom = customers[index]?.m_CharacterCustom;
+            if (custom == null || (custom.m_HasInit && custom.CharacterName == charName))
+            {
+                return;
+            }
+
+            custom.CharacterName = charName;
+            custom.Initialize();
+        }
+
         /// <summary>A puppet already wearing exactly the look an identity packet describes.
         /// Appearance is a pure function of gender and character name (the game resolves the
         /// preset by name), so equal values mean no re-dress is needed even when the wire
@@ -1118,6 +1148,10 @@ namespace CardShopCoop.Modules.Npc
             public int RootInstanceId;
             public Animator Anim;
             public CC.CharacterCustomization Custom;
+            // The clone's own (behaviour-disabled) Customer component: its fields reference the
+            // clone's animator and prop children, so presentation applies through the one shared
+            // routine instead of the per-prop captures below. Null for worker puppets.
+            public Customer Customer;
             public GameObject Bag;
             public GameObject Cash;
             public GameObject CardFan;
@@ -1175,6 +1209,7 @@ namespace CardShopCoop.Modules.Npc
             public int RootInstanceId;
             public Animator Anim;
             public CC.CharacterCustomization Custom;
+            public Customer Customer;
             public GameObject Bag;
             public GameObject Cash;
             public GameObject CardFan;
@@ -1279,6 +1314,7 @@ namespace CardShopCoop.Modules.Npc
                 RootInstanceId = p.RootInstanceId,
                 Anim = p.Anim,
                 Custom = p.Custom,
+                Customer = p.Customer,
                 Bag = p.Bag,
                 Cash = p.Cash,
                 CardFan = p.CardFan,
@@ -1300,6 +1336,7 @@ namespace CardShopCoop.Modules.Npc
             p.RootInstanceId = 0;
             p.Anim = null;
             p.Custom = null;
+            p.Customer = null;
             p.Bag = null;
             p.Cash = null;
             p.CardFan = null;
@@ -1427,6 +1464,7 @@ namespace CardShopCoop.Modules.Npc
             p.RootInstanceId = visual.RootInstanceId;
             p.Anim = visual.Anim;
             p.Custom = visual.Custom;
+            p.Customer = visual.Customer;
             p.Bag = visual.Bag;
             p.Cash = visual.Cash;
             p.CardFan = visual.CardFan;
@@ -1719,11 +1757,48 @@ namespace CardShopCoop.Modules.Npc
             var key = (KindCustomer << 16) | index;
             if (_active._puppets.TryGetValue(key, out var puppet))
             {
-                puppet.Go?.SetActive(!keepPuppetVisible);
+                if (!keepPuppetVisible && puppet.Go != null)
+                {
+                    // A real-body borrow (the register) takes over the walking mirror's exact
+                    // tracked pose and snapshot history: the real NPC continues the puppet's
+                    // trajectory instead of teleporting to its seeded spot or gliding in from
+                    // it. The puppet itself is parked below and keeps buffering for the
+                    // hand-back at detach.
+                    customer.transform.position = puppet.Go.transform.position;
+                    customer.transform.rotation = puppet.Go.transform.rotation;
+                    existing.PrevRenderedPos = puppet.PrevRenderedPos;
+                    existing.RenderYaw = puppet.RenderYaw;
+                    existing.AnimSpeed = puppet.AnimSpeed;
+                    existing.AppliedAnimSpeed = puppet.AppliedAnimSpeed;
+                    existing.BufHead = puppet.BufHead;
+                    existing.BufCount = puppet.BufCount;
+                    for (var i = 0; i < puppet.Buf.Length; i++)
+                    {
+                        existing.Buf[i] = puppet.Buf[i];
+                    }
+                }
+
+                // keepPuppetVisible borrows that render the clone (trade) reveal it the same
+                // frame the borrow takes the customer - hiding it here left a one-to-two frame
+                // hole before the puppet appeared. Reveal only a body that already wears this
+                // incarnation's look; a stale or still-unnamed body stays hidden for the
+                // identity pass to rebuild and reveal through the snapshot path.
+                puppet.Go?.SetActive(keepPuppetVisible && puppet.HasIdentity
+                    && puppet.Identity == generation);
             }
             _customerPoolChanged.Raise();
             _pendingExistingCustomerChanged[index] =
                 new ExistingCustomerChange(generation, customer);
+
+            // The client suppresses vanilla Customer.ActivateCustomer (and Start), so a pooled
+            // customer's interaction and prop children carry whatever state the prefab or a
+            // previous incarnation left behind. This borrow just made the real body the visible
+            // one, so present it in the vanilla activation state (flags = none) through the one
+            // shared routine; the authoritative flag application then applies on top from the
+            // snapshots - the pose handoff above deliberately leaves AppliedFlags at the
+            // force-apply sentinel so that first push is unconditional.
+            ApplyPresentation(customer, (NpcFlags)0);
+            customer.m_InteractCollider?.SetActive(false);
         }
 
         public static bool IsExistingCustomer(Customer customer)
@@ -2199,32 +2274,35 @@ namespace CardShopCoop.Modules.Npc
                 : actionKind == 2 ? "GrabItemHigh" : "GrabItem");
         }
 
-        private static void ApplyExistingFlags(Customer customer, NpcFlags flags, float speed)
+        /// <summary>The single customer presentation routine: applies one authoritative flag set to
+        /// a customer object's animator parameters and prop children. Every customer surface goes
+        /// through it - walking puppet clones, the borrowed real customer at the register, and the
+        /// spawn/attach reset (flags = none is vanilla's activation presentation state, i.e. the
+        /// prop block of Customer.ActivateCustomer). Vanilla's own per-state writes live inside
+        /// the Update state machine the client cannot run (it would run the host's AI), so this
+        /// mapping is the one irreducible sync surface. The per-frame MoveSpeed blend stays with
+        /// the interpolation loops.</summary>
+        private static void ApplyPresentation(Customer customer, NpcFlags flags)
         {
             if (customer.m_Anim == null)
             {
                 return;
             }
 
-            customer.m_Anim.SetFloat(HashMoveSpeed, speed);
             customer.m_Anim.SetBool(HashHoldingBag, (flags & NpcFlags.HoldingBag) != 0);
             customer.m_Anim.SetBool(HashHandingOverCash, (flags & NpcFlags.HandingOverCash) != 0);
             customer.m_Anim.SetBool(HashIsSitting, (flags & NpcFlags.IsSitting) != 0);
             customer.m_Anim.SetBool(HashIsPlaying, (flags & NpcFlags.IsPlaying) != 0);
             customer.m_Anim.SetBool(HashIsHoldingBox, (flags & NpcFlags.IsHoldingBox) != 0);
             customer.m_Anim.SetBool(HashIsBeingSprayed, (flags & NpcFlags.Sprayed) != 0);
-            customer.m_ShoppingBagTransform?.gameObject.SetActive((flags & NpcFlags.HoldingBag) != 0);
-
-            customer.m_CustomerCash?.gameObject.SetActive((flags & NpcFlags.HandingOverCash) != 0);
-
+            customer.m_ShoppingBagTransform?.gameObject.SetActive(
+                (flags & NpcFlags.HoldingBag) != 0);
+            customer.m_CustomerCash?.gameObject.SetActive(
+                (flags & NpcFlags.HandingOverCash) != 0);
             customer.m_GameCardFanOut?.SetActive((flags & NpcFlags.IsPlaying) != 0);
-
             customer.m_GameCardSingle?.SetActive((flags & NpcFlags.IsPlaying) != 0);
-
             customer.m_SmellyFX?.SetActive((flags & NpcFlags.Smelly) != 0);
-
             customer.m_CleanFX?.SetActive((flags & NpcFlags.Cleaned) != 0);
-
             customer.m_ExclaimationMesh?.SetActive((flags & NpcFlags.Exclaim) != 0);
         }
 
@@ -2238,6 +2316,18 @@ namespace CardShopCoop.Modules.Npc
             _dressing = true;
             try
             {
+                // The look belongs to the real NPC, and this is the one chokepoint every look
+                // application flows through (spawn identity, join baseline, re-dress): whenever
+                // a customer puppet is dressed, the real pooled customer for that index is
+                // dressed in place with the same authoritative name. Borrowers (the register)
+                // then reuse an already-dressed NPC instead of cloning a lookalike. A member
+                // already wearing the name is left untouched; on a real change the game's own
+                // setHair/setApparel destroy and replace each slot.
+                if (kind == KindCustomer)
+                {
+                    DressRealCustomer(index, charName);
+                }
+
                 ReDress(puppet, charName, pos, female, kind, index);
             }
             finally
@@ -2375,22 +2465,32 @@ namespace CardShopCoop.Modules.Npc
                 }
                 if ((int)p.Flags != p.AppliedFlags)
                 {
-                    if (p.Anim != null)
+                    if (p.Customer != null)
                     {
-                        p.Anim.SetBool(HashHoldingBag, (p.Flags & NpcFlags.HoldingBag) != 0);
-                        p.Anim.SetBool(HashHandingOverCash, (p.Flags & NpcFlags.HandingOverCash) != 0);
-                        p.Anim.SetBool(HashIsSitting, (p.Flags & NpcFlags.IsSitting) != 0);
-                        p.Anim.SetBool(HashIsPlaying, (p.Flags & NpcFlags.IsPlaying) != 0);
-                        p.Anim.SetBool(HashIsHoldingBox, (p.Flags & NpcFlags.IsHoldingBox) != 0);
-                        p.Anim.SetBool(HashIsBeingSprayed, (p.Flags & NpcFlags.Sprayed) != 0);
+                        // Customer clones present through the same single routine as the real
+                        // customer - the routine drives the clone's own animator and prop
+                        // children, which is what the p.Bag/p.Cash captures reference.
+                        ApplyPresentation(p.Customer, p.Flags);
                     }
-                    Toggle(p.Bag, (p.Flags & NpcFlags.HoldingBag) != 0);
-                    Toggle(p.Cash, (p.Flags & NpcFlags.HandingOverCash) != 0);
-                    Toggle(p.CardFan, (p.Flags & NpcFlags.IsPlaying) != 0);
-                    Toggle(p.CardSingle, (p.Flags & NpcFlags.IsPlaying) != 0);
-                    Toggle(p.Smelly, (p.Flags & NpcFlags.Smelly) != 0);
-                    Toggle(p.Clean, (p.Flags & NpcFlags.Cleaned) != 0);
-                    Toggle(p.Exclaim, (p.Flags & NpcFlags.Exclaim) != 0);
+                    else
+                    {
+                        // Worker clones have no Customer component; their flag surface is the
+                        // animator parameters and the trade prompt.
+                        if (p.Anim != null)
+                        {
+                            p.Anim.SetBool(HashHoldingBag, (p.Flags & NpcFlags.HoldingBag) != 0);
+                            p.Anim.SetBool(HashHandingOverCash,
+                                (p.Flags & NpcFlags.HandingOverCash) != 0);
+                            p.Anim.SetBool(HashIsSitting, (p.Flags & NpcFlags.IsSitting) != 0);
+                            p.Anim.SetBool(HashIsPlaying, (p.Flags & NpcFlags.IsPlaying) != 0);
+                            p.Anim.SetBool(HashIsHoldingBox,
+                                (p.Flags & NpcFlags.IsHoldingBox) != 0);
+                            p.Anim.SetBool(HashIsBeingSprayed, (p.Flags & NpcFlags.Sprayed) != 0);
+                        }
+
+                        Toggle(p.Exclaim, (p.Flags & NpcFlags.Exclaim) != 0);
+                    }
+
                     p.AppliedFlags = (int)p.Flags;
                 }
                 if (p.Kind == KindWorker)
@@ -2446,8 +2546,7 @@ namespace CardShopCoop.Modules.Npc
                 }
                 if ((int)mirror.Flags != mirror.AppliedFlags)
                 {
-                    ApplyExistingFlags(mirror.Customer, mirror.Flags, mirror.AnimSpeed);
-                    mirror.AppliedAnimSpeed = mirror.AnimSpeed;
+                    ApplyPresentation(mirror.Customer, mirror.Flags);
                     mirror.AppliedFlags = (int)mirror.Flags;
                 }
             }
@@ -2926,6 +3025,7 @@ namespace CardShopCoop.Modules.Npc
             // capture prop children BEFORE stripping the Customer script
             if (cust != null)
             {
+                p.Customer = cust;
                 p.Bag = cust.m_ShoppingBagTransform?.gameObject;
                 p.Cash = cust.m_CustomerCash?.gameObject;
                 p.CardFan = cust.m_GameCardFanOut;
@@ -2933,17 +3033,10 @@ namespace CardShopCoop.Modules.Npc
                 p.Smelly = cust.m_SmellyFX; // plain child FX object, survives the strip
                 p.Clean = cust.m_CleanFX; // clean puff FX shown after a spray
                 p.Exclaim = cust.m_ExclaimationMesh; // the "!" trade prompt, driven by flags below
-                Toggle(p.Bag, false);
-                Toggle(p.Cash, false);
-                Toggle(p.CardFan, false);
-                Toggle(p.CardSingle, false);
-                cust.m_CleanFX?.SetActive(false);
-
-                cust.m_ExclaimationMesh?.SetActive(false);
-
+                // Vanilla activation presentation (flags = none): everything stays off until the
+                // authoritative snapshots say otherwise.
+                ApplyPresentation(cust, (NpcFlags)0);
                 cust.m_InteractCollider?.SetActive(false);
-
-                cust.m_SmellyFX?.SetActive(false);
             }
 
             else if (worker != null)

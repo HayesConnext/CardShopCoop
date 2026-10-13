@@ -29,12 +29,6 @@ namespace CardShopCoop.Modules.Register
             public int CustomerIndex = -1;
             public int CustomerGeneration;
             public uint CounterGeneration;
-            // The Npc module renders the dressed clone for a customer whose identity it mirrors, so
-            // the register carrier is only the interaction/logic object. Its renderers are hidden
-            // while that clone is ready and restored on release; the states are captured at build
-            // time so a renderer disabled for another reason comes back exactly as it was.
-            public Renderer[] MaskedRenderers;
-            public bool[] RendererStates;
         }
 
         private sealed class CheckoutUndo
@@ -167,7 +161,6 @@ namespace CardShopCoop.Modules.Register
             SceneManager.sceneLoaded += OnSceneLoaded;
             NpcClientBehaviour.CustomerManagerReady += OnReadinessSignal;
             NpcClientBehaviour.CustomerPoolChanged += OnReadinessSignal;
-            NpcClientBehaviour.ExistingCustomerPuppetReady += OnExistingCustomerPuppetReady;
             // Registers are addressed by their stable placement key; the key only resolves once
             // the placement channel has bound this peer's counter identities, so retry the register
             // baseline/deltas whenever that structure changes.
@@ -533,6 +526,14 @@ namespace CardShopCoop.Modules.Register
                 return;
             }
 
+            // Replay the host's per-line Scanned flags: a re-anchor can rebuild the carrier from the
+            // host's current bag, so the rebuilt register must show exactly the items the host has
+            // already scanned. Safe since the host gates Scanned on the customer being at the paying
+            // position - the point at which the game registers the bag for scanning - so before that
+            // every line reads un-scanned and this replay is a no-op. Idempotent: a line whose item
+            // is already scanned is skipped, and the phase that follows writes the host's absolute
+            // total over whatever this replay accumulated.
+            ApplyBaselineScanned(station.Carrier, message.Lines);
             ApplyPhase(counter, station.Carrier, message.State, message.UsingCard, message.Paid,
                 message.Total, message.CustomerTotal, message.Change, message.ChangeReady,
                 message.ChangeStarted, message.TooMuchChange);
@@ -639,10 +640,25 @@ namespace CardShopCoop.Modules.Register
                 && existing.CounterGeneration == counterGeneration
                 && existing.CustomerIndex == customerIndex
                 && existing.CustomerGeneration == customerGeneration
-                && existing.Carrier != null)
+                && existing.Carrier != null
+                && CarrierMatchesLines(existing.Carrier, lines))
             {
                 EnsureNpcAttachment(customerIndex, customerGeneration, existing.Carrier);
                 return existing;
+            }
+
+            if (_stations.TryGetValue(index, out var stale) && stale != null)
+            {
+                // A re-anchor (a reused pooled customer, or a rejected checkout's refresh) can
+                // replace a station whose bag no longer matches the host's. Log it so a report can
+                // be traced to the delta that rebuilt the carrier.
+                CoopPlugin.Log.LogInfo("[register] rebuilding station counter=" + index
+                    + " (was index=" + stale.CustomerIndex + " gen=" + stale.CustomerGeneration
+                    + " counterGen=" + stale.CounterGeneration + " bag="
+                    + ((stale.Carrier?.GetItemInBagList()?.Count ?? 0)
+                        + (stale.Carrier?.GetCardInBagList()?.Count ?? 0))
+                    + " -> index=" + customerIndex + " gen=" + customerGeneration
+                    + " counterGen=" + counterGeneration + " lines=" + (lines?.Count ?? 0) + ").");
             }
 
             ReleaseStation(index);
@@ -666,10 +682,10 @@ namespace CardShopCoop.Modules.Register
             }
 
             RegisterInterop.ReleaseContents(carrier);
-            // The carrier is deliberately NOT dressed here. The Npc module renders the dressed
-            // clone for this customer (see UpdateCarrierVisibility), so the register never resolves
-            // a preset from its own build's tables - the mismatch that gave an Xbox client the wrong
-            // skin on a Steam host. The carrier is only the interaction/logic object.
+            // The carrier's look is not the register's concern: the Npc module's identity layer
+            // dressed this pooled customer in place when the host's identity arrived, so the
+            // borrow below hands the real, already-dressed NPC the visual role. No register-side
+            // preset resolution, no masking, no lookalike clone.
 
             if (counter.m_QueueStartPos != null)
             {
@@ -682,6 +698,9 @@ namespace CardShopCoop.Modules.Register
             }
 
             EnsureNpcAttachment(customerIndex, customerGeneration, carrier);
+            // AttachExistingCustomer hands the walking puppet's tracked pose and snapshot history
+            // to the real body, so it continues the customer's approach frame-for-frame; the
+            // queue-start placement above is only the fallback for a carrier with no puppet yet.
             carrier.gameObject.SetActive(true);
             counter.UpdateCurrentCustomer(carrier);
             counter.SetPlsaticBagVisibility(true);
@@ -702,13 +721,6 @@ namespace CardShopCoop.Modules.Register
                 }
             }
 
-            var maskedRenderers = carrier.GetComponentsInChildren<Renderer>(true);
-            var rendererStates = new bool[maskedRenderers.Length];
-            for (var i = 0; i < maskedRenderers.Length; i++)
-            {
-                rendererStates[i] = maskedRenderers[i] != null && maskedRenderers[i].enabled;
-            }
-
             var station = new LocalStation
             {
                 Carrier = carrier,
@@ -716,63 +728,9 @@ namespace CardShopCoop.Modules.Register
                 CustomerIndex = customerIndex,
                 CustomerGeneration = customerGeneration,
                 CounterGeneration = counterGeneration,
-                MaskedRenderers = maskedRenderers,
-                RendererStates = rendererStates,
             };
             _stations[index] = station;
-            UpdateCarrierVisibility(station);
             return station;
-        }
-
-        /// <summary>Hide the register carrier's own body while the Npc module's dressed clone for
-        /// this customer is visible, and show it again until that clone is ready (or if there is
-        /// none). Mirrors the trade carrier so the customer's appearance comes from the Npc module
-        /// on every build rather than from a locally re-resolved preset. Event-driven from
-        /// <see cref="NpcClientBehaviour.ExistingCustomerPuppetReady"/>, never polled.</summary>
-        private static void UpdateCarrierVisibility(LocalStation station)
-        {
-            if (station?.Carrier == null || station.MaskedRenderers == null)
-            {
-                return;
-            }
-
-            var puppetReady = NpcClientBehaviour.IsExistingCustomerPuppetReady(
-                station.CustomerIndex, station.CustomerGeneration);
-            for (var i = 0; i < station.MaskedRenderers.Length; i++)
-            {
-                var renderer = station.MaskedRenderers[i];
-                if (renderer != null)
-                {
-                    renderer.enabled = !puppetReady && station.RendererStates[i];
-                }
-            }
-        }
-
-        private static void RestoreRenderers(LocalStation station)
-        {
-            if (station?.MaskedRenderers == null)
-            {
-                return;
-            }
-
-            for (var i = 0; i < station.MaskedRenderers.Length; i++)
-            {
-                if (station.MaskedRenderers[i] != null)
-                {
-                    station.MaskedRenderers[i].enabled = station.RendererStates[i];
-                }
-            }
-        }
-
-        private void OnExistingCustomerPuppetReady(int index, int generation, Customer customer)
-        {
-            foreach (var station in _stations.Values)
-            {
-                if (station.CustomerIndex == index && station.CustomerGeneration == generation)
-                {
-                    UpdateCarrierVisibility(station);
-                }
-            }
         }
 
         /// <summary>Resolves the carrier from the host's authoritative customer list index. The Npc
@@ -800,12 +758,72 @@ namespace CardShopCoop.Modules.Register
                 || !NpcClientBehaviour.TryGetCustomerGeneration(index, out var current)
                 || current != generation)
             {
-                // Keep the Npc module's dressed clone visible: it is the customer's real look (the
-                // register carrier below is masked down to a logic object), so a build whose local
-                // preset tables differ from the host's no longer shows a locally-resolved skin.
+                // The real NPC is the visual: the Npc module's identity layer has already dressed
+                // this pooled customer in place with the host's look, so the borrow parks the
+                // walking puppet and the carrier renders itself. No register-side look resolution,
+                // masking or clone handoff - the hand-back at detach reveals the puppet again.
                 NpcClientBehaviour.AttachExistingCustomer(index, generation, carrier,
-                    keepPuppetVisible: true);
+                    keepPuppetVisible: false);
             }
+        }
+
+        /// <summary>True when the carrier's current bag already matches the authoritative line
+        /// list: the same item/card counts and the same scanned state per line. A pooled carrier,
+        /// or a station built before the host's bag settled, can hold a different bag; rebuilding
+        /// on a mismatch is what lets an authoritative re-anchor actually replace it. Kept exact
+        /// rather than count-only so a re-anchor also corrects a bag whose scanned flags drifted.</summary>
+        private static bool CarrierMatchesLines(Customer carrier, List<RegisterLine> lines)
+        {
+            var items = carrier?.GetItemInBagList();
+            var cards = carrier?.GetCardInBagList();
+            if (items == null || cards == null)
+            {
+                return false;
+            }
+
+            var itemCount = 0;
+            var cardCount = 0;
+            for (var i = 0; lines != null && i < lines.Count; i++)
+            {
+                if (lines[i].IsCard)
+                {
+                    cardCount++;
+                }
+                else
+                {
+                    itemCount++;
+                }
+            }
+
+            if (items.Count != itemCount || cards.Count != cardCount)
+            {
+                return false;
+            }
+
+            var itemSlot = 0;
+            var cardSlot = 0;
+            for (var i = 0; lines != null && i < lines.Count; i++)
+            {
+                var line = lines[i];
+                if (line.IsCard)
+                {
+                    var card = cards[cardSlot++];
+                    if (card == null || card.IsNotScanned() == line.Scanned)
+                    {
+                        return false;
+                    }
+                }
+                else
+                {
+                    var scanItem = items[itemSlot++]?.m_InteractableScanItem;
+                    if (scanItem == null || scanItem.IsNotScanned() == line.Scanned)
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            return true;
         }
 
         private static void ApplyBaselineScanned(Customer customer, List<RegisterLine> lines)
@@ -1692,9 +1710,8 @@ namespace CardShopCoop.Modules.Register
             var counter = station.Counter != null ? station.Counter : RegisterInterop.CounterForKey(index);
             if (station.Carrier != null)
             {
-                // Put the carrier's own renderers back before it leaves the scene: the next reuse of
-                // this pooled customer must start from its real states, not from the mask.
-                RestoreRenderers(station);
+                // The real NPC rendered itself the whole borrow; deactivate it wholesale and let
+                // DetachExistingCustomer reveal the walking puppet for the hand-back.
                 station.Carrier.m_CustomerCash?.gameObject.SetActive(false);
                 station.Carrier.gameObject.SetActive(false);
                 RegisterInterop.ReleaseContents(station.Carrier);
@@ -1771,7 +1788,6 @@ namespace CardShopCoop.Modules.Register
             ShutdownContents();
             NpcClientBehaviour.CustomerManagerReady -= OnReadinessSignal;
             NpcClientBehaviour.CustomerPoolChanged -= OnReadinessSignal;
-            NpcClientBehaviour.ExistingCustomerPuppetReady -= OnExistingCustomerPuppetReady;
             PlacementApi.StructureChanged -= OnPlacementStructureChanged;
             SceneManager.sceneLoaded -= OnSceneLoaded;
             _context?.Messages.UnregisterAttributedHandlers(this);
