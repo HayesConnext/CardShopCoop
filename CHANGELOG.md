@@ -8,6 +8,7 @@ True co-op multiplayer for TCG Card Shop Simulator. Both players must run the
 - Moved Direct IP connection details to remove invite codes and instead just use password / IP[:port].
 - Migrated networking modes to support hosting via two different methods e.g. Steam and Direct IP.
 - Enabled cross-build support, allowing Xbox and Steam clients to connect to each other. Deluxe furniture is now coalesced into rough equivalents when a client is missing them.
+- Fixed the customer at the register looking different for an Xbox (Game Pass) client playing on a Steam host - the register customer now shows the same appearance as the rest of the crowd.
 - Fixed a rare error that could appear when leaving a session or stopping hosting.
 - Fixed the hue slider in Character Creator being backwards. Thanks @zydesian on Discord for the report!
 - No longer disconnects for handler_failed, tries to gracefully continue. Reports of errors would still be helpful on our Discord!

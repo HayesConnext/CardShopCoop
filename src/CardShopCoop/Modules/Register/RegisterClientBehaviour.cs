@@ -29,6 +29,12 @@ namespace CardShopCoop.Modules.Register
             public int CustomerIndex = -1;
             public int CustomerGeneration;
             public uint CounterGeneration;
+            // The Npc module renders the dressed clone for a customer whose identity it mirrors, so
+            // the register carrier is only the interaction/logic object. Its renderers are hidden
+            // while that clone is ready and restored on release; the states are captured at build
+            // time so a renderer disabled for another reason comes back exactly as it was.
+            public Renderer[] MaskedRenderers;
+            public bool[] RendererStates;
         }
 
         private sealed class CheckoutUndo
@@ -161,6 +167,7 @@ namespace CardShopCoop.Modules.Register
             SceneManager.sceneLoaded += OnSceneLoaded;
             NpcClientBehaviour.CustomerManagerReady += OnReadinessSignal;
             NpcClientBehaviour.CustomerPoolChanged += OnReadinessSignal;
+            NpcClientBehaviour.ExistingCustomerPuppetReady += OnExistingCustomerPuppetReady;
             // Registers are addressed by their stable placement key; the key only resolves once
             // the placement channel has bound this peer's counter identities, so retry the register
             // baseline/deltas whenever that structure changes.
@@ -698,6 +705,13 @@ namespace CardShopCoop.Modules.Register
                 }
             }
 
+            var maskedRenderers = carrier.GetComponentsInChildren<Renderer>(true);
+            var rendererStates = new bool[maskedRenderers.Length];
+            for (var i = 0; i < maskedRenderers.Length; i++)
+            {
+                rendererStates[i] = maskedRenderers[i] != null && maskedRenderers[i].enabled;
+            }
+
             var station = new LocalStation
             {
                 Carrier = carrier,
@@ -705,9 +719,63 @@ namespace CardShopCoop.Modules.Register
                 CustomerIndex = customerIndex,
                 CustomerGeneration = customerGeneration,
                 CounterGeneration = counterGeneration,
+                MaskedRenderers = maskedRenderers,
+                RendererStates = rendererStates,
             };
             _stations[index] = station;
+            UpdateCarrierVisibility(station);
             return station;
+        }
+
+        /// <summary>Hide the register carrier's own body while the Npc module's dressed clone for
+        /// this customer is visible, and show it again until that clone is ready (or if there is
+        /// none). Mirrors the trade carrier so the customer's appearance comes from the Npc module
+        /// on every build rather than from a locally re-resolved preset. Event-driven from
+        /// <see cref="NpcClientBehaviour.ExistingCustomerPuppetReady"/>, never polled.</summary>
+        private static void UpdateCarrierVisibility(LocalStation station)
+        {
+            if (station?.Carrier == null || station.MaskedRenderers == null)
+            {
+                return;
+            }
+
+            var puppetReady = NpcClientBehaviour.IsExistingCustomerPuppetReady(
+                station.CustomerIndex, station.CustomerGeneration);
+            for (var i = 0; i < station.MaskedRenderers.Length; i++)
+            {
+                var renderer = station.MaskedRenderers[i];
+                if (renderer != null)
+                {
+                    renderer.enabled = !puppetReady && station.RendererStates[i];
+                }
+            }
+        }
+
+        private static void RestoreRenderers(LocalStation station)
+        {
+            if (station?.MaskedRenderers == null)
+            {
+                return;
+            }
+
+            for (var i = 0; i < station.MaskedRenderers.Length; i++)
+            {
+                if (station.MaskedRenderers[i] != null)
+                {
+                    station.MaskedRenderers[i].enabled = station.RendererStates[i];
+                }
+            }
+        }
+
+        private void OnExistingCustomerPuppetReady(int index, int generation, Customer customer)
+        {
+            foreach (var station in _stations.Values)
+            {
+                if (station.CustomerIndex == index && station.CustomerGeneration == generation)
+                {
+                    UpdateCarrierVisibility(station);
+                }
+            }
         }
 
         /// <summary>Resolves the carrier from the host's authoritative customer list index. The Npc
@@ -735,7 +803,11 @@ namespace CardShopCoop.Modules.Register
                 || !NpcClientBehaviour.TryGetCustomerGeneration(index, out var current)
                 || current != generation)
             {
-                NpcClientBehaviour.AttachExistingCustomer(index, generation, carrier);
+                // Keep the Npc module's dressed clone visible: it is the customer's real look (the
+                // register carrier below is masked down to a logic object), so a build whose local
+                // preset tables differ from the host's no longer shows a locally-resolved skin.
+                NpcClientBehaviour.AttachExistingCustomer(index, generation, carrier,
+                    keepPuppetVisible: true);
             }
         }
 
@@ -1623,6 +1695,9 @@ namespace CardShopCoop.Modules.Register
             var counter = station.Counter != null ? station.Counter : RegisterInterop.CounterForKey(index);
             if (station.Carrier != null)
             {
+                // Put the carrier's own renderers back before it leaves the scene: the next reuse of
+                // this pooled customer must start from its real states, not from the mask.
+                RestoreRenderers(station);
                 station.Carrier.m_CustomerCash?.gameObject.SetActive(false);
                 station.Carrier.gameObject.SetActive(false);
                 RegisterInterop.ReleaseContents(station.Carrier);
@@ -1699,6 +1774,7 @@ namespace CardShopCoop.Modules.Register
             ShutdownContents();
             NpcClientBehaviour.CustomerManagerReady -= OnReadinessSignal;
             NpcClientBehaviour.CustomerPoolChanged -= OnReadinessSignal;
+            NpcClientBehaviour.ExistingCustomerPuppetReady -= OnExistingCustomerPuppetReady;
             PlacementApi.StructureChanged -= OnPlacementStructureChanged;
             SceneManager.sceneLoaded -= OnSceneLoaded;
             _context?.Messages.UnregisterAttributedHandlers(this);
