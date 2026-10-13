@@ -198,11 +198,13 @@ namespace CardShopCoop.Net
                 && _pumpThreadId == Thread.CurrentThread.ManagedThreadId;
         }
 
-        /// <summary>Runs <paramref name="action"/> on the pump thread. Inline when already on it,
-        /// otherwise queued and awaited so ordering and failures reach the caller.</summary>
+        /// <summary>Runs <paramref name="action"/> on the pump thread. Inline when already on it, or
+        /// when there is no live pump thread to run it (never started, or it died - a failed start
+        /// must not make the caller wait out the join budget for a thread that will never drain the
+        /// queue). Otherwise queued and awaited so ordering and failures reach the caller.</summary>
         private void InvokeOnPump(Action action, string name)
         {
-            if (IsPumpThread() || _thread == null)
+            if (IsPumpThread() || _thread == null || !_thread.IsAlive)
             {
                 action();
                 return;
@@ -260,7 +262,8 @@ namespace CardShopCoop.Net
             return _inner.TryDequeueIncoming(out message);
         }
 
-        public ConcurrentQueue<ConnectionEvent> Disconnects => _inner.Disconnects;
+        public bool TryDequeueDisconnect(out ConnectionEvent disconnect)
+            => _inner.TryDequeueDisconnect(out disconnect);
 
         public event Action<PeerConnection> PeerConnected
         {

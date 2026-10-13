@@ -1,11 +1,12 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using CardShopCoop.Api;
 
 namespace CardShopCoop.Util
 {
     /// <summary>
-    /// Per-process log file (BepInEx/CardShopCoop_{pid}.log). BepInEx's LogOutput.log is
+    /// Per-process log file (BepInEx/CardShopCoopCommunity_{pid}.log). BepInEx's LogOutput.log is
     /// exclusive to the first game instance, so when two instances run on one PC (loopback
     /// testing, or two family members on one machine some day) this keeps each side readable.
     /// </summary>
@@ -59,7 +60,7 @@ namespace CardShopCoop.Util
                         _lastFlushTick = now;
                     }
                 }
-                catch (Exception e) { Swallow.Log(e); }
+                catch (Exception e) { CoopLog.Swallow(e); }
             }
         }
 
@@ -71,7 +72,7 @@ namespace CardShopCoop.Util
                 {
                     _writer?.Flush();
                 }
-                catch (Exception e) { Swallow.Log(e); }
+                catch (Exception e) { CoopLog.Swallow(e); }
             }
         }
     }

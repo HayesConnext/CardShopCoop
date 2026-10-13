@@ -8,6 +8,30 @@ namespace CardShopCoop.Modules.DebugTools
     {
         internal static void Apply(Harmony harmony)
         {
+            // BEFORE the cheat-type check below, on purpose: the forced-entitlement hook belongs to a
+            // DIFFERENT game type (the platform manager), which exists even on a build with no
+            // CheatManager at all - and that build is exactly the one that option is for.
+            //
+            // IsFurnitureAvailable consults HasEntitlement for the deluxe/pre-order furniture, and
+            // FurnitureShopUIScreen is its only caller. So this ONE method is the whole gate: no other
+            // code in the game asks whether those objects may be used.
+            var platformType = AccessTools.TypeByName("GA.PlatformManager");
+            if (platformType == null)
+            {
+                CoopPlugin.Log.LogInfo("DebugTools: no platform manager on this build, so the forced-"
+                    + "entitlement option has nothing to hook (this build has no deluxe/pre-order gate)");
+            }
+            else
+            {
+                TryPatch(harmony, platformType, "HasEntitlement",
+                    prefix: new HarmonyMethod(typeof(DebugToolsPatches), nameof(ForcedEntitlementPrefix)));
+                // The narrow, deluxe-only sibling of the above: it forces the deluxe furniture in the
+                // shop WITHOUT touching HasEntitlement, so it never trips the coin/pack grant path.
+                TryPatch(harmony, platformType, "IsFurnitureAvailable",
+                    postfix: new HarmonyMethod(typeof(DebugToolsPatches),
+                        nameof(ForcedDeluxeFurniturePostfix)));
+            }
+
             var cheatType = DebugToolsRuntime.CheatManagerType;
             if (cheatType == null)
             {
@@ -27,6 +51,48 @@ namespace CardShopCoop.Modules.DebugTools
                 prefix: new HarmonyMethod(typeof(DebugToolsPatches), nameof(CheatGiveCardsPrefix)));
 
             CoopPlugin.Log.LogInfo("DebugTools: reflected CheatManager hooks installed");
+        }
+
+        /// <summary>Forced entitlements for testing. Read from the config on EVERY call rather than
+        /// captured when the patch went in, so the option can be flipped in the .cfg while the game
+        /// runs without a restart.
+        ///
+        /// PARAMETERLESS ON PURPOSE: the original takes a game enum (EntitlementKey), and this assembly
+        /// must never name a game type in a patch signature. A Harmony prefix may omit parameters it
+        /// does not need; returning false with __result set skips the game's own check entirely.</summary>
+        internal static bool ForcedEntitlementPrefix(ref bool __result)
+        {
+            if (!CoopPlugin.ForceEntitlements.Value)
+            {
+                return true;
+            }
+
+            __result = true;
+            return false;
+        }
+
+        /// <summary>Forced deluxe furniture for testing. Runs as a POSTFIX on
+        /// <c>PlatformManager.IsFurnitureAvailable(EObjectType)</c>: it flips a false result to true
+        /// only for the deluxe furniture, and never touches <c>HasEntitlement</c>, so it cannot reach
+        /// the entitlement-grant path (the deluxe coins and packs). Read from the config on every call
+        /// so it can be flipped in the .cfg while the game runs.
+        ///
+        /// The comparison is by NAME, never a direct member reference: DeluxeInfiniteScentMachine
+        /// exists only on the Game Pass build, and this assembly must still load on the Steam build.
+        /// EObjectType itself is safe to name - both builds carry it.</summary>
+        internal static void ForcedDeluxeFurniturePostfix(EObjectType type, ref bool __result)
+        {
+            if (__result
+                || CoopPlugin.ForceDeluxeFurniture == null
+                || !CoopPlugin.ForceDeluxeFurniture.Value)
+            {
+                return;
+            }
+
+            if (string.Equals(type.ToString(), "DeluxeInfiniteScentMachine", StringComparison.Ordinal))
+            {
+                __result = true;
+            }
         }
 
         /// <summary>Clients may close the menu, but may never open the shared-economy cheat UI.</summary>

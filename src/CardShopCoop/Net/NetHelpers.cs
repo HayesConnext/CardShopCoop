@@ -6,24 +6,29 @@ using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
+using CardShopCoop.Api;
 
 namespace CardShopCoop.Net
 {
     /// <summary>
-    /// The two things a host needs before an invite code can reach the outside world: a port
-    /// opened on the router (UPnP IGD) and the public address to put in the code (the router's
-    /// own GetExternalIPAddress, with a STUN binding request as the fallback).
+    /// What a host needs to be reachable from outside the house: the router asked to open the
+    /// co-op port (UPnP IGD, then NAT-PMP, then PCP) and the public address a friend must dial
+    /// (a STUN binding request).
+    ///
+    /// PRIVACY: the public address is a home connection and must never be printed - not to the
+    /// log, not to the window. These methods return it to the IP backend, which only ever puts it
+    /// on the clipboard. Do not add a log line here that contains it.
     ///
     /// THREADING: every method here BLOCKS on sockets and HTTP for seconds at a time. Nothing
-    /// in this file may be called from Unity's main thread - CoopCore runs the whole sequence
-    /// on a worker (the same new-Thread idiom as SendWorldTo) and polls volatile fields for
-    /// the result.
+    /// in this file may be called from Unity's main thread - the IP backend runs the whole
+    /// sequence on a worker thread while hosting is already live.
     ///
     /// FAILURE POLICY: a home router is not a well-behaved peer. It can answer SSDP and then
     /// serve a 404 for its own description; it can advertise a service and reject every SOAP
     /// call; it can hand back XML with no closing tags. EVERY path here catches, logs at
     /// Info/Warning, and returns null/false. Hosting must be completely unaffected by anything
-    /// that happens in this file - the worst outcome allowed is "LAN-only invite code".
+    /// that happens in this file - the worst outcome allowed is "the player forwards the port
+    /// by hand".
     ///
     /// SECURITY: the SSDP LOCATION header is attacker-controllable by anything on the LAN (and
     /// SSDP is unauthenticated by design), so it is treated as untrusted input. We only ever
@@ -71,6 +76,11 @@ namespace CardShopCoop.Net
         private static volatile string _controlUrl;
         private static volatile string _serviceType;
         private static volatile int _mappedPort; // 0 = we have not opened anything
+        private const int MapProtocolUpnp = 1;
+        private const int MapProtocolNatPmp = 2;
+        private const int MapProtocolPcp = 3;
+        private const int NatPmpPcpPort = 5351;
+        private static volatile int _mapProtocol; // 0 none, else one of the constants above
         /// <summary>Bumped inside MapLock every time a mapping is actually created, so a caller
         /// can name the mapping IT made. The port number cannot do that job: two consecutive
         /// sessions map the identical port, and "delete port 27886" from the older session's
@@ -109,60 +119,98 @@ namespace CardShopCoop.Net
 
         /// <summary>As above, and hands back the EPOCH of the mapping it created (0 when none
         /// was). Pass that number to <see cref="RemoveMapping(long)"/> to remove that mapping
-        /// and nothing else - see the orphan path in CoopCore's invite worker.</summary>
+        /// and nothing else - see the orphan path in CoopCore's invite worker.
+        ///
+        /// Three protocols do the same job and a router frequently speaks only one, so UPnP IGD is
+        /// tried first, then NAT-PMP, then PCP.</summary>
         public static bool TryMapPort(int port, out string reason, out long epoch)
+        {
+            return TryMapPort(port, out reason, out epoch, out _);
+        }
+
+        /// <summary>As above, and reports the EXTERNAL port the gateway actually opened, which is
+        /// what a reach code must carry. NAT-PMP and PCP state that port in their reply; UPnP
+        /// does not, and we request the very number we bind, so there it is the requested port.
+        /// BLOCKING - worker thread only.</summary>
+        public static bool TryMapPort(int port, out string reason, out long epoch, out int externalPort,
+            Action<string> progress = null)
         {
             reason = null;
             epoch = 0;
+            externalPort = 0;
+            if (port <= 0 || port > 65535)
+            {
+                reason = "the co-op port is out of range";
+                return false;
+            }
+
             lock (MapLock)
             {
+                // ONE ATTEMPT, LEASED, AND NO PERMANENT RETRY (1.0.38). This used to fall back to
+                // a lease of 0 when the router answered 725 (OnlyPermanentLeasesSupported). That
+                // bought a class of hardware at the price of a hole in the router that NOTHING
+                // bounds - a mapping the player does not know about is exactly what the session
+                // password exists to defend against. A router that only takes permanent leases now
+                // gets the honest "declined" path and the player forwards the port themselves.
+                progress?.Invoke("Asking the router to open the port with UPnP\u2026");
                 try
                 {
-                    if (port <= 0 || port > 65535)
+                    if (EnsureGateway())
                     {
-                        reason = "the co-op port is out of range";
-                        return false;
+                        var local = LocalIPv4ForGateway();
+                        if (local != null && AddMapping(port, local, LeaseSeconds))
+                        {
+                            _mappedPort = port;
+                            _mapProtocol = MapProtocolUpnp;
+                            epoch = ++_mapEpoch;
+                            externalPort = port; // UPnP is asked for this exact port
+                            CoopPlugin.Log.LogInfo($"UPnP: asked the router to forward UDP {port} for {LeaseSeconds}s (this is a REQUEST - double NAT can still block the port)");
+                            return true;
+                        }
                     }
-                    if (!EnsureGateway())
-                    {
-                        reason = "no UPnP router answered";
-                        return false;
-                    }
-
-                    var local = LocalIPv4ForGateway();
-                    if (local == null)
-                    {
-                        reason = "couldn't work out this PC's LAN address";
-                        return false;
-                    }
-
-                    // ONE ATTEMPT, LEASED, AND NO PERMANENT RETRY (1.0.38). This used to fall
-                    // back to a lease of 0 when the router answered 725
-                    // (OnlyPermanentLeasesSupported). That bought a class of hardware at the
-                    // price of a hole in the router that NOTHING bounds: if the delete on
-                    // Shutdown never lands (the game was killed, the router stopped answering,
-                    // the PC moved network), a permanent mapping stays open until a human finds
-                    // it in the router's admin page - and a mapping the player does not know
-                    // about is exactly the thing the session password exists to defend against.
-                    // A router that only takes permanent leases now gets the honest "router
-                    // declined" path and the player forwards the port themselves, knowingly.
-                    if (AddMapping(port, local, LeaseSeconds))
-                    {
-                        _mappedPort = port;
-                        epoch = ++_mapEpoch;
-                        CoopPlugin.Log.LogInfo($"UPnP: asked the router to forward UDP {port} to {local} for {LeaseSeconds}s (this is a REQUEST - double NAT can still block the port)");
-                        return true;
-                    }
-
-                    reason = "the router refused the port mapping";
-                    return false;
                 }
                 catch (Exception e)
                 {
-                    reason = e.Message;
+                    reason = "UPnP failed (" + e.GetType().Name + ")";
                     CoopPlugin.Log.LogWarning("UPnP map failed: " + e.GetType().Name + ": " + e.Message);
-                    return false;
                 }
+
+                progress?.Invoke("Asking the router to open the port with NAT-PMP\u2026");
+                var gateway = GatewayAddress();
+                if (gateway != null)
+                {
+                    try
+                    {
+                        if (NatPmpMap(gateway, port, LeaseSeconds, out var pmpPort))
+                        {
+                            _mappedPort = port;
+                            _mapProtocol = MapProtocolNatPmp;
+                            epoch = ++_mapEpoch;
+                            externalPort = pmpPort;
+                            return true;
+                        }
+
+                        progress?.Invoke("Asking the router to open the port with PCP\u2026");
+                        if (PcpMap(gateway, port, LeaseSeconds, out var pcpPort))
+                        {
+                            _mappedPort = port;
+                            _mapProtocol = MapProtocolPcp;
+                            epoch = ++_mapEpoch;
+                            externalPort = pcpPort;
+                            return true;
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        reason = "NAT-PMP/PCP failed (" + e.Message + ")";
+                        CoopPlugin.Log.LogWarning("NAT-PMP/PCP map failed: " + e.Message);
+                    }
+                }
+
+                reason ??= gateway == null
+                    ? "no router answered UPnP, NAT-PMP or PCP"
+                    : "the router refused the port mapping";
+                return false;
             }
         }
 
@@ -197,6 +245,24 @@ namespace CardShopCoop.Net
                 }
 
                 _mappedPort = 0; // claim it first: a second caller must not repeat the SOAP call
+                var protocol = _mapProtocol;
+                _mapProtocol = 0;
+                if (protocol != MapProtocolUpnp)
+                {
+                    // The mapping was made by NAT-PMP or PCP; delete it with the same protocol.
+                    var natGateway = GatewayAddress();
+                    if (protocol == MapProtocolNatPmp)
+                    {
+                        NatPmpDelete(natGateway, port);
+                    }
+                    else if (protocol == MapProtocolPcp)
+                    {
+                        PcpDelete(natGateway, port);
+                    }
+
+                    return;
+                }
+
                 try
                 {
                     if (_controlUrl == null)
@@ -281,7 +347,7 @@ namespace CardShopCoop.Net
                     return null;
                 }
 
-                CoopPlugin.Log.LogInfo("UPnP: router reports external address " + ip);
+                // Deliberately NOT logged: this is the home's public address. See the class note.
                 return ip;
             }
             catch (Exception e)
@@ -333,7 +399,7 @@ namespace CardShopCoop.Net
                     var ip = ParseStun(resp, txn);
                     if (ip != null)
                     {
-                        CoopPlugin.Log.LogInfo("STUN: public address " + ip);
+                        // Deliberately NOT logged: this is the home's public address.
                         return ip;
                     }
                 }
@@ -347,7 +413,7 @@ namespace CardShopCoop.Net
                     {
                         udp?.Close();
                     }
-                    catch (Exception e) { Swallow.Log(e); }
+                    catch (Exception e) { CoopLog.Swallow(e); }
                 }
             }
             return null;
@@ -357,7 +423,7 @@ namespace CardShopCoop.Net
         /// documented literal otherwise. The resolve is pushed onto its own short-lived thread
         /// purely because Dns.GetHostAddresses cannot be given a deadline - abandoning that
         /// thread is safe (it is a background thread that only writes a local) and is the whole
-        /// point: the invite worker refuses to wait on it longer than the budget above.</summary>
+        /// point: the worker refuses to wait on it longer than the budget above.</summary>
         private static IPEndPoint ResolveStun()
         {
             IPAddress found = null;
@@ -376,7 +442,7 @@ namespace CardShopCoop.Net
                             }
                         }
                     }
-                    catch (Exception e) { Swallow.Log(e); /* no DNS, no resolver, no network: the literal below covers it */ }
+                    catch (Exception e) { CoopLog.Swallow(e); /* no DNS, no resolver, no network: the literal below covers it */ }
                 })
                 {
                     IsBackground = true,
@@ -520,7 +586,7 @@ namespace CardShopCoop.Net
 
                 return true;
             }
-            catch (Exception e) { Swallow.Log(e); return false; }
+            catch (Exception e) { CoopLog.Swallow(e); return false; }
         }
 
         /// <summary>Best guess at this PC's LAN address, ranked the same way the host panel
@@ -579,7 +645,7 @@ namespace CardShopCoop.Net
         /// "connect" picks the route without putting a single byte on the wire.
         ///
         /// NULL WHEN NO GATEWAY HAS BEEN DISCOVERED, and that distinction is the point: the
-        /// invite code's LAN fallback address must be THIS one whenever we know it, because
+        /// reach code's LAN fallback address must be THIS one whenever we know it, because
         /// <see cref="LocalIPv4"/> merely RANKS adapters by prefix and a VirtualBox, Hyper-V or
         /// VPN adapter sitting on 192.168.x wins that ranking as easily as the real LAN card
         /// does. Putting the losing adapter in the code while the port mapping points at the
@@ -604,9 +670,258 @@ namespace CardShopCoop.Net
             }
             catch (Exception e)
             {
-                Swallow.Log(e);
+                CoopLog.Swallow(e);
                 return LocalIPv4();
             }
+        }
+
+        // ------------------------------------------------------------------ NAT-PMP / PCP
+
+        /// <summary>The LAN default gateway. Prefers the host the UPnP description came from when
+        /// known, else the OS routing table. Null when there is none.</summary>
+        private static IPAddress GatewayAddress()
+        {
+            try
+            {
+                if (_controlUrl != null
+                    && IPAddress.TryParse(new Uri(_controlUrl).Host, out var igd)
+                    && igd.AddressFamily == AddressFamily.InterNetwork)
+                {
+                    return igd;
+                }
+            }
+            catch (Exception e) { CoopLog.Swallow(e); }
+
+            try
+            {
+                foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (ni.OperationalStatus != OperationalStatus.Up
+                        || ni.NetworkInterfaceType == NetworkInterfaceType.Loopback)
+                    {
+                        continue;
+                    }
+
+                    foreach (var gw in ni.GetIPProperties().GatewayAddresses)
+                    {
+                        if (gw?.Address != null
+                            && gw.Address.AddressFamily == AddressFamily.InterNetwork
+                            && !gw.Address.Equals(IPAddress.Any))
+                        {
+                            return gw.Address;
+                        }
+                    }
+                }
+            }
+            catch (Exception e) { CoopLog.Swallow(e); }
+
+            return null;
+        }
+
+        /// <summary>NAT-PMP (RFC 6886) UDP mapping request. BLOCKING - worker thread only. Three
+        /// attempts with the RFC's backoff; a non-zero result code means the gateway refused.</summary>
+        private static bool NatPmpMap(IPAddress gateway, int port, int lease, out int mappedPort)
+        {
+            mappedPort = 0;
+            if (gateway == null)
+            {
+                return false;
+            }
+
+            var request = new byte[12];
+            request[1] = 1;                     // opcode 1 = map UDP
+            request[4] = (byte)(port >> 8);
+            request[5] = (byte)port;            // internal port
+            request[6] = (byte)(port >> 8);
+            request[7] = (byte)port;            // suggested external port
+            request[8] = (byte)(lease >> 24);
+            request[9] = (byte)(lease >> 16);
+            request[10] = (byte)(lease >> 8);
+            request[11] = (byte)lease;
+
+            for (var attempt = 0; attempt < 3; attempt++)
+            {
+                try
+                {
+                    using (var udp = new UdpClient(new IPEndPoint(IPAddress.Any, 0)))
+                    {
+                        udp.Client.ReceiveTimeout = 250 * (1 << attempt);
+                        udp.Send(request, request.Length, new IPEndPoint(gateway, NatPmpPcpPort));
+                        IPEndPoint from = null;
+                        var resp = udp.Receive(ref from);
+                        if (resp != null && resp.Length >= 16 && resp[1] == 129)
+                        {
+                            var result = (resp[2] << 8) | resp[3];
+                            if (result == 0)
+                            {
+                                // NAT-PMP reports the external port it actually opened.
+                                mappedPort = (resp[10] << 8) | resp[11];
+                                if (mappedPort <= 0)
+                                {
+                                    mappedPort = port;
+                                }
+
+                                CoopPlugin.Log.LogInfo("NAT-PMP: gateway opened UDP " + mappedPort
+                                    + " -> " + port + " for " + lease + "s");
+                                return true;
+                            }
+
+                            CoopPlugin.Log.LogInfo("NAT-PMP: gateway refused with code " + result);
+                            return false;
+                        }
+                    }
+                }
+                catch (Exception e)
+                {
+                    if (attempt == 2)
+                    {
+                        CoopPlugin.Log.LogInfo("NAT-PMP failed: " + e.GetType().Name + ": " + e.Message);
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        private static void NatPmpDelete(IPAddress gateway, int port)
+        {
+            if (gateway == null)
+            {
+                return;
+            }
+
+            var request = new byte[12];
+            // A NAT-PMP deletion is a MAP for the SAME protocol with Lifetime 0 (RFC 6886). Opcode 2
+            // is Map TCP - using it would leave our UDP mapping open for its whole 24h lease.
+            request[1] = 1;
+            request[4] = (byte)(port >> 8);
+            request[5] = (byte)port;
+            try
+            {
+                using (var udp = new UdpClient(new IPEndPoint(IPAddress.Any, 0)))
+                {
+                    udp.Client.ReceiveTimeout = 500;
+                    udp.Send(request, request.Length, new IPEndPoint(gateway, NatPmpPcpPort));
+                }
+            }
+            catch (Exception e) { CoopLog.Swallow(e); }
+        }
+
+        /// <summary>PCP (RFC 6887) MAP request. BLOCKING - worker thread only. The nonce is checked
+        /// on the reply, so a stray datagram cannot be read as a success.</summary>
+        private static bool PcpMap(IPAddress gateway, int port, int lease, out int mappedPort)
+        {
+            mappedPort = 0;
+            if (gateway == null)
+            {
+                return false;
+            }
+
+            var request = new byte[60];
+            request[0] = 2;                     // version
+            request[1] = 1;                     // opcode 1 = MAP
+            request[4] = (byte)(lease >> 24);
+            request[5] = (byte)(lease >> 16);
+            request[6] = (byte)(lease >> 8);
+            request[7] = (byte)lease;
+            var nonce = new byte[12];
+            using (var rng = new RNGCryptoServiceProvider())
+            {
+                rng.GetBytes(nonce);
+            }
+
+            Buffer.BlockCopy(nonce, 0, request, 24, 12);
+            request[36] = 17;                   // protocol 17 = UDP
+            request[40] = (byte)(port >> 8);
+            request[41] = (byte)port;           // internal port
+            request[42] = (byte)(port >> 8);
+            request[43] = (byte)port;           // suggested external port
+
+            for (var attempt = 0; attempt < 3; attempt++)
+            {
+                try
+                {
+                    using (var udp = new UdpClient(new IPEndPoint(IPAddress.Any, 0)))
+                    {
+                        udp.Client.ReceiveTimeout = 250 * (1 << attempt);
+                        udp.Send(request, request.Length, new IPEndPoint(gateway, NatPmpPcpPort));
+                        IPEndPoint from = null;
+                        var resp = udp.Receive(ref from);
+                        if (resp == null || resp.Length < 60 || resp[0] != 2 || resp[1] != 1)
+                        {
+                            continue;
+                        }
+
+                        var echoed = true;
+                        for (var i = 0; i < 12; i++)
+                        {
+                            if (resp[24 + i] != nonce[i])
+                            {
+                                echoed = false;
+                                break;
+                            }
+                        }
+                        if (!echoed)
+                        {
+                            continue;
+                        }
+
+                        var result = resp[3];
+                        if (result == 0)
+                        {
+                            // The PCP MAP reply carries the external port it assigned.
+                            mappedPort = (resp[42] << 8) | resp[43];
+                            if (mappedPort <= 0)
+                            {
+                                mappedPort = port;
+                            }
+
+                            CoopPlugin.Log.LogInfo("PCP: gateway opened UDP " + mappedPort
+                                + " -> " + port + " for " + lease + "s");
+                            return true;
+                        }
+
+                        CoopPlugin.Log.LogInfo("PCP: gateway refused with code " + result);
+                        return false;
+                    }
+                }
+                catch (Exception e)
+                {
+                    if (attempt == 2)
+                    {
+                        CoopPlugin.Log.LogInfo("PCP failed: " + e.GetType().Name + ": " + e.Message);
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        private static void PcpDelete(IPAddress gateway, int port)
+        {
+            if (gateway == null)
+            {
+                return;
+            }
+
+            // A MAP with lifetime 0 is a delete.
+            var request = new byte[60];
+            request[0] = 2;
+            request[1] = 1;
+            request[36] = 17;
+            request[40] = (byte)(port >> 8);
+            request[41] = (byte)port;
+            request[42] = (byte)(port >> 8);
+            request[43] = (byte)port;
+            try
+            {
+                using (var udp = new UdpClient(new IPEndPoint(IPAddress.Any, 0)))
+                {
+                    udp.Client.ReceiveTimeout = 500;
+                    udp.Send(request, request.Length, new IPEndPoint(gateway, NatPmpPcpPort));
+                }
+            }
+            catch (Exception e) { CoopLog.Swallow(e); }
         }
 
         // ------------------------------------------------------------------ SSDP + IGD setup
@@ -629,7 +944,9 @@ namespace CardShopCoop.Net
 
             _noGateway = true; // every path below that doesn't set _controlUrl is a failure
 
-            var location = SsdpDiscover();
+            // Multi-IGD / flaky-router retry: one more sweep before giving up, so a router whose
+            // first reply was lost or whose IGD only answers on the second M-SEARCH still works.
+            var location = SsdpDiscover() ?? SsdpDiscover();
             if (location == null)
             {
                 return false;
@@ -642,7 +959,7 @@ namespace CardShopCoop.Net
             // because this is the gate that must hold even if that selection ever changes.
             if (!IsPrivateHttpUrl(location))
             {
-                CoopPlugin.Log.LogWarning("UPnP: ignoring an SSDP reply whose LOCATION is not a private address - " + location);
+                CoopPlugin.Log.LogWarning("UPnP: ignoring an SSDP reply whose LOCATION is not a private address");
                 return false;
             }
 
@@ -677,14 +994,14 @@ namespace CardShopCoop.Net
             // trust only as far as its host, and it can point anywhere it likes.
             if (!IsPrivateHttpUrl(abs.ToString()))
             {
-                CoopPlugin.Log.LogWarning("UPnP: ignoring a controlURL that points off the LAN - " + abs);
+                CoopPlugin.Log.LogWarning("UPnP: ignoring a controlURL that points off the LAN");
                 return false;
             }
 
             _serviceType = serviceType;
             _controlUrl = abs.ToString();
             _noGateway = false; // we have one after all
-            CoopPlugin.Log.LogInfo("UPnP: gateway control URL " + _controlUrl + " (" + serviceType + ")");
+            CoopPlugin.Log.LogInfo("UPnP: gateway control URL found (" + serviceType + ")");
             return true;
         }
 
@@ -756,7 +1073,7 @@ namespace CardShopCoop.Net
                     if (!warned)
                     {
                         warned = true; // once per sweep: a chatty rogue must not flood the log
-                        CoopPlugin.Log.LogWarning("UPnP: ignoring an SSDP reply whose LOCATION is not a private address - " + loc);
+                        CoopPlugin.Log.LogWarning("UPnP: ignoring an SSDP reply whose LOCATION is not a private address");
                     }
                 }
                 CoopPlugin.Log.LogInfo("UPnP: no InternetGatewayDevice answered the SSDP search");
@@ -771,7 +1088,7 @@ namespace CardShopCoop.Net
                 {
                     udp?.Close();
                 }
-                catch (Exception e) { Swallow.Log(e); }
+                catch (Exception e) { CoopLog.Swallow(e); }
             }
             return null;
         }
@@ -886,7 +1203,7 @@ namespace CardShopCoop.Net
 
                 return false;
             }
-            catch (Exception e) { Swallow.Log(e); return false; }
+            catch (Exception e) { CoopLog.Swallow(e); return false; }
         }
 
         private static string HttpGet(string url)
@@ -983,9 +1300,10 @@ namespace CardShopCoop.Net
                         }
                     }
                 }
-                catch (Exception e) { Swallow.Log(e); }
-                CoopPlugin.Log.LogInfo("UPnP " + action + " refused: " + we.Message
-                    + (body != null ? " | " + Snip(body) : ""));
+                catch (Exception e) { CoopLog.Swallow(e); }
+                // Deliberately NOT the response body: for GetExternalIPAddress it can carry the
+                // home's public address, and this log is meant to be safe to share.
+                CoopPlugin.Log.LogInfo("UPnP " + action + " refused: " + we.Message);
                 return false;
             }
             catch (Exception e)
@@ -1011,13 +1329,13 @@ namespace CardShopCoop.Net
             {
                 uri = resp.ResponseUri != null ? resp.ResponseUri.ToString() : null;
             }
-            catch (Exception e) { Swallow.Log(e); }
+            catch (Exception e) { CoopLog.Swallow(e); }
             if (uri != null && IsPrivateHttpUrl(uri))
             {
                 return true;
             }
 
-            CoopPlugin.Log.LogWarning("UPnP: refusing a reply that came from somewhere other than the LAN address we asked - " + (uri ?? "(no URI)"));
+            CoopPlugin.Log.LogWarning("UPnP: refusing a reply that came from somewhere other than the LAN address we asked");
             return false;
         }
 
@@ -1119,7 +1437,7 @@ namespace CardShopCoop.Net
                     at = gt + 1;
                 }
             }
-            catch (Exception e) { Swallow.Log(e); return null; }
+            catch (Exception e) { CoopLog.Swallow(e); return null; }
         }
 
         /// <summary>Value of an HTTP-style header line out of an SSDP response.</summary>
@@ -1153,7 +1471,7 @@ namespace CardShopCoop.Net
                     }
                 }
             }
-            catch (Exception e) { Swallow.Log(e); }
+            catch (Exception e) { CoopLog.Swallow(e); }
             return null;
         }
 

@@ -46,35 +46,34 @@ It's the folder that has **Card Shop Simulator.exe** in it.
 **Load into your shop first.** Not the main menu — all the way into the game.
 Then press **F2**.
 
-**Steam ↔ Steam (easiest — KCP over Steam Networking Sockets)**
+**Steam ↔ Steam (easiest)**
 
-Host clicks **Host via Steam** → **Invite friend**. Friend accepts. Done.
+Host clicks **Start hosting on Steam** → **Invite friend**. Friend accepts. Done.
 
-**LAN / same house (UDP/KCP)**
+**LAN / same house (IP / LAN)**
 
-Host clicks **Host via LAN**. The panel shows a **session password** and a
-**Copy invite code** button. Friend pastes the code into **Join by code**.
+Host clicks **Start hosting on IP / LAN**. The friend types the host's address on your
+network — like `192.168.1.50`, or `192.168.1.50:27886` if the host changed the port —
+into **Host address** and clicks **Join through IP / LAN**. Both players type the same
+password.
 
 **Over the internet (no Steam — this is the Game Pass route)**
 
 The Game Pass version of the game has no Steam Networking Sockets support at all, so it's
 IP-only.
 
-- **Option A:** host forwards UDP/KCP port **27886** on their router, then shares
-  the invite code. The mod tries to do this automatically; the host panel tells
-  you if your router refused.
-- **Option B (easier):** use a free virtual-LAN app — **Radmin VPN**
+- Leave **Open my router's port** on (the default) and the mod asks your router to open the
+  port for you. If your router refuses, forward UDP **27886** (or whatever port the host set)
+  on it yourself. Either way, press **Copy public address** on the host panel and send that to
+  the friend, who pastes it into **Host address**.
+- **Easier:** use a free virtual-LAN app — **Radmin VPN**
   (https://www.radmin-vpn.com) or Hamachi. Both players join the same virtual
-  network, then the joiner types the **host's virtual IP** into the IP box and
-  the **session password** into the small **pw** box, and clicks **Join LAN**.
-
-> With Radmin/Hamachi, use the IP + pw boxes — **not** the invite code. The code
-> carries your real internet address, not the virtual one.
+  network and then type each other's virtual address exactly as on a LAN.
 
 **Steam ↔ Game Pass?**
 
 Only when both stores are on the same game version. Right now they aren't
-(Game Pass is on 0.70, Steam on 0.70.3), so the mod refuses the join and says
+(Game Pass is on 1.00, Steam on 1.02), so the mod refuses the join and says
 so. When the stores line up it'll just work — no mod update needed.
 
 ---
@@ -104,9 +103,10 @@ Nothing to fix on your end — wait for the stores to match.
 Load fully into your shop before hosting, then try again.
 
 **Friends can't join over the internet**
-Your router probably refused the automatic port forward (the host panel says
-so). Either forward port **27886** manually, let the **other player host**, or
-use Radmin VPN / Hamachi.
+Your router probably refused to open the port (the host panel says so). Forward UDP
+**27886** (or whatever port the host set) on the host's router to the host's PC, then have
+the host press **Copy public address** and send that to the friend. If your router won't
+forward the port, use Radmin VPN / Hamachi instead.
 
 **Cards or items look wrong / missing**
 Update both PCs to the latest version first — a lot of these are already fixed.
@@ -121,7 +121,7 @@ Bugs get fixed fast when the report is good.
 **1. Logs from BOTH PCs.** This is the big one — most bugs are only visible by
 comparing the two sides. In your game folder:
 
-- `BepInEx\CardShopCoop_<number>.log` ← the important one
+- `BepInEx\CardShopCoopCommunity_<number>.log` ← the important one (the number is the game's process id)
 - `BepInEx\LogOutput.log` ← also helpful if the mod isn't loading at all
 
 Grab the newest one from right after the problem happened, and say which log is

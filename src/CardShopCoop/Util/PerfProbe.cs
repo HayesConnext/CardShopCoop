@@ -6,6 +6,7 @@ using System.Linq;
 using Unity.Profiling;
 using UnityEngine;
 using UnityEngine.Profiling;
+using CardShopCoop.Api;
 
 namespace CardShopCoop.Util
 {
@@ -180,7 +181,7 @@ namespace CardShopCoop.Util
                 }
                 catch (Exception e)
                 {
-                    Swallow.Log(e);
+                    CoopLog.Swallow(e);
                     return false;
                 }
             }
@@ -241,21 +242,6 @@ namespace CardShopCoop.Util
             return new ThreadScope(stage);
         }
 
-        /// <summary>Run an action and expose/log its stage while diagnostics are enabled.</summary>
-        public static void Measure(string stage, Action action)
-        {
-            if (!Enabled)
-            {
-                action();
-                return;
-            }
-
-            using (Sample(stage))
-            {
-                action();
-            }
-        }
-
         public static void Reset()
         {
             LastStageLog.Clear();
@@ -301,14 +287,6 @@ namespace CardShopCoop.Util
 
             LastStageLog[stage] = now;
             CoopPlugin.Log.LogWarning($"[perf] {stage} took {ms:F1} ms");
-        }
-
-        public static void End(string stagePrefix, Type type, long start)
-        {
-            if (start != 0L)
-            {
-                End(stagePrefix + (type?.Name ?? "unknown"), start);
-            }
         }
 
         public static long StartThreadMetric()

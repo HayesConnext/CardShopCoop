@@ -1,15 +1,36 @@
 using CardShopCoop.Net.Connection;
 using PeerConnection = CardShopCoop.Net.Connection.PeerConnection;
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 
 namespace CardShopCoop.Net
 {
+    /// <summary>One received message, already reassembled and decoded from the wire.
+    /// Transports never expose partial frames to callers.</summary>
+    public struct InMsg
+    {
+        public PeerConnection Connection;
+        public INetMessage Message;
+
+        /// <summary>Set by the runtime's transports; not part of the public contract.</summary>
+        internal bool ReceivedBeforeMessageIdActivation;
+
+        public Type MessageType
+        {
+            get
+            {
+                return Message?.GetType();
+            }
+        }
+    }
+
     /// <summary>
     /// Transport contract shared by the LAN UDP/KCP transport and the Steam
     /// KCP over Steam Networking Sockets transport.
     /// Connection ids are small ints; 1 is always "the host" from a client's view.
+    ///
+    /// This lives in CardShopCoop.Api so a transport can be contributed by its own assembly: the
+    /// Steam transport is a separate plugin that references only this assembly.
     /// </summary>
     public interface ICoopTransport : IDisposable
     {
@@ -18,10 +39,9 @@ namespace CardShopCoop.Net
         /// it. Callers must use this method instead of retaining a raw producer queue.
         /// </summary>
         bool TryDequeueIncoming(out InMsg message);
-        ConcurrentQueue<ConnectionEvent> Disconnects
-        {
-            get;
-        }
+        /// <summary>Removes one peer-disconnect notification, if any. Replaces the old public queue
+        /// property, which handed every caller the transport's own mutable internals.</summary>
+        bool TryDequeueDisconnect(out ConnectionEvent disconnect);
         event Action<PeerConnection> PeerConnected;
 
         /// <summary>Activates compact message ids for an authenticated peer.</summary>
@@ -46,7 +66,7 @@ namespace CardShopCoop.Net
         void Stop();
 
         /// <summary>Advances one transport pump step. This runs on the dedicated network
-        /// thread owned by <see cref="NetworkPump"/>, never on the Unity update loop. All
+        /// thread owned by NetworkPump, never on the Unity update loop. All
         /// lifecycle calls (Start/Stop/Dispose/ActivateMessageIds) are marshalled onto that
         /// same thread so bearer and KCP state stay single-threaded.</summary>
         void PumpNetworkThread();
@@ -65,29 +85,26 @@ namespace CardShopCoop.Net
     /// Keeping this separate from the public send surface prevents external callers from
     /// bypassing the Handshaking admission gate.
     /// </summary>
-    internal interface ICoopHandshakeTransport
+    public interface ICoopHandshakeTransport
     {
         void SendHandshake(PeerConnection connection, INetMessage message);
     }
 
     /// <summary>Lifecycle seam: a transport whose bearer must be started on the network pump
-    /// thread. Kept internal so callers cannot bypass <see cref="NetworkPump"/>'s thread
-    /// ownership by starting a bearer themselves.</summary>
-    internal interface ICoopStartable
+    /// thread. The runtime wraps contributed transports in NetworkPump, which starts them here.</summary>
+    public interface ICoopStartable
     {
         void Start();
     }
 
     /// <summary>
-    /// Internal fan-out admission used only by the host world relay. A relay is a
+    /// Fan-out admission used only by the host world relay. A relay is a
     /// <see cref="ICoopTransport.Broadcast"/> that omits one connection, so it must honor the
     /// exact same recipient admission as <c>Broadcast</c>: a peer that is disconnecting, still
     /// completing the named handshake, or has not yet activated compact message ids is skipped
-    /// rather than treated as a hard send failure. A per-connection
-    /// <see cref="ICoopTransport.Send"/> over the connection list would disconnect a peer that
-    /// is simply still joining. Kept internal so external callers cannot reach the relay seam.
+    /// rather than treated as a hard send failure.
     /// </summary>
-    internal interface ICoopRelayTransport
+    public interface ICoopRelayTransport
     {
         void Relay(INetMessage message, int exceptConnectionId);
     }

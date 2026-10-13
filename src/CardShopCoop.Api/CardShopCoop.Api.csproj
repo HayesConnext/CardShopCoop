@@ -44,7 +44,7 @@
   <Target Name="Package" AfterTargets="Build" Condition="'$(Package)' == 'true'">
     <PropertyGroup>
       <PackageDirectory>$(IntermediateOutputPath)package</PackageDirectory>
-      <PackageZip>$(OutputPath)$(AssemblyName)-$(CardShopCoopVersion).zip</PackageZip>
+      <PackageZip>$(OutputPath)$(AssemblyName).zip</PackageZip>
     </PropertyGroup>
     <RemoveDir Directories="$(PackageDirectory)" />
     <MakeDir Directories="$(PackageDirectory)/$(AssemblyName)" />

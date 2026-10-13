@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading;
+using CardShopCoop.Api;
 
 namespace CardShopCoop.Net.Datagrams
 {
@@ -56,6 +57,10 @@ namespace CardShopCoop.Net.Datagrams
         private long _nextToken = 1;
         private int _pendingClosedIndex;
 
+        // A socket the caller already bound (the IP backend binds one so it knows the port it must
+        // tell a friend to dial); the transport adopts it rather than binding its own.
+        private Socket _adoptedSocket;
+
         /// <summary>
         /// Creates a host transport.  The socket is created by <see cref="Start"/>, not by this
         /// constructor, so callers can subscribe to events before any lifecycle event occurs.
@@ -95,32 +100,16 @@ namespace CardShopCoop.Net.Datagrams
             return new UdpDatagramTransport(bindEndpoint, maxDatagramSize);
         }
 
-        /// <summary>Creates a stopped host transport bound to all IPv4 interfaces.</summary>
+        /// <summary>A host transport over a socket the caller already bound - the IP backend binds one
+        /// to a fixed port and must keep serving that same socket, and the caller needs the bound port
+        /// to hand to a friend.</summary>
         public static UdpDatagramTransport CreateHost(
-            int port,
+            Socket boundSocket,
             int maxDatagramSize = DefaultMaxDatagramSize)
         {
-            return CreateHost(new IPEndPoint(IPAddress.Any, port), maxDatagramSize);
-        }
-
-        /// <summary>
-        /// Creates a stopped client transport.  It binds an ephemeral local port in the remote
-        /// endpoint's address family.
-        /// </summary>
-        public static UdpDatagramTransport CreateClient(
-            IPEndPoint remoteEndpoint,
-            int maxDatagramSize = DefaultMaxDatagramSize)
-        {
-            return new UdpDatagramTransport(null, remoteEndpoint, maxDatagramSize);
-        }
-
-        /// <summary>Creates a stopped client with an explicit local bind endpoint.</summary>
-        public static UdpDatagramTransport CreateClient(
-            IPEndPoint remoteEndpoint,
-            IPEndPoint localBindEndpoint,
-            int maxDatagramSize = DefaultMaxDatagramSize)
-        {
-            return new UdpDatagramTransport(localBindEndpoint, remoteEndpoint, maxDatagramSize);
+            var transport = CreateHost(new IPEndPoint(IPAddress.Any, 0), maxDatagramSize);
+            transport._adoptedSocket = boundSocket;
+            return transport;
         }
 
         public int MaxDatagramSize => _maxDatagramSize;
@@ -155,15 +144,36 @@ namespace CardShopCoop.Net.Datagrams
                     return;
                 }
 
-                var socket = CreateSocket(_bindEndpoint.AddressFamily);
-                try
+                var socket = _adoptedSocket;
+                _adoptedSocket = null;
+                if (socket != null)
                 {
-                    socket.Bind(_bindEndpoint);
+                    // A socket bound by the caller (for STUN) arrives blocking; the receive loop
+                    // gate below assumes the same non-blocking posture as a socket we created.
+                    try
+                    {
+                        DisableUdpConnReset(socket, socket.AddressFamily);
+                        socket.Blocking = false;
+                    }
+                    catch (Exception error)
+                    {
+                        CloseSocket(socket);
+                        throw new InvalidOperationException(
+                            "could not prepare the adopted punch socket", error);
+                    }
                 }
-                catch
+                else
                 {
-                    CloseSocket(socket);
-                    throw;
+                    socket = CreateSocket(_bindEndpoint.AddressFamily);
+                    try
+                    {
+                        socket.Bind(_bindEndpoint);
+                    }
+                    catch
+                    {
+                        CloseSocket(socket);
+                        throw;
+                    }
                 }
 
                 _socket = socket;

@@ -1,5 +1,7 @@
 using CardShopCoop.Net.Datagrams;
 using CardShopCoop.Net.Kcp;
+using CardShopCoop.Net.Networking;
+using CardShopCoop.Steam;
 using CardShopCoop.Util;
 using System;
 using System.Collections.Concurrent;
@@ -8,6 +10,7 @@ using System.Threading;
 using Steamworks;
 using UnityEngine;
 using CardShopCoop;
+using CardShopCoop.Api;
 
 namespace CardShopCoop.Net
 {
@@ -21,7 +24,6 @@ namespace CardShopCoop.Net
         private CallResult<LobbyCreated_t> _createLobby;
         private Callback<LobbyEnter_t> _cbEnter;
         private Callback<GameLobbyJoinRequested_t> _cbJoinRequested;
-        private CallResult<LobbyMatchList_t> _lobbyList;
 
         public CSteamID LobbyId = CSteamID.Nil;
         private bool _joining;
@@ -29,7 +31,6 @@ namespace CardShopCoop.Net
         private long _operationGeneration;
         private long _pendingOperationGeneration;
         private long _activeLobbyOperationGeneration;
-        private long _listOperationGeneration;
         private bool _pendingPublic;
         private string _pendingName = "";
         private bool _pendingHasPw;
@@ -42,60 +43,9 @@ namespace CardShopCoop.Net
         public Action<long, string> OnHostFailed;
         public Action<CSteamID> OnInviteAccepted; // local player accepted someone's invite
         public Action<string> OnError;
-        public Action OnListUpdated;
-
-        public struct LobbyRow
-        {
-            public CSteamID Id;
-            public string Name;
-            public int Players;
-            public int Max;
-            public bool HasPw;
-            public string Ver;
-        }
-
-        public readonly List<LobbyRow> Lobbies = new();
-        public bool ListRefreshing
-        {
-            get; private set;
-        }
 
         public void Init()
         {
-            _lobbyList = CallResult<LobbyMatchList_t>.Create((e, ioFail) =>
-            {
-                if (_listOperationGeneration == 0 || _listOperationGeneration != _operationGeneration)
-                {
-                    return; // stale list result must not clear or publish a newer operation
-                }
-
-                ListRefreshing = false;
-                Lobbies.Clear();
-                if (ioFail)
-                {
-                    OnError?.Invoke("Steam lobby list failed");
-                    return;
-                }
-                for (var i = 0; i < e.m_nLobbiesMatching; i++)
-                {
-                    var id = SteamMatchmaking.GetLobbyByIndex(i);
-                    if (id == CSteamID.Nil)
-                    {
-                        continue;
-                    }
-
-                    Lobbies.Add(new LobbyRow
-                    {
-                        Id = id,
-                        Name = SteamMatchmaking.GetLobbyData(id, "name"),
-                        Players = SteamMatchmaking.GetNumLobbyMembers(id),
-                        Max = SteamMatchmaking.GetLobbyMemberLimit(id),
-                        HasPw = SteamMatchmaking.GetLobbyData(id, "pw") == "1",
-                        Ver = SteamMatchmaking.GetLobbyData(id, "coopver"),
-                    });
-                }
-                OnListUpdated?.Invoke();
-            });
             _cbEnter = Callback<LobbyEnter_t>.Create(e =>
             {
                 CSteamID enteredLobby = new(e.m_ulSteamIDLobby);
@@ -133,7 +83,7 @@ namespace CardShopCoop.Net
             {
                 return SteamAPI.IsSteamRunning();
             }
-            catch (Exception e) { Swallow.Log(e); return false; }
+            catch (Exception e) { CoopLog.Swallow(e); return false; }
         }
 
         public void Host(bool isPublic, string lobbyName, bool hasPassword, int maxPlayers)
@@ -188,23 +138,6 @@ namespace CardShopCoop.Net
             _createLobby.Set(call);
         }
 
-        /// <summary>Fetch public lobbies of THIS mod (server-side filtered by our key).</summary>
-        public void RefreshList()
-        {
-            if (ListRefreshing)
-            {
-                return;
-            }
-
-            ListRefreshing = true;
-            _listOperationGeneration = ++_operationGeneration;
-            SteamMatchmaking.AddRequestLobbyListStringFilter("coopmod", "communitymultiplayer", ELobbyComparison.k_ELobbyComparisonEqual);
-            SteamMatchmaking.AddRequestLobbyListResultCountFilter(100);
-            SteamMatchmaking.AddRequestLobbyListDistanceFilter(ELobbyDistanceFilter.k_ELobbyDistanceFilterWorldwide);
-            var call = SteamMatchmaking.RequestLobbyList();
-            _lobbyList.Set(call);
-        }
-
         public long Join(CSteamID lobby)
         {
             AbortPendingOperation();
@@ -221,6 +154,18 @@ namespace CardShopCoop.Net
             {
                 SteamFriends.ActivateGameOverlayInviteDialog(LobbyId);
             }
+        }
+
+        /// <summary>Opens Steam's Game Servers window in the overlay.
+        ///
+        /// "servers" is the dialog name the overlay's dispatch switch maps to its GameServers window.
+        /// It is deliberately absent from the wrapper's dialog enum because it is undocumented - the
+        /// documented set is friends/community/players/settings/officialgamegroup/stats/achievements,
+        /// and the undocumented ones that also work include "workshop", "leaderboards" and this.
+        /// Verified against the overlay's own UI bundle, not guessed.</summary>
+        public void OpenGameServers()
+        {
+            SteamFriends.ActivateGameOverlay("servers");
         }
 
         public void Leave()
@@ -288,7 +233,7 @@ namespace CardShopCoop.Net
             {
                 SteamMatchmaking.LeaveLobby(lobby);
             }
-            catch (Exception e) { Swallow.Log(e); }
+            catch (Exception e) { CoopLog.Swallow(e); }
             if (LobbyId == lobby)
             {
                 LobbyId = CSteamID.Nil;
@@ -324,8 +269,6 @@ namespace CardShopCoop.Net
             _createLobby = null;
             _pendingOperationGeneration = 0;
             _activeLobbyOperationGeneration = 0;
-            _listOperationGeneration = 0;
-            ListRefreshing = false;
             _joining = false;
             _pendingLobbyId = CSteamID.Nil;
             if (LobbyId != CSteamID.Nil)
@@ -334,7 +277,7 @@ namespace CardShopCoop.Net
                 {
                     SteamMatchmaking.LeaveLobby(LobbyId);
                 }
-                catch (Exception e) { Swallow.Log(e); }
+                catch (Exception e) { CoopLog.Swallow(e); }
                 LobbyId = CSteamID.Nil;
             }
         }
@@ -659,7 +602,7 @@ namespace CardShopCoop.Net
     /// lifecycle remain entirely on this side of the Steam-free bridge; the returned transport
     /// is the common KCP manager used by every backend.
     /// </summary>
-    internal sealed class SteamBridgeImpl : ISteamBridge
+    public sealed class SteamBridgeImpl : ISteamBridge
     {
         internal const int MaxPendingCallbacks = 512;
         internal const int MaxCallbacksPerPump = 64;
@@ -667,7 +610,6 @@ namespace CardShopCoop.Net
         private readonly SteamLobby _lobby = new();
         private readonly ConcurrentQueue<BridgeCallback> _callbacks = new();
         private readonly object _transportGate = new object();
-        private readonly List<LobbyRow> _rows = new();
         private DeferredSteamDatagramTransport _datagrams;
         private ICoopTransport _tx;
         private long _transportGeneration;
@@ -790,7 +732,6 @@ namespace CardShopCoop.Net
             };
             _lobby.OnInviteAccepted = id => QueueGlobal(
                 () => OnInviteAccepted?.Invoke(id.m_SteamID));
-            _lobby.OnListUpdated = () => { };
         }
 
         public bool SteamAvailable()
@@ -806,7 +747,7 @@ namespace CardShopCoop.Net
                 {
                     return SteamAvailable() ? (SteamFriends.GetPersonaName() ?? "") : "";
                 }
-                catch (Exception e) { Swallow.Log(e); return ""; }
+                catch (Exception e) { CoopLog.Swallow(e); return ""; }
             }
         }
 
@@ -823,7 +764,7 @@ namespace CardShopCoop.Net
 
                     return SteamUser.GetSteamID().m_SteamID;
                 }
-                catch (Exception e) { Swallow.Log(e); return 0; }
+                catch (Exception e) { CoopLog.Swallow(e); return 0; }
             }
         }
 
@@ -849,7 +790,7 @@ namespace CardShopCoop.Net
 
                 return SteamFriends.GetFriendPersonaName(friend) ?? "";
             }
-            catch (Exception e) { Swallow.Log(e); return ""; }
+            catch (Exception e) { CoopLog.Swallow(e); return ""; }
         }
 
         public ICoopTransport CreateTransport(bool isHost)
@@ -864,6 +805,8 @@ namespace CardShopCoop.Net
                 var datagrams = new DeferredSteamDatagramTransport(
                     SteamDatagramTransport.DefaultMaxDatagramSize);
                 var transport = new KcpSessionManager(datagrams, isHost);
+                transport.SetConnectionIdBand(SteamNetworkingBackend.IdBase,
+                    SteamNetworkingBackend.IdBase + NetworkingBands.Size);
                 _datagrams = datagrams;
                 _tx = transport;
                 _transportGeneration++;
@@ -898,39 +841,9 @@ namespace CardShopCoop.Net
             _lobby.OpenInviteDialog();
         }
 
-        public void RefreshList()
+        public void OpenGameServers()
         {
-            _lobby.RefreshList();
-        }
-
-        public bool ListRefreshing
-        {
-            get
-            {
-                return _lobby.ListRefreshing;
-            }
-        }
-
-        public List<LobbyRow> Lobbies
-        {
-            get
-            {
-                _rows.Clear();
-                foreach (var r in _lobby.Lobbies)
-                {
-                    _rows.Add(new LobbyRow
-                    {
-                        Id = r.Id.m_SteamID,
-                        Name = r.Name,
-                        Players = r.Players,
-                        Max = r.Max,
-                        HasPw = r.HasPw,
-                        Ver = r.Ver,
-                    });
-                }
-
-                return _rows;
-            }
+            _lobby.OpenGameServers();
         }
 
         private void BindHost(long generation, ICoopTransport transport,

@@ -241,7 +241,12 @@ namespace CardShopCoop.Modules.Catalog
         /// the other. The numeric ids are deliberately ignored - EPL mints them in bundle load
         /// order, so the same name can carry different ids on two peers; the wire and the save
         /// translate enum identity by name (<see cref="CatalogIdMap"/>), so differing ids are not
-        /// a conflict.</summary>
+        /// a conflict.
+        ///
+        /// A name present on only one peer is SATISFIED when it is in the coalesce table and the
+        /// side that LACKS it has the alias target (it is the side that will ingest and coalesce),
+        /// or when it is a dropped member with no equivalent. Those are the cross-build
+        /// <c>EObjectType</c> divergences; everything else still refuses the join.</summary>
         internal static List<string> EnumKeyConflicts(List<EnumKindIdentityDto> theirs,
             List<EnumKindIdentityDto> ours)
         {
@@ -250,7 +255,7 @@ namespace CardShopCoop.Modules.Catalog
             var ourKeys = EnumKeySet(ours);
             foreach (var key in theirKeys)
             {
-                if (!ourKeys.Contains(key))
+                if (!ourKeys.Contains(key) && !CoalesceSatisfies(key, ourKeys))
                 {
                     found.Add("client-only " + key);
                 }
@@ -258,7 +263,7 @@ namespace CardShopCoop.Modules.Catalog
 
             foreach (var key in ourKeys)
             {
-                if (!theirKeys.Contains(key))
+                if (!theirKeys.Contains(key) && !CoalesceSatisfies(key, theirKeys))
                 {
                     found.Add("host-only " + key);
                 }
@@ -266,6 +271,34 @@ namespace CardShopCoop.Modules.Catalog
 
             found.Sort(StringComparer.Ordinal);
             return found;
+        }
+
+        /// <summary>True when a key missing from the given side is handled by the coalesce table:
+        /// a dropped member with no equivalent anywhere, or an alias source whose target exists on
+        /// that same side (so that side can ingest the peer's value as the target). Only
+        /// <c>EObjectType</c> has a coalesce table; every other missing key stays a conflict.</summary>
+        private static bool CoalesceSatisfies(string key, HashSet<string> missingSideKeys)
+        {
+            var colon = key.IndexOf(':');
+            if (colon < 0)
+            {
+                return false;
+            }
+
+            var typeName = key.Substring(0, colon);
+            var member = key.Substring(colon + 1);
+            if (!string.Equals(typeName, nameof(EObjectType), StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            if (CatalogIdMap.IsObjectTypeDropped(member))
+            {
+                return true;
+            }
+
+            var target = CatalogIdMap.ObjectTypeAliasTarget(member);
+            return target != null && missingSideKeys.Contains(typeName + ":" + target);
         }
 
         /// <summary>The "EnumType:MemberName" keys of one identity, for key-set comparison. The

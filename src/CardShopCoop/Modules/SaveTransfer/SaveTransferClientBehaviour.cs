@@ -81,8 +81,13 @@ namespace CardShopCoop.Modules.SaveTransfer
                 owner.RejectTransfer("the session generation is no longer active");
                 return false;
             }
-            owner._saveBuffer = new MemoryStream(Math.Min(saveLength, SaveTransferStorage.MaxTransferBytes));
-            owner._bundleBuffer = new MemoryStream(Math.Min(bundleLength, SaveTransferStorage.MaxTransferBytes));
+            // Grow as the chunks arrive instead of reserving the declared size up front. The declared
+            // length is already bounded by MaxTransferBytes above, and a MemoryStream doubles its
+            // capacity when it overflows, so the buffer ends up at the transfer's REAL size and never at
+            // the cap. A peer declaring a huge transfer must not be able to make us reserve that much
+            // memory before a single byte has arrived.
+            owner._saveBuffer = new MemoryStream(Math.Min(saveLength, 64 * 1024));
+            owner._bundleBuffer = new MemoryStream(Math.Min(bundleLength, 64 * 1024));
             owner._pendingSave = null;
             owner._saveDone = false;
             owner._worldRequested = false;

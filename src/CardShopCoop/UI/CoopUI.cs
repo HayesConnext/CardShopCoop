@@ -1,19 +1,20 @@
 using System;
 using System.Collections.Generic;
-using System.Globalization;
-using System.Net.NetworkInformation;
-using System.Net.Sockets;
+using System.Threading.Tasks;
 using BepInEx.Configuration;
 using CardShopCoop.Net;
+using CardShopCoop.Net.Networking;
 using CardShopCoop.Modules.Catalog;
 using CardShopCoop.Modules.Grading;
 using CardShopCoop.Modules.Hud;
 using CardShopCoop.Modules.Presence;
+using CardShopCoop.Modules.Shop;
 using CardShopCoop.Runtime;
 // NO `using Steamworks;` HERE, AND NEVER AGAIN - see the same note in CoopCore.cs. OnGUI
 // is the worst possible place for a type-load fault (DrawNone runs every frame on the main
-// menu), so every lobby id in this file is a plain ulong and lobby rows are Net.LobbyRow.
+// menu), so nothing Steam-typed may appear in this file - a lobby id included.
 using UnityEngine;
+using CardShopCoop.Api;
 
 namespace CardShopCoop.UI
 {
@@ -27,15 +28,29 @@ namespace CardShopCoop.UI
         private Rect _win = new(24f, 96f, 400f, 10f);
         private int _fpsShown = -1;
         private string _versionWithFps;
-        private string _ipField;
         private string _nameField;
-        private string _lanIps;
-        private string _lanIpsOther;
-        private readonly CopyButton _ipCopy = new();
-        private string _inviteField = "";
-        private readonly CopyButton _inviteCopy = new();
-        private readonly CopyButton _passwordCopy = new();
-        private string _lanPwField = "";
+        private readonly Dictionary<string, FieldValues> _fieldValues = new();
+
+        // Delayed hover tooltips: which control the pointer is resting on, since when, and the box
+        // the last qualifying hover parked for the end of the window.
+        private const float TooltipDelaySeconds = 3f;
+
+        // Glyph buttons: one character in a square button the same height as every other button in
+        // the panel (ButtonSecondary fixes that height), so a row of field actions stays compact.
+        private const float IconButtonWidth = 26f;
+
+        // The single Start/Stop control in a container header: a square glyph button, sized to sit in
+        // line with the button height the theme fixes for every other control.
+        private const float HeaderIconWidth = 30f;
+        private string _tipKey;
+        private float _tipSince;
+        private string _pendingTipText;
+        private Vector2 _pendingTipAt;
+        private readonly HashSet<string> _expanded = new();
+        private readonly Dictionary<string, BackendAvailability> _availability = new();
+        private readonly Dictionary<string, Task<BackendAvailability>> _availabilityTasks = new();
+        private readonly HashSet<string> _autoExpanded = new();
+        private float _availabilityPolledAt;
         private bool _characterOpen = true;
         private enum CoopTab
         {
@@ -82,21 +97,9 @@ namespace CardShopCoop.UI
         // impossible (a queued publish drains in Update, and OnGUI can run more than once per
         // Update). Latching in Layout only - the same trick _lanIps already uses - makes both
         // passes draw from one immutable snapshot, so the question cannot arise.
-        private InviteState _invState;
-        private string _invCode, _invReason, _invPassword;
-        private int _invPortState;
-
-        // lobby browser + host options
-        private bool _browserOpen;
-        private string _searchField = "";
-        private int _page;
-        private bool _publicLobby;
-        private string _lobbyNameField = "";
-        private string _hostPwField = "";
-        private string _hostPlayersField = SteamLobbyLimits.DefaultPlayers.ToString(CultureInfo.InvariantCulture);
-        private string _joinPwField = "";
-        private ulong _pwPromptLobby; // 0 = no password prompt open
-        private const int PageSize = 6;
+        // The networking tab probes each backend's availability at most every couple of seconds and
+        // caches the answer - never once per frame (see DrawBackendGroup).
+        private const float AvailabilityRefreshSeconds = 2f;
         private const float MaxWindowHeight = 720f;
         // Keep the complete window clear of the screen edges so a resize cannot push the
         // footer off-screen. The window's own height is set from this, not from its children.
@@ -105,6 +108,10 @@ namespace CardShopCoop.UI
         // wrapper from it so the session's last panel can fill the tab, without guessing the
         // header/tabs/footer size.
         private float _viewportHeight;
+        /// <summary>The width the scroll content was actually given, measured on the previous
+        /// Repaint. Controls whose text can be long must be given an explicit width from THIS, not
+        /// from their content, or they widen the whole panel.</summary>
+        private float _viewportWidth = 240f;
 
         // OnGUI runs 2+ times per frame; GUIStyle construction and string interpolation there
         // is steady per-frame garbage. Styles/textures live in CoopTheme (built once, cached);
@@ -120,35 +127,14 @@ namespace CardShopCoop.UI
         private KeyCode _toggleKeySeen = KeyCode.None;
         private string _toggleHint;
 
-        /// <summary>Lower = more likely the real home-LAN address.</summary>
-        private static int IpRank(string ip)
-        {
-            if (ip.StartsWith("192.168."))
-            {
-                return 0;             // classic home router
-            }
-
-            if (ip.StartsWith("10."))
-            {
-                return 1;                   // some routers/VPNs
-            }
-
-            if (ip.StartsWith("172."))
-            {
-                return 2;                  // usually WSL/Hyper-V/Docker
-            }
-
-            return 3;
-        }
+        // The failure-alert popup (CoopAlert). The rect is seeded when the alert first appears and
+        // then tracked from GUILayout.Window so it stays where it was placed.
+        private Rect _alertWin = new(0f, 0f, 460f, 10f);
+        private bool _alertShown;
 
         public void Draw(CoopCore core, ICoopTransport net)
         {
             CoopTheme.EnsureBuilt();
-            if (_ipField == null)
-            {
-                _ipField = CoopPlugin.LastJoinIP.Value;
-            }
-
             if (_nameField == null)
             {
                 _nameField = core.EffectivePlayerName;
@@ -207,6 +193,7 @@ namespace CardShopCoop.UI
             if (!Visible)
             {
                 PresenceApi.SetCharacterPreview(false);
+                DrawAlert();
                 return;
             }
 
@@ -225,6 +212,72 @@ namespace CardShopCoop.UI
             // pre-call clamp only had the previous frame's height.
             _win.x = Mathf.Clamp(_win.x, 0f, Mathf.Max(0f, Screen.width - _win.width));
             _win.y = Mathf.Clamp(_win.y, 0f, Mathf.Max(0f, Screen.height - _win.height));
+
+            // Drawn LAST so it sits above the window and every HUD pill; the same call also runs
+            // on the hidden path above, because an error the player must see cannot depend on the
+            // co-op window being open.
+            DrawAlert();
+        }
+
+        /// <summary>Draws the one-shot failure alert (see <see cref="CoopAlert"/>) as a centered
+        /// popup window with a Dismiss button. It is sized and placed once, when it first appears,
+        /// and then only clamped to the screen - it is not a drag handle, so it stays put.</summary>
+        private void DrawAlert()
+        {
+            if (!CoopAlert.Active)
+            {
+                _alertShown = false;
+                return;
+            }
+
+            if (!_alertShown)
+            {
+                _alertShown = true;
+                // Same width discipline as the main window: never wider than the screen it has to
+                // fit on, so a small resolution cannot push the alert off the right edge. The seed
+                // height only shapes the very first frame's shadow - the real height comes back
+                // from GUILayout.Window once it has measured the labels.
+                _alertWin.width = Mathf.Min(460f, Mathf.Max(1f, Screen.width - 80f));
+                _alertWin.height = 160f;
+                _alertWin.x = (Screen.width - _alertWin.width) * 0.5f;
+                _alertWin.y = Mathf.Max(24f, Screen.height * 0.32f);
+            }
+
+            _alertWin.x = Mathf.Clamp(_alertWin.x, 0f, Mathf.Max(0f, Screen.width - _alertWin.width));
+            _alertWin.y = Mathf.Clamp(_alertWin.y, 0f, Mathf.Max(0f, Screen.height - _alertWin.height));
+            CoopTheme.DrawWindowShadow(_alertWin);
+            _alertWin = GUILayout.Window(867531, _alertWin, id => AlertWindowFn(), "",
+                CoopTheme.Window, GUILayout.Width(_alertWin.width));
+            // Clamp again after layout, exactly like the main window: the pre-call clamp only had
+            // the previous frame's height, so a wrapped label that grows the window is corrected
+            // here instead of leaving the alert hanging off the screen.
+            _alertWin.x = Mathf.Clamp(_alertWin.x, 0f, Mathf.Max(0f, Screen.width - _alertWin.width));
+            _alertWin.y = Mathf.Clamp(_alertWin.y, 0f, Mathf.Max(0f, Screen.height - _alertWin.height));
+        }
+
+        private void AlertWindowFn()
+        {
+            CoopTheme.DrawWindowChrome(new Rect(0f, 0f, _alertWin.width, _alertWin.height),
+                "CO-OP ERROR", "");
+            GUILayout.Label(CoopAlert.Title, CoopTheme.LabelWrap);
+            if (CoopAlert.RepeatCount > 1)
+            {
+                GUILayout.Label("This has happened " + CoopAlert.RepeatCount + " times.",
+                    CoopTheme.LabelDim);
+            }
+            if (CoopAlert.Detail.Length > 0)
+            {
+                GUILayout.Space(4f);
+                GUILayout.Label(CoopAlert.Detail, CoopTheme.LabelDimWrap);
+            }
+            GUILayout.Space(8f);
+            GUILayout.BeginHorizontal();
+            GUILayout.FlexibleSpace();
+            if (GUILayout.Button("Dismiss", CoopTheme.ButtonSecondary, GUILayout.Width(90f)))
+            {
+                CoopAlert.Dismiss();
+            }
+            GUILayout.EndHorizontal();
         }
 
         /// <summary>Draws one horizontally centered persistent HUD pill. OnGUI runs at least twice
@@ -289,19 +342,14 @@ namespace CardShopCoop.UI
             scroll = GUILayout.BeginScrollView(scroll, CoopTheme.ScrollView, GUILayout.ExpandHeight(true));
             // Everything in the scroll view shares this minimum-height wrapper, seeded from the
             // viewport measured on the previous Repaint. A short tab therefore fills the space
-            // (its last panel can expand) while a tall one grows past it and scrolls. The PROBLEM
-            // banner is inside it too, so a wrapped error counts as content instead of forcing a
-            // scrollbar on its own.
+            // (its last panel can expand) while a tall one grows past it and scrolls.
+            //
+            // There is deliberately NO error banner above the tabs any more. It said PROBLEM plus the
+            // core's last error, which meant a failure to JOIN appeared at the top of the HOSTING tab
+            // and vice versa - the error carried no sense of which half produced it. Failures now show
+            // only inside the backend section they belong to (BackendError, keyed by mode), and the
+            // HUD pill still reports them when the window is hidden.
             GUILayout.BeginVertical(CoopTheme.ScrollContent, GUILayout.MinHeight(_viewportHeight));
-            if (core.ErrorLine.Length > 0)
-            {
-                GUILayout.BeginHorizontal();
-                CoopTheme.Chip("PROBLEM", CoopTheme.ChipDanger);
-                GUILayout.FlexibleSpace();
-                GUILayout.EndHorizontal();
-                GUILayout.Label(core.ErrorLine, CoopTheme.LabelDanger);
-                GUILayout.Space(4f);
-            }
             if (_tab == CoopTab.Character && CoopCore.Role != CoopRole.None)
             {
                 DrawCharacterSelector(core);
@@ -326,10 +374,20 @@ namespace CardShopCoop.UI
             // Guarded so a bogus value can never inflate the content into a permanent scrollbar.
             if (Event.current.type == EventType.Repaint)
             {
-                var measured = GUILayoutUtility.GetLastRect().height;
-                if (measured > 0f && measured <= _win.height)
+                var measured = GUILayoutUtility.GetLastRect();
+                if (measured.height > 0f && measured.height <= _win.height)
                 {
-                    _viewportHeight = measured;
+                    _viewportHeight = measured.height;
+                }
+
+                // Width for the same reason: layout gives a control a MINIMUM width equal to its
+                // content, so a long value (a reach code) widens the panel unless it is given an
+                // explicit width - and that width has to come from the panel, not the content.
+                // Reject a width bigger than the window: that IS the widened case we are fixing,
+                // so keep the last good one instead of latching the overflow.
+                if (measured.width > 0f && measured.width <= _win.width)
+                {
+                    _viewportWidth = measured.width;
                 }
             }
             if (_tab == CoopTab.Character)
@@ -351,6 +409,7 @@ namespace CardShopCoop.UI
 
             GUILayout.EndVertical();
 
+            DrawPendingTooltip();
             FinishWindow();
         }
 
@@ -405,7 +464,12 @@ namespace CardShopCoop.UI
                     DrawNone(core);
                     break;
                 case CoopRole.Host:
-                    DrawHost(core, net);
+                    // The session roster first, so the host can see who is in and remove anyone.
+                    DrawHostPlayers(core);
+                    // No separate hosting view: the tab stays the backend list. The container of the
+                    // backend you started swaps its options for that backend's connection info, and
+                    // the others stay usable so another can be opened or closed on its own.
+                    DrawConnectBody(core, ConnectMode.Host);
                     break;
                 case CoopRole.Client:
                     DrawClient(core);
@@ -560,6 +624,9 @@ namespace CardShopCoop.UI
         {
             DrawConfigToggle(CoopPlugin.ShowHiddenCategory, "Show hidden category");
             DrawConfigToggle(CoopPlugin.EnableGameCheatMenu, "Enable game cheat menu");
+            // Bound only on builds with the entitlement gate (Game Pass), so this draws nothing on
+            // the Steam build.
+            DrawConfigToggle(CoopPlugin.ForceDeluxeFurniture, "Force deluxe furniture");
         }
 
         private static void DrawConfigToggle(ConfigEntry<bool> entry, string label)
@@ -983,9 +1050,12 @@ namespace CardShopCoop.UI
                 {
                     wrapMode = TextureWrapMode.Clamp
                 };
+                // Top of the strip is the highest hue, matching the marker and click handler, which
+                // both read the bar top-down (hue 1 at the top). The saturation/value box uses the
+                // same convention for its value axis.
                 for (var y = 0; y < 96; y++)
                 {
-                    _huePickerTexture.SetPixel(0, y, Color.HSVToRGB(1f - y / 95f, 1f, 1f));
+                    _huePickerTexture.SetPixel(0, y, Color.HSVToRGB(y / 95f, 1f, 1f));
                 }
 
                 _huePickerTexture.Apply();
@@ -1172,386 +1242,725 @@ namespace CardShopCoop.UI
         private static bool Has(string hay, string needle)
             => hay.IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0;
 
+        /// <summary>No session yet. Which half of the window is offered follows the game state, not a
+        /// toggle: a loaded save means you are HOSTING (the shop is live), the title screen means you
+        /// are JOINING. The old manual host/join toggle is gone.</summary>
         private void DrawNone(CoopCore core)
-        {
-            if (_browserOpen)
-            {
-                DrawBrowser(core);
-                return;
-            }
+            => DrawConnectBody(core, core.InSave ? ConnectMode.Host : ConnectMode.Join);
 
+        /// <summary>
+        /// The connect tab: the player's name and every backend's own container, in the mode the game
+        /// state dictates. Starting a session does NOT replace any of this - the container of
+        /// the backend you started swaps its options for that backend's connection info, and the rest
+        /// stay usable, so a second backend can be opened or closed on its own.
+        /// </summary>
+        private void DrawConnectBody(CoopCore core, ConnectMode mode)
+        {
             GUILayout.BeginHorizontal();
             GUILayout.Label("Your name:", CoopTheme.Label, GUILayout.Width(72f));
-            if (core.UsingSteamPersona)
+            GUI.SetNextControlName("coop_name");
+            var newName = GUILayout.TextField(_nameField, 16, CoopTheme.TextField,
+                GUILayout.Width(FieldWidth(72f)));
+            var nameFocused = string.Equals(GUI.GetNameOfFocusedControl(), "coop_name",
+                StringComparison.Ordinal);
+            if (newName != _nameField)
             {
-                GUILayout.Label(core.EffectivePlayerName, CoopTheme.TextField, GUILayout.Width(160f));
-                GUILayout.Label("(from Steam)", CoopTheme.LabelDim);
-            }
-            else
-            {
-                GUI.SetNextControlName("coop_name");
-                var newName = GUILayout.TextField(_nameField, 16, CoopTheme.TextField);
-                if (newName != _nameField)
+                _nameField = newName;
+                var trimmed = newName.Trim();
+                if (trimmed.Length > 0)
                 {
-                    _nameField = newName;
-                    if (newName.Trim().Length > 0)
+                    CoopPlugin.PlayerName.Value = trimmed;
+                    if (!CoopPlugin.NameOverride.Value)
                     {
-                        CoopPlugin.PlayerName.Value = newName.Trim();
+                        CoopPlugin.NameOverride.Value = true;
                     }
+                }
+                else if (CoopPlugin.NameOverride.Value)
+                {
+                    // Emptying the box means "go back to my platform name". Drop the override now,
+                    // but leave the box empty until the player clicks away - refilling it mid-edit
+                    // would fight them. The branch below repopulates it once focus is lost.
+                    CoopPlugin.NameOverride.Value = false;
+                }
+            }
+            else if (!CoopPlugin.NameOverride.Value && !nameFocused)
+            {
+                // Back on the platform name and no longer being edited: refill the box after a
+                // clear, and let it fill in the moment the Xbox gamertag or Steam persona arrives.
+                var effective = core.EffectivePlayerName;
+                if (!string.Equals(_nameField, effective, StringComparison.Ordinal))
+                {
+                    _nameField = effective;
                 }
             }
             GUILayout.EndHorizontal();
 
             GUILayout.Space(4f);
 
-            // HOST section
+            if (Event.current.type == EventType.Layout)
+            {
+                SnapshotHosting(core);
+                if (Time.unscaledTime - _availabilityPolledAt > AvailabilityRefreshSeconds)
+                {
+                    _availabilityPolledAt = Time.unscaledTime;
+                    // Re-probe, but KEEP the last known answer: clearing it would flip every group to
+                    // "checking..." and collapse it for a frame or two, which reads as flicker.
+                    _availabilityTasks.Clear();
+                }
+            }
+
+            var backends = core.Backends;
+            if (backends.Count == 0)
+            {
+                GUILayout.Label("No transports available.", CoopTheme.LabelDim);
+                return;
+            }
+
+            DrawBackendGroups(core, mode);
+
+            if (CoopCore.Role == CoopRole.Host)
+            {
+                DrawSessionActions(core);
+            }
+        }
+
+        /// <summary>Which backends are carrying the session, and what they publish, snapped once per
+        /// frame. The backends write that info from their own worker threads, so reading it live in
+        /// Repaint after Layout read it could change a container's contents between the two passes -
+        /// the Mismatched LayoutGroup this snapshot exists to prevent.</summary>
+        private void SnapshotHosting(CoopCore core)
+        {
+            _hostInfo.Clear();
+            _backendInfo.Clear();
+            _fields.Clear();
+            foreach (var backend in core.Backends)
+            {
+                var info = backend.ConnectionInfo;
+
+                // EVERY backend's info, not just the hosting ones: the header shows a start's current
+                // step and whether it is still working, and both live here.
+                _backendInfo[backend.Id] = info;
+
+                if (info.Active && info.IsHost)
+                {
+                    _hostInfo[backend.Id] = info;
+                }
+
+                // The field list itself, frozen here too: a backend decides which fields it needs from
+                // state it publishes on a worker thread (the router's answer), so a list read live
+                // could differ between Layout and Repaint and that is the Mismatched LayoutGroup.
+                _fields[backend.Id + "|" + ConnectMode.Host] = backend.GetFields(ConnectMode.Host);
+                _fields[backend.Id + "|" + ConnectMode.Join] = backend.GetFields(ConnectMode.Join);
+            }
+        }
+
+        /// <summary>Whether drawing the fields changed any of them - a choice or a toggle counts as much
+        /// as typed text.</summary>
+        private static bool ValuesChanged(Dictionary<FieldId, string> before, FieldValues values)
+        {
+            if (before.Count != values.Count)
+            {
+                return true;
+            }
+
+            foreach (var pair in values)
+            {
+                if (!before.TryGetValue(pair.Key, out var was)
+                    || !string.Equals(was, pair.Value, StringComparison.Ordinal))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        /// <summary>This frame's snapshot of a backend's fields - see <see cref="SnapshotHosting"/>.</summary>
+        private IReadOnlyList<BackendField> FieldsFor(INetworkingBackend backend, ConnectMode mode)
+            => _fields.TryGetValue(backend.Id + "|" + mode, out var fields)
+                ? fields
+                : backend.GetFields(mode);
+
+        /// <summary>
+        /// Every backend's own section, in the given mode. Drawn both before hosting starts and again
+        /// while hosting, so a shop already reachable over one backend can be opened on another (LAN
+        /// and Steam friends at once) and either can be closed on its own - only the section you start
+        /// changes, not the list.
+        /// </summary>
+        private void DrawBackendGroups(CoopCore core, ConnectMode mode)
+        {
+            foreach (var backend in core.Backends)
+            {
+                DrawBackendGroup(core, backend, mode);
+            }
+        }
+
+        /// <summary>One collapsible backend group: a header with its availability (a spinner while
+        /// probing, a cross plus the reason when unusable), and - when available and expanded - the
+        /// fields for the given mode and its own Start/Join/Stop button.</summary>
+        private void DrawBackendGroup(CoopCore core, INetworkingBackend backend, ConnectMode mode)
+        {
+            var id = backend.Id;
+            if (Event.current.type == EventType.Layout)
+            {
+                RefreshAvailability(backend);
+            }
+
+            var known = _availability.TryGetValue(id, out var cached);
+            var available = known && cached.Available;
+
+            // Expansion is the player's state alone. It used to require "available", so any probe
+            // in flight collapsed the group - that was the flicker.
+            var expanded = _expanded.Contains(id);
+
             GUILayout.BeginVertical(CoopTheme.SectionBox);
-            GUILayout.Label("HOST YOUR SHOP", CoopTheme.SectionHeader);
-            _publicLobby = GUILayout.Toggle(_publicLobby, " public lobby (shows in the browser)", CoopTheme.Toggle);
-            if (_publicLobby)
-            {
-                GUILayout.BeginHorizontal();
-                GUILayout.Label("Lobby name:", CoopTheme.Label, GUILayout.Width(80f));
-                GUI.SetNextControlName("coop_lobbyname");
-                _lobbyNameField = GUILayout.TextField(_lobbyNameField, 28, CoopTheme.TextField);
-                GUILayout.EndHorizontal();
-                GUILayout.BeginHorizontal();
-                GUILayout.Label("Password:", CoopTheme.Label, GUILayout.Width(80f));
-                GUI.SetNextControlName("coop_hostpw");
-                _hostPwField = GUILayout.TextField(_hostPwField, 20, CoopTheme.TextField);
-                GUILayout.Label("<size=10>(blank = open)</size>", CoopTheme.LabelDim, GUILayout.Width(80f));
-                GUILayout.EndHorizontal();
-            }
-            if (core.Steam != null)
-            {
-                GUILayout.BeginHorizontal();
-                GUILayout.Label("Players:", CoopTheme.Label, GUILayout.Width(80f));
-                GUI.SetNextControlName("coop_hostplayers");
-                _hostPlayersField = GUILayout.TextField(_hostPlayersField, 3, CoopTheme.TextField,
-                    GUILayout.Width(48f));
-                GUILayout.Label("(2-250)", CoopTheme.LabelDim);
-                GUILayout.EndHorizontal();
-            }
-            // core.Steam == null means this build has NO Steamworks assembly (Game Pass /
-            // DRM-free), so Steam can never work and there is nothing the player could do
-            // about it. Hide the control entirely rather than leaving a dead button that
-            // answers with an error - and promote LAN to the full-width primary so the row
-            // doesn't look like something failed to draw.
             GUILayout.BeginHorizontal();
-            if (core.Steam != null)
+            if (GUILayout.Button((expanded ? "\u25bc " : "\u25b6 ") + backend.DisplayName,
+                    CoopTheme.LabelBold))
             {
-                if (GUILayout.Button("Host via Steam", CoopTheme.ButtonPrimary))
+                if (expanded)
                 {
-                    if (int.TryParse(_hostPlayersField, NumberStyles.None, CultureInfo.InvariantCulture,
-                        out var maxPlayers)
-                        && maxPlayers >= SteamLobbyLimits.MinPlayers
-                        && maxPlayers <= SteamLobbyLimits.MaxPlayers)
-                    {
-                        core.StartHostingSteam(_publicLobby, _lobbyNameField,
-                            _publicLobby ? _hostPwField : "", maxPlayers);
-                    }
-                    else
-                    {
-                        core.ErrorLine = $"Player count must be between {SteamLobbyLimits.MinPlayers} and "
-                            + $"{SteamLobbyLimits.MaxPlayers}.";
-                    }
-                }
-                if (GUILayout.Button("Host via LAN", CoopTheme.ButtonSecondary, GUILayout.Width(110f)))
-                {
-                    core.StartHosting();
-                }
-            }
-            else
-            {
-                if (GUILayout.Button("Host via LAN", CoopTheme.ButtonPrimary))
-                {
-                    core.StartHosting();
-                }
-            }
-            GUILayout.EndHorizontal();
-            GUILayout.EndVertical();
-
-            CoopTheme.Divider();
-
-            // JOIN section - the last panel on the idle session view, so it expands to fill the
-            // tab container (DrawSession's MinHeight wrapper supplies the leftover space).
-            GUILayout.BeginVertical(CoopTheme.SectionBox, GUILayout.ExpandHeight(true));
-            GUILayout.Label("JOIN A FRIEND", CoopTheme.SectionHeader);
-            // Lobby browser + invite hint are Steam-only. On a Steamworks-less build point
-            // the player at the thing that DOES work here (the IP field two rows down)
-            // instead of showing an error about something they cannot install.
-            if (core.Steam != null)
-            {
-                if (GUILayout.Button("Browse public lobbies", CoopTheme.ButtonPrimary))
-                {
-                    _browserOpen = true;
-                    _page = 0;
-                    _pwPromptLobby = 0;
-                    core.Steam.RefreshList();
-                }
-                GUILayout.Label("<size=11>Accept the host's Steam invite.</size>", CoopTheme.LabelDim);
-            }
-            else
-            {
-                GUILayout.Label("<size=11>This build has no Steam support - join by IP below.</size>", CoopTheme.LabelDim);
-            }
-
-            // wrong-password retry for invites into protected lobbies
-            if (core.LastDisconnectRetryable
-                && core.LastDisconnectCode == "rejected"
-                && core.LastDisconnectReason == "wrong password"
-                && core.LastFailedLobby != 0UL)
-            {
-                GUILayout.BeginHorizontal();
-                GUILayout.Label("Password:", CoopTheme.Label, GUILayout.Width(80f));
-                GUI.SetNextControlName("coop_joinpw");
-                _joinPwField = GUILayout.TextField(_joinPwField, 20, CoopTheme.TextField);
-                if (GUILayout.Button("Retry", CoopTheme.ButtonPrimary, GUILayout.Width(64f)))
-                {
-                    core.JoinSteamLobby(core.LastFailedLobby, _joinPwField);
-                }
-
-                GUILayout.EndHorizontal();
-            }
-
-            // IP + optional session password. The password field is here because a LAN host
-            // now generates one by default (CoopPlugin.AutoLanPassword): a friend who PASTES
-            // the invite code never sees it, but a friend who TYPES the address has to have
-            // somewhere to put the eight characters the host read out. Blank is still correct
-            // for a host that turned the password off, so nothing about the old flow breaks.
-            GUILayout.BeginHorizontal();
-            GUI.SetNextControlName("coop_ip");
-            _ipField = GUILayout.TextField(_ipField, 24, CoopTheme.TextField);
-            GUILayout.Label("<size=11>pw</size>", CoopTheme.LabelDim, GUILayout.Width(20f));
-            GUI.SetNextControlName("coop_lanpw");
-            _lanPwField = GUILayout.TextField(_lanPwField, 20, CoopTheme.TextField, GUILayout.Width(84f));
-            if (GUILayout.Button("Join LAN", CoopTheme.ButtonPrimary, GUILayout.Width(84f)))
-            {
-                // Trimmed and folded to upper case HERE, not in Join and not in the host's
-                // password gate. A LAN host's password can only ever be the generated one
-                // (there is no field anywhere that sets a custom one), and that is eight
-                // characters of an uppercase-only alphabet - so folding what was TYPED can
-                // never turn a wrong password into a right one, while it does spare a player
-                // who typed what they heard in lower case an inexplicable "wrong password".
-                // The gate itself stays exactly comparing, because a STEAM lobby password is
-                // player-chosen and its case is the player's business.
-                core.JoinHostedGame(_ipField, CoopPlugin.Port.Value, _lanPwField.Trim().ToUpperInvariant());
-            }
-
-            GUILayout.EndHorizontal();
-
-            // The invite code is just the IP row with the address, the port and the password
-            // folded into one pasteable string - so it sits directly under it rather than in a
-            // section of its own.
-            //
-            // DELIBERATELY VISIBLE ON STEAM BUILDS TOO, unlike the lobby browser above. A code
-            // is a plain address + port + password: nothing in it is Steam-shaped, and the host
-            // who produced it may well be on Game Pass, where Steam invites do not exist. A
-            // Steam player joining a Game Pass host over IP is exactly the case this row is
-            // for, so it is not gated on core.Steam.
-            GUILayout.BeginHorizontal();
-            GUI.SetNextControlName("coop_invite");
-            _inviteField = GUILayout.TextField(_inviteField, InviteCode.MaxCodeLength, CoopTheme.TextField);
-            if (GUILayout.Button("Join by code", CoopTheme.ButtonPrimary, GUILayout.Width(100f)))
-            {
-                if (InviteCode.TryParse(_inviteField, out var codeIp, out var codePort, out var codePw))
-                {
-                    _ipField = codeIp; // keep the plain IP row in step with what we just used
-                    core.JoinHostedGame(codeIp, codePort, codePw);
+                    _expanded.Remove(id);
                 }
                 else
                 {
-                    core.ErrorLine = "that invite code doesn't look right - check for typos";
+                    _expanded.Add(id);
                 }
             }
-            GUILayout.EndHorizontal();
-            GUILayout.Label("<size=11>Paste an invite code, or enter an IP and password.</size>", CoopTheme.LabelDim);
-            GUILayout.Label($"<size=11>LAN port {CoopPlugin.Port.Value} - all players need this mod + the same mods.</size>", CoopTheme.LabelDim);
-            GUILayout.EndVertical();
-        }
 
-        private void DrawHost(CoopCore core, ICoopTransport net)
-        {
-            // The host status is the last (and only) panel on this session view, so it expands
-            // to fill the tab container via DrawSession's MinHeight wrapper.
-            GUILayout.BeginVertical(CoopTheme.SectionBox, GUILayout.ExpandHeight(true));
-            GUILayout.Label("HOSTING", CoopTheme.SectionHeader);
-            if (core.IsSteamSession)
+            GUILayout.FlexibleSpace();
+
+            // WHERE THE START HAS GOT TO, right-aligned in the header. The text and the busy flag come
+            // from the per-frame snapshot, because a backend publishes them from its own worker thread.
+            ConnectionInfo progress = default;
+            var busy = known && _backendInfo.TryGetValue(id, out progress) && progress.Busy;
+            if (busy && !string.IsNullOrEmpty(progress.Summary))
             {
-                GUILayout.Label("Hosting through Steam - no IPs needed.", CoopTheme.Label);
-                if (GUILayout.Button("Invite friend  (Steam overlay)", CoopTheme.ButtonPrimary))
+                GUILayout.Label(progress.Summary, CoopTheme.Label);
+                GUILayout.Space(4f);
+            }
+
+            // The action lives where the status tick used to be: one Start/Stop for this container, so
+            // the body holds only the fields, or the connection info once it is carrying.
+            if (!known)
+            {
+                GUILayout.Label("checking\u2026", CoopTheme.LabelDim);
+            }
+            else if (!available)
+            {
+                GUILayout.Label("\u2715 " + (string.IsNullOrEmpty(cached.Reason)
+                    ? "unavailable" : cached.Reason), CoopTheme.LabelDim,
+                    GUILayout.Width(FieldWidth(150f)));
+            }
+            else if (_hostInfo.ContainsKey(id))
+            {
+                if (GUILayout.Button(CoopTheme.IconGlyph("stop") ?? "Stop",
+                        CoopTheme.IconButtonDanger, GUILayout.Width(HeaderIconWidth)))
                 {
-                    core.OpenSteamInvite();
+                    core.StopHosting(backend);
                 }
 
-                var scount = net?.ConnectionCount ?? 0;
-                GUILayout.Label(scount == 0 ? "Waiting for your invite to be accepted..." : PlayersLine(core), CoopTheme.Label);
+                DelayedTooltip("backend-stop:" + id, "Stop hosting on " + backend.DisplayName
+                    + " - players who joined through it disconnect.");
             }
             else
             {
-                if (_lanIps == null)
+                var label = mode == ConnectMode.Host ? "Start hosting on " : "Join through ";
+
+                // Greyed while the backend is working, until it is ready or has failed: pressing again
+                // mid-start can only fight the start that is already running. The step it is on is
+                // printed in the header just above.
+                GUI.enabled = !busy;
+                var play = GUILayout.Button(CoopTheme.IconGlyph("play") ?? (mode == ConnectMode.Host
+                            ? "Start" : "Join"),
+                        CoopTheme.IconButtonStart, GUILayout.Width(HeaderIconWidth));
+                GUI.enabled = true;
+                if (play)
                 {
-                    var ips = LocalIPv4s();
-                    // home-router addresses first; virtual/VPN adapters are unreachable
-                    ips.Sort((a, b) => IpRank(a).CompareTo(IpRank(b)));
-                    _lanIps = ips.Count > 0 ? ips[0] : "(no LAN address found)";
-                    _lanIpsOther = ips.Count > 1 ? string.Join("  ", ips.GetRange(1, ips.Count - 1)) : "";
+                    var values = ValueBuffer(backend.Id, FieldsFor(backend, mode));
+
+                    // No address has to be built before starting any more: the host just listens on
+                    // its port and a joiner dials the address it typed, so the button connects
+                    // straight away for every backend.
+                    backend.Configure(values);
+                    core.ConnectBackend(backend, mode, values);
                 }
-                // The address is the one thing that can leak a home connection on stream, so it
-                // is never printed: the copy button puts the whole connection block on the
-                // clipboard instead (the clipboard is not on camera). The session password below
-                // is still shown because it alone opens nothing and a friend typing the address
-                // by hand needs to read it.
-                _ipCopy.Draw("Copy IP address", IpClipboardText(), CoopTheme.ButtonSecondary);
-                DrawInvite(core);
-                var count = net?.ConnectionCount ?? 0;
-                GUILayout.Label(count == 0 ? "Waiting for a player..." : PlayersLine(core), CoopTheme.Label);
+
+                DelayedTooltip("backend-start:" + id, busy
+                    ? "Working: " + progress.Summary
+                    : label + backend.DisplayName);
             }
+
+            GUILayout.EndHorizontal();
+
+            if (expanded)
+            {
+                if (available)
+                {
+                    DrawBackendBody(core, backend, mode);
+                }
+                else
+                {
+                    GUILayout.Label("<size=11>Not available right now.</size>", CoopTheme.LabelDim);
+                }
+            }
+
+            GUILayout.EndVertical();
+        }
+
+        private void DrawBackendBody(CoopCore core, INetworkingBackend backend, ConnectMode mode)
+        {
+            var fields = FieldsFor(backend, mode);
+            if (mode == ConnectMode.Host && _hostInfo.TryGetValue(backend.Id, out var hosted))
+            {
+                // This container is carrying the session, so its options are gone and its connection
+                // info takes their place: where the shop is reachable, the password to hand out, and
+                // the way to close just this one backend.
+                DrawHostingInfo(core, backend, hosted);
+                return;
+            }
+
+            var values = ValueBuffer(backend.Id, fields);
+
+            // Field-bound actions belong ON their field's row (a small trailing button); the rest
+            // are plain panel buttons.
+            var actions = backend.Actions;
+            Dictionary<FieldId, List<BackendAction>> fieldActions = null;
+            var panelActions = new List<BackendAction>();
+            for (var i = 0; i < actions.Count; i++)
+            {
+                var action = actions[i];
+                if (action.Mode.HasValue && action.Mode.Value != mode)
+                {
+                    continue; // this button belongs to the other mode
+                }
+
+                if (action.Phase == ActionPhase.Live)
+                {
+                    // The options view is by definition before the session starts, so a live-only
+                    // action (Invite friend, the host's copy buttons) has nothing to act on yet. The
+                    // live view draws it instead.
+                    continue;
+                }
+
+                if (!action.Field.HasValue)
+                {
+                    panelActions.Add(action);
+                    continue;
+                }
+
+                fieldActions = fieldActions ?? new Dictionary<FieldId, List<BackendAction>>();
+                if (!fieldActions.TryGetValue(action.Field.Value, out var list))
+                {
+                    fieldActions[action.Field.Value] = list = new List<BackendAction>();
+                }
+
+                list.Add(action);
+            }
+
+            // Push field edits to the backend as they happen. It used to only see them on Start, so
+            // anything that runs earlier - an availability probe, the public-address lookup - acted
+            // on whatever the last Start had set, which is how a changed port was ignored.
+            var before = new Dictionary<FieldId, string>();
+            foreach (var pair in values)
+            {
+                before[pair.Key] = pair.Value;
+            }
+            foreach (var field in fields)
+            {
+                List<BackendAction> inline = null;
+                fieldActions?.TryGetValue(field.Id, out inline);
+                DrawBackendField(backend.Id, values, field, inline);
+            }
+
+            if (ValuesChanged(before, values))
+            {
+                backend.Configure(values);
+            }
+
+            var failure = core.BackendError(backend, mode);
+            if (!string.IsNullOrEmpty(failure))
+            {
+                // The header carries the button, so a failed start returns the container to baseline
+                // and the reason lives here, under it.
+                GUILayout.Label(failure, CoopTheme.LabelDanger);
+            }
+
+            foreach (var action in panelActions)
+            {
+                DrawActionButton(action, false);
+                DelayedTooltip("panel:" + backend.Id + ":" + action.Id, ActionTip(action));
+            }
+        }
+
+        /// <summary>Draws one backend action and fires it when clicked. An action whose icon the UI
+        /// can draw becomes a glyph button (its words move into the hover tooltip); otherwise it is the
+        /// label as usual, so a machine without an icon font loses nothing but the picture. A row's
+        /// last action uses the flush style, whose missing right margin is what lets it line up with
+        /// the inputs above it.</summary>
+        private static void DrawActionButton(BackendAction action, bool last)
+        {
+            var glyph = CoopTheme.IconGlyph(action.Icon);
+            var style = ActionStyle(action, last);
+            GUI.enabled = action.Enabled;
+            // Width only for the glyph: the style's own fixed height (shared with every other button in
+            // the panel) is what keeps these squares in line with the row they sit in.
+            var clicked = glyph != null
+                ? GUILayout.Button(glyph, style, GUILayout.Width(IconButtonWidth))
+                : GUILayout.Button(action.Label, style, GUILayout.ExpandWidth(false));
+            if (clicked)
+            {
+                action.Invoke?.Invoke();
+            }
+
+            GUI.enabled = true;
+        }
+
+        private static GUIStyle ActionStyle(BackendAction action, bool last)
+        {
+            if (CoopTheme.IconGlyph(action.Icon) != null)
+            {
+                return last ? CoopTheme.IconButtonFlush : CoopTheme.IconButton;
+            }
+
+            return last ? CoopTheme.ButtonSecondaryFlush : CoopTheme.ButtonSecondary;
+        }
+
+        /// <summary>What one action button takes across a row, margins included - this has to match
+        /// what layout really consumes, or the field beside it is sized wrong.</summary>
+        private static float ActionWidth(BackendAction action, bool last)
+        {
+            var style = ActionStyle(action, last);
+            return CoopTheme.IconGlyph(action.Icon) != null
+                ? IconButtonWidth + style.margin.horizontal
+                : style.CalcSize(new GUIContent(action.Label)).x + style.margin.horizontal;
+        }
+
+        private void DrawBackendField(string backendId, FieldValues values, BackendField field,
+            IReadOnlyList<BackendAction> inlineActions)
+        {
+            var trailing = InlineActionsWidth(inlineActions);
+
+            values.TryGetValue(field.Id, out var current);
+            current ??= field.Value ?? "";
+
+            GUILayout.BeginHorizontal();
+            GUILayout.Label(field.Label + ":", CoopTheme.Label, GUILayout.Width(96f));
+            DelayedTooltip("label:" + backendId + ":" + field.Id, field.Tooltip);
+            var updated = current;
+            switch (field.Kind)
+            {
+                case FieldKind.Toggle:
+                    var on = current == "1"
+                        || string.Equals(current, "true", StringComparison.OrdinalIgnoreCase);
+                    updated = GUILayout.Toggle(on, " on", CoopTheme.Toggle) ? "1" : "0";
+                    break;
+                case FieldKind.Password:
+                    updated = GUILayout.PasswordField(current, '*', 32, CoopTheme.TextField,
+                        GUILayout.Width(FieldWidth(96f + trailing)));
+                    break;
+                default:
+                    updated = GUILayout.TextField(current, 64, CoopTheme.TextField,
+                        GUILayout.Width(FieldWidth(96f + trailing)));
+                    break;
+            }
+
+            DrawInlineActions(backendId, field, inlineActions);
+            GUILayout.EndHorizontal();
+            if (!string.Equals(updated, current, StringComparison.Ordinal))
+            {
+                values[field.Id] = updated;
+            }
+        }
+
+        /// <summary>Width the inline action buttons for a field will take, so the field can shrink to
+        /// leave room for them instead of pushing them out of the panel. This must be exactly what
+        /// layout consumes (margins included, and the last button's right margin already removed by its
+        /// flush style) - over-reserving here is what left the last button short of the right edge the
+        /// fields above it end on.</summary>
+        private static float InlineActionsWidth(IReadOnlyList<BackendAction> actions)
+        {
+            if (actions == null || actions.Count == 0)
+            {
+                return 0f;
+            }
+
+            var width = 0f;
+            for (var i = 0; i < actions.Count; i++)
+            {
+                width += ActionWidth(actions[i], i == actions.Count - 1);
+            }
+
+            return width;
+        }
+
+        /// <summary>The small trailing buttons a field owns (Generate / Copy for a reach code).</summary>
+        private void DrawInlineActions(string backendId, BackendField field,
+            IReadOnlyList<BackendAction> actions)
+        {
+            if (actions == null)
+            {
+                return;
+            }
+
+            for (var i = 0; i < actions.Count; i++)
+            {
+                var action = actions[i];
+                DrawActionButton(action, i == actions.Count - 1);
+                DelayedTooltip("field:" + backendId + ":" + field.Id + ":" + action.Id, ActionTip(action));
+            }
+        }
+
+        /// <summary>The hover text for an action. Once the words are replaced by a glyph the label
+        /// only survives here, so it stays in front of the detail.</summary>
+        private static string ActionTip(BackendAction action)
+        {
+            if (CoopTheme.IconGlyph(action.Icon) == null)
+            {
+                return action.Tooltip;
+            }
+
+            return string.IsNullOrEmpty(action.Tooltip)
+                ? action.Label
+                : action.Label + "\n" + action.Tooltip;
+        }
+
+        /// <summary>Hover help that only appears once the pointer has RESTED on the control for a few
+        /// seconds: IMGUI's own tooltip pops instantly and covers the panel while the player is just
+        /// moving across it. Call immediately after drawing the control; the box is drawn at the very
+        /// END of the window so no later control paints over it.</summary>
+        private void DelayedTooltip(string key, string text)
+        {
+            if (string.IsNullOrEmpty(text) || Event.current.type != EventType.Repaint)
+            {
+                return;
+            }
+
+            var rect = GUILayoutUtility.GetLastRect();
+            if (!rect.Contains(Event.current.mousePosition))
+            {
+                if (_tipKey == key)
+                {
+                    _tipKey = null;
+                }
+
+                return;
+            }
+
+            if (_tipKey != key)
+            {
+                _tipKey = key;
+                _tipSince = Time.unscaledTime;
+                return;
+            }
+
+            if (Time.unscaledTime - _tipSince < TooltipDelaySeconds)
+            {
+                return;
+            }
+
+            _pendingTipText = text;
+            _pendingTipAt = Event.current.mousePosition;
+        }
+
+        /// <summary>Draws the tooltip the last DelayedTooltip call parked, at the end of the window.</summary>
+        private void DrawPendingTooltip()
+        {
+            var text = _pendingTipText;
+            _pendingTipText = null;
+            if (string.IsNullOrEmpty(text) || Event.current.type != EventType.Repaint)
+            {
+                return;
+            }
+
+            const float TipWidth = 230f;
+            var style = CoopTheme.Tooltip;
+            var height = style.CalcHeight(new GUIContent(text), TipWidth) + 2f;
+            var x = Mathf.Min(_pendingTipAt.x + 14f, _win.xMax - TipWidth - 12f);
+            var y = _pendingTipAt.y + 18f;
+            GUI.Box(new Rect(x, y, TipWidth, height), text, style);
+        }
+
+        /// <summary>
+        /// Width for a control that shares its row with a labelled prefix. It comes from the
+        /// measured panel (_viewportWidth), NEVER from the control's own content - layout gives a
+        /// control a minimum width equal to its content, which is what made a long reach code
+        /// widen the whole panel however wide ExpandWidth was told to be.
+        /// </summary>
+        private float FieldWidth(float labelWidth)
+            => Mathf.Max(60f, _viewportWidth - labelWidth - 30f);
+
+        private FieldValues ValueBuffer(string id, IReadOnlyList<BackendField> fields)
+        {
+            if (!_fieldValues.TryGetValue(id, out var values))
+            {
+                values = new FieldValues();
+                _fieldValues[id] = values;
+            }
+
+            foreach (var field in fields)
+            {
+                if (!values.Contains(field.Id))
+                {
+                    values[field.Id] = field.Value ?? "";
+                }
+            }
+
+            return values;
+        }
+
+        /// <summary>Probes a backend at most once per refresh window and keeps the LAST KNOWN answer
+        /// in between, so the header never flickers back to "checking". The first time a backend
+        /// comes back ready it is auto-expanded, so its fields are there without a click; a later
+        /// manual collapse sticks.</summary>
+        private void RefreshAvailability(INetworkingBackend backend)
+        {
+            var id = backend.Id;
+            if (_availabilityTasks.TryGetValue(id, out var task))
+            {
+                if (!task.IsCompleted)
+                {
+                    return;
+                }
+
+                _availabilityTasks.Remove(id);
+                ApplyAvailability(backend, task.Status == TaskStatus.RanToCompletion
+                    ? task.Result
+                    : BackendAvailability.No("probe failed"));
+                return;
+            }
+
+            try
+            {
+                _availabilityTasks[id] = backend.GetAvailabilityAsync();
+            }
+            catch (Exception error)
+            {
+                ApplyAvailability(backend, BackendAvailability.No(error.Message));
+            }
+        }
+
+        private void ApplyAvailability(INetworkingBackend backend, BackendAvailability result)
+        {
+            var id = backend.Id;
+            _availability[id] = result;
+
+            if (result.Available && _autoExpanded.Add(id))
+            {
+                _expanded.Add(id);
+            }
+        }
+
+        /// <summary>
+        /// What a container shows once its backend is carrying the session: that backend's own
+        /// connection info in place of its options. The options have already been applied, so the
+        /// container's job now is to say where the shop is reachable, hand the password over, and let
+        /// this one backend be closed on its own. There is deliberately no separate hosting view.
+        /// </summary>
+        private void DrawHostingInfo(CoopCore core, INetworkingBackend backend, ConnectionInfo info)
+        {
+            // The container header already carries the backend's name, so this is just the info.
+            GUILayout.Label(info.Summary, CoopTheme.Label);
+
+            if (!string.IsNullOrEmpty(info.Password))
+            {
+                GUILayout.Label("<size=11>session password: <b>" + info.Password + "</b></size>",
+                    CoopTheme.LabelDim);
+            }
+
+            if (!string.IsNullOrEmpty(info.Warning))
+            {
+                GUILayout.Label("<size=11>" + info.Warning + "</size>", CoopTheme.LabelDimWrap);
+            }
+
+            if (info.ForwardState == ForwardState.Mapped)
+            {
+                GUILayout.Label("<size=10>your router opened the port</size>", CoopTheme.LabelDim);
+            }
+            else if (info.ForwardState == ForwardState.Declined)
+            {
+                GUILayout.Label("<size=10>your router wouldn't open the port - forward it yourself</size>",
+                    CoopTheme.LabelDim);
+            }
+
+            foreach (var action in backend.Actions)
+            {
+                if (action.Mode.HasValue && action.Mode.Value != ConnectMode.Host)
+                {
+                    continue; // join-side button; this panel is hosting
+                }
+
+                if (action.Phase == ActionPhase.BeforeStart || action.Field.HasValue)
+                {
+                    continue; // options-only, or drawn on its own field's row
+                }
+
+                GUI.enabled = action.Enabled;
+                if (GUILayout.Button(action.Label, CoopTheme.ButtonSecondary))
+                {
+                    action.Invoke?.Invoke();
+                }
+
+                GUI.enabled = true;
+            }
+        }
+
+        /// <summary>The two controls that belong to the session rather than to any single backend,
+        /// drawn under the containers so there is no hosting view above them.</summary>
+        private void DrawSessionActions(CoopCore core)
+        {
+            GUILayout.Space(4f);
+            GUILayout.BeginHorizontal();
             if (GUILayout.Button("Wave  (" + CoopPlugin.EmoteKey.Value + ")", CoopTheme.ButtonSecondary))
             {
                 PresenceApi.SendEmote();
             }
 
-            if (GUILayout.Button("Stop hosting", CoopTheme.ButtonDanger))
+            if (GUILayout.Button("Stop hosting everything", CoopTheme.ButtonDanger))
             {
                 core.Disconnect();
             }
 
-            GUILayout.EndVertical();
-        }
-
-        /// <summary>The invite-code block in the LAN host panel: the status + copy row, the
-        /// session-password row, and the router notes. Only ever drawn for a LAN session -
-        /// DrawHost returns before this for Steam, where the overlay invite already does the
-        /// job and an address-bearing code would just be a second way to do the same thing.
-        ///
-        /// The code EMBEDS the address, so the raw text is never printed: copying is always
-        /// allowed (the clipboard isn't on camera) and the address itself is copy-only in
-        /// DrawHost rather than shown on screen.</summary>
-        private void DrawInvite(CoopCore core)
-        {
-            // LATCH FIRST, BEFORE THE EARLY RETURN. Everything below - including whether this
-            // block draws at all - reads the latched copies, so the snapshot has to be taken
-            // ahead of the first decision that depends on it. Latch after the return and a
-            // panel that starts in Off never updates its own copy and stays blank forever.
-            if (Event.current.type == EventType.Layout)
-            {
-                _invState = core.InviteStatus;
-                _invCode = core.InviteCodeText;
-                _invReason = core.InviteReason;
-                _invPortState = core.PortForwardState;
-                _invPassword = core.HostPassword;
-            }
-
-            if (_invState == InviteState.Off)
-            {
-                return;
-            }
-
-            var code = _invCode;
-
-            var copyButtonWidth = CopyButtonWidth();
-            // Both copy rows share this height (the button's box plus its margins) so the text
-            // can be centred against the button instead of sitting at the top of the row.
-            var copyRowHeight = CoopTheme.ButtonSecondary.fixedHeight + CoopTheme.ButtonSecondary.margin.vertical;
-            GUILayout.BeginHorizontal();
-            GUILayout.Label(InviteStatusText(_invState), CoopTheme.LabelDimMiddle, GUILayout.Height(copyRowHeight));
-            GUILayout.FlexibleSpace();
-            GUI.enabled = code != null;
-            _inviteCopy.Draw("Copy invite code", code, CoopTheme.ButtonSecondary,
-                GUILayout.Width(copyButtonWidth));
-            GUI.enabled = true;
             GUILayout.EndHorizontal();
-
-            // THE SESSION PASSWORD is still printed while the connection details are hidden,
-            // and that is the shape of the stream-safety rule rather than an oversight: it
-            // protects the ADDRESS, because an address is what lets a stranger reach this PC at
-            // all, while the password on its own opens nothing and a friend typing the IP by
-            // hand needs to read it. Anyone who used the invite code already supplied it.
-            if (!string.IsNullOrEmpty(_invPassword))
-            {
-                GUILayout.BeginHorizontal();
-                GUILayout.Label($"<size=11>session password: <b>{_invPassword}</b></size>", CoopTheme.LabelDimMiddle,
-                    GUILayout.ExpandWidth(true), GUILayout.Height(copyRowHeight));
-                _passwordCopy.Draw("Copy password", _invPassword, CoopTheme.ButtonSecondary,
-                    GUILayout.Width(copyButtonWidth));
-                GUILayout.EndHorizontal();
-            }
-
-            // Say plainly what a LAN-only code is and isn't. It is NOT a failure - it is the
-            // code that has always worked for the PC in the next room - so it is worded as a
-            // limit rather than an error, and it names the reason so the player can fix it.
-            if (_invState == InviteState.LanOnly)
-            {
-                var why = _invReason;
-                GUILayout.Label("<size=11>LAN-only code - " + (why != null ? why : "couldn't reach the internet resolver")
-                    + ". It carries your LAN address, so it still works for someone in this house.</size>",
-                    CoopTheme.LabelWrap);
-            }
-
-            // UPnP success means the router ACCEPTED the request, which is not the same as the
-            // port being reachable (a second router, or the ISP's own NAT, still gets a vote).
-            // Never promise more than that.
-            if (_invPortState == 1)
-            {
-                GUILayout.Label("<size=10>port forward requested on your router automatically</size>", CoopTheme.LabelDim);
-            }
-            else if (_invPortState == 2)
-            {
-                // Say what to DO about it, not just that it happened: forwarding the port is a
-                // router-admin job this mod cannot do, and the other player hosting instead is
-                // the answer for anyone who isn't going to go find their router password.
-                // Kept short AND wrapped: the long form measured wider than this 400px panel,
-                // and LabelDim doesn't wrap, so the tail was clipped off-screen - the half that
-                // carried the advice. LabelDimWrap is LabelDim + wordWrap.
-                GUILayout.Label($"<size=10>router declined - forward port {CoopPlugin.Port.Value} manually, or let the other player host</size>", CoopTheme.LabelDimWrap);
-            }
         }
 
-        /// <summary>The plain-text connection block the Copy IP button puts on the clipboard:
-        /// the primary address + port, then any other local addresses. This is the text the
-        /// panel used to render, kept copyable so the address is never shown on screen.</summary>
-        private string IpClipboardText()
-        {
-            var text = $"{_lanIps}  (port {CoopPlugin.Port.Value})";
-            if (!string.IsNullOrEmpty(_lanIpsOther))
-            {
-                text += $"\nOther addresses: {_lanIpsOther}";
-            }
+        /// <summary>Which backends are carrying the session, and what they publish, snapped once per
+        /// frame by <see cref="SnapshotHosting"/>, along with the field lists themselves.</summary>
+        private readonly Dictionary<string, ConnectionInfo> _hostInfo = new();
 
-            return text;
-        }
+        /// <summary>Every backend's <see cref="ConnectionInfo"/> for this frame, hosting or not: the
+        /// container header reads a start's current step and its busy flag from here.</summary>
+        private readonly Dictionary<string, ConnectionInfo> _backendInfo = new();
 
-        private static float CopyButtonWidth()
-        {
-            return Mathf.Max(
-                CoopTheme.ButtonSecondary.CalcSize(new GUIContent("Copy invite code")).x,
-                CoopTheme.ButtonSecondary.CalcSize(new GUIContent("Copy password")).x,
-                CoopTheme.ButtonSecondary.CalcSize(new GUIContent("Copied!")).x);
-        }
-
-        private static string InviteStatusText(InviteState state)
-        {
-            switch (state)
-            {
-                case InviteState.Resolving:
-                    return "Preparing code...";
-                case InviteState.Ready:
-                    return "Code ready";
-                case InviteState.LanOnly:
-                    return "Code ready";
-                default:
-                    return "";
-            }
-        }
+        private readonly Dictionary<string, IReadOnlyList<BackendField>> _fields = new();
 
         private void DrawClient(CoopCore core)
         {
-            // The client status is the last (and only) panel on this session view, so it expands
-            // to fill the tab container via DrawSession's MinHeight wrapper.
             GUILayout.BeginVertical(CoopTheme.SectionBox, GUILayout.ExpandHeight(true));
             GUILayout.Label("IN SESSION", CoopTheme.SectionHeader);
-            GUILayout.Label(PlayersLine(core), CoopTheme.Label);
+
+            if (ShopApi.TryGetShopName(out var shopName))
+            {
+                GUILayout.Label("Shop: <b>" + SafeLabel(shopName) + "</b>", CoopTheme.Label);
+            }
+
+            DrawHostVersion(core);
+
+            // Snapshot on the layout pass: PresenceApi.SessionPlayers allocates, and the control set
+            // must be identical between Layout and Repaint.
+            if (Event.current.type == EventType.Layout)
+            {
+                _clientPlayers.Clear();
+                _clientPlayers.AddRange(PresenceApi.SessionPlayers);
+            }
+
+            GUILayout.Label("Players", CoopTheme.LabelDim);
+            for (var i = 0; i < _clientPlayers.Count; i++)
+            {
+                DrawPlayerRow(_clientPlayers[i], core, allowKick: false);
+            }
+
+            GUILayout.Space(4f);
             if (GUILayout.Button("Wave  (" + CoopPlugin.EmoteKey.Value + ")", CoopTheme.ButtonSecondary))
             {
                 PresenceApi.SendEmote();
@@ -1565,14 +1974,141 @@ namespace CardShopCoop.UI
             GUILayout.EndVertical();
         }
 
-        /// <summary>The graded-album repair offer, drawn only while a one-sided difference is
-        /// actually known - i.e. after a digest exchange found graded cards the peer has and this
-        /// PC does not. One button per peer, and pressing it is the ONLY thing in the whole
-        /// graded-divergence feature that changes a card: it adds, one way, and never removes.
-        ///
-        /// LATCHED IN THE LAYOUT PASS for the reason spelled out at the top of this file - the
-        /// offer list is rebuilt from the network pump, and a row count that differs between
-        /// Layout and Repaint takes the entire window down with "Mismatched LayoutGroup".</summary>
+        /// <summary>This frame's roster, latched on the layout pass (the source allocates).</summary>
+        private readonly List<PresencePlayer> _clientPlayers = new();
+        private readonly List<PresencePlayer> _hostPlayers = new();
+
+        /// <summary>The HOST's session view: everyone connected, with a Kick button per client.
+        /// Drawn at the top of the host's Session tab.</summary>
+        private void DrawHostPlayers(CoopCore core)
+        {
+            if (Event.current.type == EventType.Layout)
+            {
+                _hostPlayers.Clear();
+                _hostPlayers.AddRange(PresenceApi.SessionPlayers);
+            }
+
+            GUILayout.BeginVertical(CoopTheme.SectionBox);
+            GUILayout.Label("PLAYERS", CoopTheme.SectionHeader);
+            if (_hostPlayers.Count <= 1)
+            {
+                GUILayout.Label("Waiting for players\u2026", CoopTheme.LabelDim);
+            }
+
+            for (var i = 0; i < _hostPlayers.Count; i++)
+            {
+                DrawPlayerRow(_hostPlayers[i], core, allowKick: true);
+            }
+
+            GUILayout.EndVertical();
+        }
+
+        /// <summary>The host's build, as advertised in its Welcome: the mod version (always equal to
+        /// ours - the handshake enforces it) and the game/Unity build (which CAN differ on a
+        /// cross-build join, and is the interesting fact).</summary>
+        private static void DrawHostVersion(CoopCore core)
+        {
+            var plugin = core.HostVersion;
+            var game = core.HostGameVersion;
+            var unity = core.HostUnityVersion;
+            if (string.IsNullOrEmpty(plugin) && string.IsNullOrEmpty(game))
+            {
+                return;
+            }
+
+            var text = "Host version: " + (string.IsNullOrEmpty(plugin) ? "?" : "v" + plugin);
+            if (!string.IsNullOrEmpty(game))
+            {
+                text += "   game " + game;
+            }
+            if (!string.IsNullOrEmpty(unity))
+            {
+                text += " / Unity " + unity;
+            }
+
+            GUILayout.Label(SafeLabel(text), CoopTheme.LabelDim);
+        }
+
+        /// <summary>One roster row: the baked crown for the host, the name (with "(you)" for this
+        /// player) and, for a client, the build it advertised, plus on the host's side a Kick button.
+        /// Every row reserves the crown's width so the names line up.</summary>
+        private static void DrawPlayerRow(PresencePlayer player, CoopCore core, bool allowKick)
+        {
+            GUILayout.BeginHorizontal();
+            DrawCrown(player.IsHost);
+
+            GUILayout.Label(SafeLabel(player.Name ?? "Player") + (player.IsSelf ? "  (you)" : ""),
+                CoopTheme.Label);
+
+            // The build rides the same line as the name, so a row is one line per player.
+            var build = BuildLineFor(core, player);
+            if (!string.IsNullOrEmpty(build))
+            {
+                GUILayout.Label(build, CoopTheme.LabelDim);
+            }
+
+            GUILayout.FlexibleSpace();
+
+            // A host may kick any client; the host itself and this player are never kickable.
+            if (allowKick && !player.IsHost && !player.IsSelf
+                && GUILayout.Button("Kick", CoopTheme.ButtonDanger, GUILayout.Width(56f)))
+            {
+                core.KickPeer(player.Id);
+            }
+
+            GUILayout.EndHorizontal();
+        }
+
+        /// <summary>The build line for one roster row, or null. Only a CLIENT row carries one: the
+        /// build a client advertised in its Hello is known to the host, and the HOST row's build is
+        /// shown separately by the client's "Host version" line.</summary>
+        private static string BuildLineFor(CoopCore core, PresencePlayer player)
+        {
+            if (player.IsHost)
+            {
+                return null;
+            }
+
+            return core.TryGetPeerBuild(player.Id, out var build)
+                ? BuildLine(build.Version, build.GameVersion)
+                : null;
+        }
+
+        private static string BuildLine(string version, string game)
+        {
+            // Compact, for an inline row: "v2.0.7 · 1.00".
+            var parts = new List<string>(2);
+            if (!string.IsNullOrEmpty(version))
+            {
+                parts.Add(SafeLabel("v" + version));
+            }
+            if (!string.IsNullOrEmpty(game))
+            {
+                parts.Add(SafeLabel(game));
+            }
+
+            return parts.Count == 0 ? null : string.Join(" \u00b7 ", parts);
+        }
+
+        /// <summary>IMGUI labels render rich text, and a shop or player name can come off the wire
+        /// (the rename stream, the presence roster, a peer's advertised build), so markup must never
+        /// be injectable. Angle brackets are the only markup delimiter, so they are swapped for
+        /// lookalikes - the text still reads the same and cannot open a tag.</summary>
+        private static string SafeLabel(string text)
+            => string.IsNullOrEmpty(text) ? text : text.Replace('<', '\u2039').Replace('>', '\u203a');
+
+        /// <summary>The baked crown on the host's row. EVERY row reserves the same box - a layout
+        /// control, not Space - so the names line up exactly; a non-host row just leaves it empty.</summary>
+        private static void DrawCrown(bool isHost)
+        {
+            var rect = GUILayoutUtility.GetRect(CoopTheme.CrownSize, CoopTheme.CrownSize,
+                GUILayout.Width(CoopTheme.CrownSize), GUILayout.Height(CoopTheme.CrownSize));
+            if (isHost && CoopTheme.CrownTexture != null && Event.current.type == EventType.Repaint)
+            {
+                GUI.DrawTexture(rect, CoopTheme.CrownTexture, ScaleMode.ScaleToFit, true);
+            }
+        }
+        /// <summary>Graded-album repair offers, latched in the layout pass (see below).</summary>
         private readonly List<GradingOffer> _adoptOffers = new();
 
         private void DrawGradedAdopt(CoopCore core)
@@ -1607,180 +2143,6 @@ namespace CardShopCoop.UI
                 }
             }
             GUILayout.EndVertical();
-        }
-
-        private void DrawBrowser(CoopCore core)
-        {
-            // Belt and braces: the only door into the browser is already hidden when Steam
-            // is absent, but every line below dereferences core.Steam, so refuse to draw at
-            // all rather than trust that. Closes the panel silently - there is no error to
-            // report, this build simply has no lobbies.
-            if (core.Steam == null)
-            {
-                _browserOpen = false;
-                return;
-            }
-
-            GUILayout.BeginHorizontal();
-            GUILayout.Label("PUBLIC LOBBIES", CoopTheme.SectionHeader);
-            GUILayout.FlexibleSpace();
-            if (GUILayout.Button(core.Steam.ListRefreshing ? "..." : "Refresh", CoopTheme.ButtonPrimary, GUILayout.Width(72f)))
-            {
-                core.Steam.RefreshList();
-            }
-
-            if (GUILayout.Button("Back", CoopTheme.ButtonSecondary, GUILayout.Width(54f)))
-            {
-                _browserOpen = false;
-                _pwPromptLobby = 0;
-            }
-            GUILayout.EndHorizontal();
-
-            GUILayout.BeginHorizontal();
-            GUILayout.Label("Search:", CoopTheme.Label, GUILayout.Width(52f));
-            GUI.SetNextControlName("coop_search");
-            var s = GUILayout.TextField(_searchField, 24, CoopTheme.TextField);
-            if (s != _searchField)
-            {
-                _searchField = s;
-                _page = 0;
-            }
-            GUILayout.EndHorizontal();
-
-            // Net.LobbyRow, NOT SteamLobby.LobbyRow: the latter carries a CSteamID field, so
-            // even as a local generic argument here it would take this whole method down on
-            // a build with no Steamworks assembly.
-            var filtered = new List<LobbyRow>();
-            foreach (var row in core.Steam.Lobbies)
-            {
-                if (_searchField.Length == 0
-                    || (row.Name ?? "").IndexOf(_searchField, StringComparison.OrdinalIgnoreCase) >= 0)
-                {
-                    filtered.Add(row);
-                }
-            }
-
-            var pages = Mathf.Max(1, (filtered.Count + PageSize - 1) / PageSize);
-            _page = Mathf.Clamp(_page, 0, pages - 1);
-
-            if (filtered.Count == 0)
-            {
-                GUILayout.Label(core.Steam.ListRefreshing ? "Searching..." : "No lobbies found - hit Refresh, or host one!", CoopTheme.LabelDim);
-            }
-            for (var i = _page * PageSize; i < filtered.Count && i < (_page + 1) * PageSize; i++)
-            {
-                var row = filtered[i];
-                var verOk = row.Ver == CoopPlugin.Version;
-                GUILayout.BeginHorizontal(((i & 1) == 0) ? CoopTheme.RowEven : CoopTheme.RowOdd);
-                GUILayout.Label((row.HasPw ? "[pw] " : "") + row.Name, CoopTheme.LabelBold, GUILayout.ExpandWidth(false));
-                GUILayout.FlexibleSpace();
-                var right = $"{row.Players}/{row.Max}" + (verOk ? "" : $"  <size=10>v{row.Ver}</size>");
-                GUILayout.Label(right, CoopTheme.LabelDim, GUILayout.ExpandWidth(false));
-                GUILayout.Space(6f);
-                GUI.enabled = verOk;
-                if (GUILayout.Button("Join", CoopTheme.ButtonPrimary, GUILayout.Width(56f)))
-                {
-                    if (row.HasPw)
-                    {
-                        _pwPromptLobby = row.Id;
-                        _joinPwField = "";
-                    }
-                    else
-                    {
-                        core.JoinSteamLobby(row.Id, "");
-                        _browserOpen = false;
-                    }
-                }
-                GUI.enabled = true;
-                GUILayout.EndHorizontal();
-
-                if (_pwPromptLobby == row.Id)
-                {
-                    GUILayout.BeginHorizontal();
-                    GUILayout.Label("Password:", CoopTheme.Label, GUILayout.Width(70f));
-                    GUI.SetNextControlName("coop_joinpw");
-                    _joinPwField = GUILayout.TextField(_joinPwField, 20, CoopTheme.TextField);
-                    if (GUILayout.Button("Go", CoopTheme.ButtonPrimary, GUILayout.Width(44f)))
-                    {
-                        core.JoinSteamLobby(row.Id, _joinPwField);
-                        _browserOpen = false;
-                        _pwPromptLobby = 0;
-                    }
-                    GUILayout.EndHorizontal();
-                }
-            }
-
-            GUILayout.BeginHorizontal();
-            GUI.enabled = _page > 0;
-            if (GUILayout.Button("< Prev", CoopTheme.ButtonSecondary, GUILayout.Width(64f)))
-            {
-                _page--;
-            }
-
-            GUI.enabled = _page < pages - 1;
-            if (GUILayout.Button("Next >", CoopTheme.ButtonSecondary, GUILayout.Width(64f)))
-            {
-                _page++;
-            }
-
-            GUI.enabled = true;
-            GUILayout.FlexibleSpace();
-            GUILayout.Label($"<size=11>page {_page + 1}/{pages} - {filtered.Count} lobbies</size>", CoopTheme.LabelDim);
-            GUILayout.EndHorizontal();
-        }
-
-        private static string PlayersLine(CoopCore core)
-        {
-            if (PresenceApi.PeerNames.Count == 0)
-            {
-                return "Linked.";
-            }
-
-            var names = new List<string>(PresenceApi.PeerNames);
-            return "Playing with: " + string.Join(", ", names);
-        }
-
-        private static List<string> LocalIPv4s()
-        {
-            var result = new List<string>();
-            try
-            {
-                foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
-                {
-                    if (ni.OperationalStatus != OperationalStatus.Up)
-                    {
-                        continue;
-                    }
-
-                    if (ni.NetworkInterfaceType == NetworkInterfaceType.Loopback)
-                    {
-                        continue;
-                    }
-
-                    foreach (var addr in ni.GetIPProperties().UnicastAddresses)
-                    {
-                        if (addr.Address.AddressFamily != AddressFamily.InterNetwork)
-                        {
-                            continue;
-                        }
-
-                        var s = addr.Address.ToString();
-                        if (s.StartsWith("169.254"))
-                        {
-                            continue; // link-local noise
-                        }
-
-                        result.Add(s);
-                    }
-                }
-            }
-            catch (Exception e) { Swallow.Log(e); }
-            if (result.Count == 0)
-            {
-                result.Add("(no LAN address found)");
-            }
-
-            return result;
         }
     }
 }

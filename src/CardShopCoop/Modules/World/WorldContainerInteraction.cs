@@ -221,7 +221,12 @@ namespace CardShopCoop.Modules.World
         // layers (see ClientApplyDelta) instead of applying the stale record raw.
         private readonly HashSet<Guid> _pendingPackInserts = new();
         private int _nextPackClaimToken = 1;
-        private ContainerStateMessage _pendingClientState;
+        // Records whose target object the world has not produced yet. The join baseline can
+        // name a placement the guest rebuilds only after the baseline is applied, and applying
+        // such a record against a null target throws out of the reliable handler and drops the
+        // session. Keyed by the packed (kind, index) identity; the newest authoritative value
+        // for a key wins. Re-applied from the placement structure-change hook, never dropped.
+        private readonly Dictionary<int, ContainerRecord> _pendingRecords = new();
         private readonly BoxNetworkInteraction _boxes;
         private readonly PlayerBoxInteraction _playerBox;
         private Guid _hostPredictionId;
@@ -275,7 +280,7 @@ namespace CardShopCoop.Modules.World
             _packClaimOwner.Clear();
             _packClaimToken.Clear();
             _nextPackClaimToken = 1;
-            _pendingClientState = null;
+            _pendingRecords.Clear();
             _hostPredictionId = Guid.Empty;
             _hostActorConnectionId = 0;
             _hostDeltaBox = null;
@@ -285,14 +290,33 @@ namespace CardShopCoop.Modules.World
             _hostPackIndex = 0;
         }
 
+        /// <summary>Re-applies every record whose target object the world had not produced when it
+        /// arrived, and returns immediately when nothing is outstanding. Called from the world-ready
+        /// paths (through WorldCardInteraction.FlushWorldReady, the way every interaction class in this
+        /// module is) and on every placement structure change - the late-join signal PlayTable, Register
+        /// and CardDisplay use - so an object the placement layer recreates after the baseline is
+        /// reconciled instead of being left unapplied. ONE entry point per class, as its siblings have.</summary>
         internal void FlushClientState()
         {
-            if (_pendingClientState == null || !InGame)
+            if (_pendingRecords.Count == 0 || !InGame)
+            {
                 return;
+            }
 
-            var pending = _pendingClientState;
-            _pendingClientState = null;
-            ClientApplyState(pending);
+            var pending = new List<KeyValuePair<int, ContainerRecord>>(_pendingRecords);
+            for (var i = 0; i < pending.Count; i++)
+            {
+                var key = pending[i].Key;
+                var kind = key >> 8;
+                var idx = key & 0xFF;
+                if (!HasTarget(kind, idx))
+                {
+                    continue;
+                }
+
+                _pendingRecords.Remove(key);
+                ApplyRecord(kind, idx, pending[i].Value);
+            }
         }
 
         internal void AppendBaselineMessages(Action<INetMessage> append)
@@ -379,6 +403,27 @@ namespace CardShopCoop.Modules.World
             }
 
             return list[idx] as T;
+        }
+
+        /// <summary>True when the authoritative record's target object resolves on this peer.
+        /// An unknown kind is left to <see cref="ApplyRecord"/>, which rejects it explicitly.</summary>
+        private bool HasTarget(int kind, int idx) => kind switch
+        {
+            KindCardStorage => Get<InteractableCardStorageShelf>(kind, idx) != null,
+            KindDonation => Get<InteractableBulkDonationBox>(kind, idx) != null,
+            KindPackOpener => Get<InteractableAutoPackOpener>(kind, idx) != null,
+            KindCleanser => Get<InteractableAutoCleanser>(kind, idx) != null,
+            KindEmptyBoxStorage => Get<InteractableEmptyBoxStorage>(kind, idx) != null,
+            _ => true,
+        };
+
+        /// <summary>The length of a kind's placement list, for the deferral diagnostic. -1 when
+        /// the shelf manager or the list itself is missing.</summary>
+        private int ListCount(int kind)
+        {
+            var sm = Sm();
+            var list = sm == null ? null : PlacementApi.GetList(sm, kind);
+            return list?.Count ?? -1;
         }
 
         /// <summary>True when a bulk donation box is a defined game object type and therefore
@@ -1294,56 +1339,83 @@ namespace CardShopCoop.Modules.World
             if (message == null)
                 throw new InvalidOperationException("Authoritative container state is missing.");
 
-            if (!InGame)
+            if (InGame)
             {
-                _pendingClientState = message;
-                return;
+                CacheContainerScreens();
             }
 
-            CacheContainerScreens();
             var records = message.Records;
             for (var r = 0; r < records.Count; r++)
             {
                 var rec = records[r];
-                var kind = (int)rec.Kind;
-                var idx = (int)rec.Index;
-                switch (kind)
-                {
-                    case KindCardStorage:
-                        ApplyContentInPlace(Get<InteractableCardStorageShelf>(kind, idx),
-                            rec.Cards, rec.CanWorkerTake);
-                        break;
-                    case KindDonation:
-                        {
-                            var donation = Get<InteractableBulkDonationBox>(kind, idx);
-                            if (IsSyncedDonationBox(donation))
-                            {
-                                ApplyContentInPlace(donation, rec.Cards);
-                            }
+                ApplyOrDefer((int)rec.Kind, (int)rec.Index, rec);
+            }
+        }
 
-                            break;
-                        }
-                    case KindPackOpener:
-                        ApplyPackState(Get<InteractableAutoPackOpener>(kind, idx), rec);
-                        if (rec.CollectClaimed)
-                            _claimedPackIndices.Add(idx);
-                        else
-                            _claimedPackIndices.Remove(idx);
-                        break;
-                    case KindCleanser:
-                        var cleanser = Get<InteractableAutoCleanser>(kind, idx);
-                        ApplyCleanserState(idx, cleanser, (rec.Flags & 1) != 0,
-                            (rec.Flags & 2) != 0, rec.Fills);
-                        break;
-                    case KindEmptyBoxStorage:
-                        var storage = Get<InteractableEmptyBoxStorage>(kind, idx);
-                        FiEmptyStoredCount.SetValue(storage, rec.Count);
-                        MiEmptyEvaluateStack.Invoke(storage, null);
-                        break;
-                    default:
-                        throw new InvalidOperationException("Unknown authoritative container kind "
-                            + kind + ".");
+        /// <summary>Applies one authoritative record when its target object exists, or keeps it
+        /// until the world produces that object. A join baseline can name a placement the guest
+        /// only rebuilds after this message (the placement baseline is requested after the world
+        /// baseline), and applying it against a null target throws out of the reliable handler
+        /// and drops the session. The record is never dropped: the placement layer's
+        /// structure-change signal re-applies it once the object exists.</summary>
+        private void ApplyOrDefer(int kind, int idx, ContainerRecord rec)
+        {
+            var key = (kind << 8) | idx;
+            if (!InGame || !HasTarget(kind, idx))
+            {
+                if (InGame)
+                {
+                    CoopPlugin.Log.LogWarning("[containers] deferring record kind=" + kind
+                        + " idx=" + idx + " until the world produces the object (list.Count="
+                        + ListCount(kind) + ").");
                 }
+
+                _pendingRecords[key] = rec;
+                return;
+            }
+
+            _pendingRecords.Remove(key);
+            ApplyRecord(kind, idx, rec);
+        }
+
+        private void ApplyRecord(int kind, int idx, ContainerRecord rec)
+        {
+            switch (kind)
+            {
+                case KindCardStorage:
+                    ApplyContentInPlace(Get<InteractableCardStorageShelf>(kind, idx),
+                        rec.Cards, rec.CanWorkerTake);
+                    break;
+                case KindDonation:
+                    {
+                        var donation = Get<InteractableBulkDonationBox>(kind, idx);
+                        if (IsSyncedDonationBox(donation))
+                        {
+                            ApplyContentInPlace(donation, rec.Cards);
+                        }
+
+                        break;
+                    }
+                case KindPackOpener:
+                    ApplyPackState(Get<InteractableAutoPackOpener>(kind, idx), rec);
+                    if (rec.CollectClaimed)
+                        _claimedPackIndices.Add(idx);
+                    else
+                        _claimedPackIndices.Remove(idx);
+                    break;
+                case KindCleanser:
+                    var cleanser = Get<InteractableAutoCleanser>(kind, idx);
+                    ApplyCleanserState(idx, cleanser, (rec.Flags & 1) != 0,
+                        (rec.Flags & 2) != 0, rec.Fills);
+                    break;
+                case KindEmptyBoxStorage:
+                    var storage = Get<InteractableEmptyBoxStorage>(kind, idx);
+                    FiEmptyStoredCount.SetValue(storage, rec.Count);
+                    MiEmptyEvaluateStack.Invoke(storage, null);
+                    break;
+                default:
+                    throw new InvalidOperationException("Unknown authoritative container kind "
+                        + kind + ".");
             }
         }
 

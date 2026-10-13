@@ -8,23 +8,6 @@ using CardShopCoop.Net.Protocol;
 
 namespace CardShopCoop.Net
 {
-    /// <summary>One received message, already reassembled and decoded from the wire.
-    /// Transports never expose partial frames to callers.</summary>
-    public struct InMsg
-    {
-        public PeerConnection Connection;
-        public INetMessage Message;
-        internal bool ReceivedBeforeMessageIdActivation;
-
-        public Type MessageType
-        {
-            get
-            {
-                return Message?.GetType();
-            }
-        }
-    }
-
     /// <summary>Frame builders/parsers. Wire format per frame:
     /// [int32 frameLen][byte tokenKind][token][UTF-8 JSON payload]. A named token is
     /// [int32 nameLen][UTF-8 Type.FullName]; a compact token is [uint16 messageId].</summary>
@@ -350,17 +333,6 @@ namespace CardShopCoop.Net
             0x00, 0x03, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00,
         };
-
-        public static byte[] Gunzip(byte[] data)
-        {
-            using (var src = new MemoryStream(data, writable: false))
-            using (var gz = new System.IO.Compression.GZipStream(src, System.IO.Compression.CompressionMode.Decompress))
-            using (var dst = new MemoryStream())
-            {
-                gz.CopyTo(dst);
-                return dst.ToArray();
-            }
-        }
 
     }
 }

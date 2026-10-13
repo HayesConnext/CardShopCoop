@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Reflection;
+using CardShopCoop.Api;
 
 namespace CardShopCoop.Util
 {
@@ -8,9 +9,6 @@ namespace CardShopCoop.Util
     /// type initialization; optional members only produce a one-shot, greppable diagnostic.</summary>
     internal static class ReflectionSurface
     {
-        private static readonly HashSet<string> Reported = new();
-        private static readonly object Gate = new();
-
         internal static Type OptionalType(string name, string assembly)
         {
             var result = ModParity.ResolveType(name, assembly);
@@ -26,13 +24,7 @@ namespace CardShopCoop.Util
         {
             var key = (required ? "required" : "optional") + ":" + kind + ":" +
                 (type == null ? "<null>" : type.FullName) + "." + name;
-            bool report;
-            lock (Gate)
-            {
-                report = Reported.Add(key);
-            }
-
-            if (!report)
+            if (!CoopLog.First(key))
             {
                 return;
             }
@@ -111,6 +103,99 @@ namespace CardShopCoop.Util
             }
 
             return result;
+        }
+
+        /// <summary>True when the type's definition can actually load in this process. Mono resolves
+        /// a type's FIELD signatures while loading it, so a type whose field names a type from a
+        /// missing OR stub assembly throws <see cref="TypeLoadException"/>. The Xbox / Game Pass
+        /// build ships a 4 KB stub literally named <c>com.rlabrecque.steamworks.net</c>, which is
+        /// why loading <c>SteamLobby</c> (fields are <c>Steamworks.CallResult&lt;T&gt;</c>) faults
+        /// there - and that type now lives in the Steam transport assembly, which IS scanned as an
+        /// integrating mod. There is no way to know before touching the type (the CLR resolves
+        /// fields as it loads them), so the probe IS the detection: probe defensively, skip.</summary>
+        internal static bool CanLoad(Type type)
+        {
+            if (type == null)
+            {
+                return false;
+            }
+
+            try
+            {
+                typeof(object).IsAssignableFrom(type);
+                return true;
+            }
+            catch (Exception error)
+            {
+                Skip(type, error);
+                return false;
+            }
+        }
+
+        /// <summary>IsAssignableFrom that treats an unloadable candidate as "no" instead of letting
+        /// the load fault escape into a startup scan.</summary>
+        internal static bool IsAssignableTo(Type candidate, Type baseType)
+        {
+            if (candidate == null || baseType == null)
+            {
+                return false;
+            }
+
+            try
+            {
+                return baseType.IsAssignableFrom(candidate);
+            }
+            catch (Exception error)
+            {
+                Skip(candidate, error);
+                return false;
+            }
+        }
+
+        /// <summary>Custom attributes of a type, or an empty array when the type cannot load.</summary>
+        internal static object[] SafeAttributes(Type type)
+        {
+            if (type == null)
+            {
+                return Array.Empty<object>();
+            }
+
+            try
+            {
+                return type.GetCustomAttributes(false);
+            }
+            catch (Exception error)
+            {
+                Skip(type, error);
+                return Array.Empty<object>();
+            }
+        }
+
+        /// <summary>One-shot diagnostic for a type an assembly-wide scan had to skip. The fail-loud
+        /// policy still holds - a skipped type is always named once - but an unloadable type is not
+        /// a bug in the scan, so it is a warning rather than a throw.</summary>
+        private static void Skip(Type type, Exception error)
+        {
+            string name;
+            try
+            {
+                name = type.FullName ?? type.Name;
+            }
+            catch
+            {
+                name = "<unknown>";
+            }
+
+            if (!CoopLog.First("type-load:" + name))
+            {
+                return;
+            }
+
+            if (CoopPlugin.Log != null)
+            {
+                CoopPlugin.Log.LogWarning("coop: skipped a type that cannot load on this build ("
+                    + name + "): " + error.Message);
+            }
         }
 
         private static MethodInfo ResolveMethod(Type type, string name, Type[] args)

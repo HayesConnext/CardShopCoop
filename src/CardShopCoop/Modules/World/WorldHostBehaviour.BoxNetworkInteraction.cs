@@ -72,7 +72,7 @@ namespace CardShopCoop.Modules.World
             {
                 if (!PlacementApi.TryResolveBoxableFurnitureEntityId(message.StableEntityId,
                     WorldMessageMetadata.FurnitureIdentityScope, message.ObjectType,
-                    out var match, false))
+                    out var match, requireUnboxed: false, requireTypeMatch: false))
                 {
                     CoopPlugin.Log.LogWarning("[box-furniture] rejected box-up request entity="
                         + (message.StableEntityId ?? "<missing>") + " type=" + message.ObjectType + ".");

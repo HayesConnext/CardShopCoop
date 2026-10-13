@@ -16,8 +16,8 @@ It is a shared counter: a client intent, a host-authoritative broadcast, and a j
    </ProjectReference>
    ```
    `CardShopCoop.Api.dll` reaches you three ways: it ships inside the `CardShopCoop` plugin folder,
-   inside the core release zip `CardShopCoop-<version>.zip`, and as the standalone release asset
-   `CardShopCoop.Api-<version>.zip` (which contains `CardShopCoop.Api/CardShopCoop.Api.dll` and its
+   inside the core release zip `CardShopCoop.zip`, and as the standalone release asset
+   `CardShopCoop.Api.zip` (which contains `CardShopCoop.Api/CardShopCoop.Api.dll` and its
    XML documentation) so you can compile against it directly. Never ship your own copy: a second
    copy in another plugin folder can shadow the shipped one (version skew, binding type mismatch) or
    load as a second assembly identity, and nothing will line up.
@@ -194,8 +194,10 @@ A DTO that carries a prediction id may implement `IPredictedMessage`.
 - Transient messages have no fragmentation and no reliable fallback and must stay small (roughly
   1 KB; larger sends fail and can force session recovery). Use the default reliable lane for
   anything bigger.
-- An exception thrown by a reliable handler forces session recovery (both players are
-  disconnected); a transient handler exception drops the message. Do not throw from handlers.
+- An exception thrown by a reliable handler drops that one message and keeps the session up: the
+  player who received it gets an on-screen alert and the failure is logged. Because the message is
+  discarded rather than retried, the two peers can drift from that point, so a rejoin is the
+  resync. A transient handler exception drops the message silently. Do not throw from handlers.
 
 ## Connection ids
 

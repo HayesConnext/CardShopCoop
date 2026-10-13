@@ -110,24 +110,53 @@
   </Target>
 
   <Target Name="DeployToPlugins" AfterTargets="Build" Condition="'$(Deploy)' == 'true'">
-    <Copy SourceFiles="$(TargetPath);$(TargetDir)CardShopCoop.Api.dll" DestinationFolder="$(GamePath)/BepInEx/plugins/CardShopCoop" />
+    <Copy SourceFiles="$(TargetPath);$(TargetDir)CardShopCoop.Api.dll" DestinationFolder="$(DeployPath)/BepInEx/plugins/CardShopCoop" />
     <Copy SourceFiles="$(TargetDir)CardShopCoop.Api.xml"
-          DestinationFolder="$(GamePath)/BepInEx/plugins/CardShopCoop"
+          DestinationFolder="$(DeployPath)/BepInEx/plugins/CardShopCoop"
           Condition="Exists('$(TargetDir)CardShopCoop.Api.xml')" />
   </Target>
 
-  <Target Name="Package" AfterTargets="Build" Condition="'$(Package)' == 'true'">
+  <Target Name="Package" AfterTargets="Build" DependsOnTargets="BuildOptionalSteamAssembly"
+          Condition="'$(Package)' == 'true'">
     <PropertyGroup>
       <PackageDirectory>$(IntermediateOutputPath)package</PackageDirectory>
-      <PackageZip>$(OutputPath)$(AssemblyName)-$(CardShopCoopVersion).zip</PackageZip>
+      <PackageZip>$(OutputPath)$(AssemblyName).zip</PackageZip>
+      <!-- The Steam transport is its OWN assembly, so it lands in ITS output directory, never in
+           this project's $(TargetDir). Resolve it there under the same configuration (Release,
+           Deploy, ...). -->
+      <SteamAssembly>$(MSBuildThisFileDirectory)..\CardShopCoop.Steam\bin\$(Configuration)\CardShopCoop.Steam.dll</SteamAssembly>
     </PropertyGroup>
+    <!-- Fail LOUDLY rather than ship a zip with no Steam transport: an earlier version copied
+         $(TargetDir)CardShopCoop.Steam.dll, which never exists, and silently omitted it. -->
+    <Error Condition="!Exists('$(SteamAssembly)')"
+           Text="Package: CardShopCoop.Steam.dll was not found at '$(SteamAssembly)'. The zip would ship without the Steam transport; build CardShopCoop.Steam first (or use the solution)." />
     <RemoveDir Directories="$(PackageDirectory)" />
     <MakeDir Directories="$(PackageDirectory)/$(AssemblyName)" />
     <Copy SourceFiles="$(TargetPath);$(TargetDir)CardShopCoop.Api.dll" DestinationFolder="$(PackageDirectory)/$(AssemblyName)" />
     <Copy SourceFiles="$(TargetDir)CardShopCoop.Api.xml"
           DestinationFolder="$(PackageDirectory)/$(AssemblyName)"
           Condition="Exists('$(TargetDir)CardShopCoop.Api.xml')" />
+    <Copy SourceFiles="$(SteamAssembly)"
+          DestinationFolder="$(PackageDirectory)/$(AssemblyName)" />
     <ZipDirectory SourceDirectory="$(PackageDirectory)" DestinationFile="$(PackageZip)" Overwrite="true" />
+  </Target>
+
+  <!-- The optional Steam transport is its OWN assembly (see Net/ISteamBridge.cs) and this project
+       deliberately does NOT reference it, so a build here would never pull it in. Build it
+       alongside so a plain `dotnet build CardShopCoop.csproj -p:Deploy=true` still produces the
+       full plugin set. Steam -> core is the only project-reference direction, so there is no
+       cycle: core has finished building by the time this runs. -->
+  <Target Name="BuildOptionalSteamAssembly" AfterTargets="Build"
+          Condition="'$(SkipOptionalSteamBuild)' != 'true' and Exists('$(MSBuildThisFileDirectory)..\CardShopCoop.Steam\CardShopCoop.Steam.csproj')">
+    <!-- Restore;Build, not just Build: the Steam project is deliberately NOT a ProjectReference, so
+         the restore the outer build runs never covers it, and a nested Build alone dies with
+         NETSDK1004 on a clean checkout. Restore is a no-op once its assets exist.
+         Package=false is load-bearing: a global -p:Package=true would otherwise flow through
+         Steam's ProjectReference build of Core, run Core's Package target BEFORE Steam has
+         compiled, and trip the "CardShopCoop.Steam.dll was not found" guard. -->
+    <MSBuild Projects="$(MSBuildThisFileDirectory)..\CardShopCoop.Steam\CardShopCoop.Steam.csproj"
+             Targets="Restore;Build"
+             Properties="Configuration=$(Configuration);Deploy=$(Deploy);DeployPath=$(DeployPath);Package=false;SkipOptionalSteamBuild=true" />
   </Target>
 
 </Project>

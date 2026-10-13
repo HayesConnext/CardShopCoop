@@ -86,7 +86,7 @@ namespace CardShopCoop.Net.Protocol
             public void Dispose()
             {
                 if (System.Threading.Interlocked.Exchange(ref _disposed, 1) == 0)
-                    _registry.EndSession(this);
+                    _registry.EndSession();
             }
         }
 
@@ -113,7 +113,14 @@ namespace CardShopCoop.Net.Protocol
             = new(StringComparer.Ordinal);
         private ProtocolSnapshot _snapshot;
         private bool _frozen;
-        private SessionLease _sessionLease;
+        /// <summary>The snapshot the current session froze, held for as long as ANY transport still
+        /// holds a lease. Null when no session is active. Stored separately from the leases so a
+        /// reused lease never reads through a lease the first holder has already disposed.</summary>
+        private ProtocolSnapshot _sessionSnapshot;
+        /// <summary>How many live transports hold the current session. One process can host several
+        /// backends at once (IP + Steam), and each builds its own KCP transport - all of them must
+        /// share the one frozen catalog, so the freeze lifts only when the LAST holder releases.</summary>
+        private int _sessionLeaseCount;
         private int _generation;
         private bool _coreAssemblyRegistered;
         private bool _disposed;
@@ -165,15 +172,25 @@ namespace CardShopCoop.Net.Protocol
         }
 
         /// <summary>
-        /// Starts one exclusive session and publishes registrations pending from a prior session.
-        /// The returned lease keeps the resulting snapshot immutable until it is disposed.
+        /// Starts a session and publishes registrations pending from a prior session. The returned
+        /// lease keeps the resulting snapshot immutable until it is disposed. A process may hold
+        /// several leases at once (one per transport, e.g. a host on IP and Steam together): they all
+        /// share the one frozen snapshot, and the freeze lifts when the LAST lease is released.
         /// </summary>
         public IProtocolSessionLease BeginSession()
         {
             lock (_gate)
             {
                 ThrowIfDisposedLocked();
-                if (_sessionLease != null || _frozen)
+                if (_sessionSnapshot != null)
+                {
+                    // A session is already frozen in this process: another transport is joining it.
+                    // Hand back a lease over the SAME snapshot rather than refusing - the catalog is
+                    // per-process, so every transport must see the one that is already frozen.
+                    _sessionLeaseCount++;
+                    return new SessionLease(this, _sessionSnapshot);
+                }
+                if (_frozen)
                 {
                     throw new InvalidOperationException(
                         "A protocol session is already active for this registry");
@@ -236,22 +253,30 @@ namespace CardShopCoop.Net.Protocol
                 _generation++;
                 _frozen = true;
                 RebuildSnapshotLocked(sessionDescriptors);
-                _sessionLease = new SessionLease(this, _snapshot);
-                return _sessionLease;
+                _sessionSnapshot = _snapshot;
+                _sessionLeaseCount = 1;
+                return new SessionLease(this, _snapshot);
             }
         }
 
-        private void EndSession(SessionLease lease)
+        private void EndSession()
         {
             lock (_gate)
             {
-                if (!ReferenceEquals(_sessionLease, lease))
+                if (_sessionLeaseCount <= 0)
                     return;
 
-                // Keep the lease's snapshot object untouched, but publish a new unfrozen view.
+                _sessionLeaseCount--;
+                if (_sessionLeaseCount > 0)
+                {
+                    // Another transport in this process still holds the session; keep it frozen.
+                    return;
+                }
+
+                // Keep the snapshot object untouched, but publish a new unfrozen view.
                 // Registrations made while the lease was active remain pending until the next
                 // BeginSession call and therefore are deliberately absent from this view.
-                _sessionLease = null;
+                _sessionSnapshot = null;
                 _frozen = false;
                 RebuildSnapshotLocked();
             }
@@ -431,11 +456,6 @@ namespace CardShopCoop.Net.Protocol
             }
         }
 
-        public bool TryGetDescriptor(Type messageType, out MessageDescriptor descriptor)
-        {
-            return CurrentSnapshot.TryGet(messageType, out descriptor);
-        }
-
         /// <summary>Looks in the bootstrap/pending catalog as well as the current session.</summary>
         public bool TryGetRegisteredDescriptor(Type messageType, out MessageDescriptor descriptor)
         {
@@ -455,16 +475,6 @@ namespace CardShopCoop.Net.Protocol
                 descriptor = registration.Descriptor;
                 return true;
             }
-        }
-
-        public bool TryGetDescriptor(string wireName, out MessageDescriptor descriptor)
-        {
-            return CurrentSnapshot.TryGet(wireName, out descriptor);
-        }
-
-        internal bool TryGetHandler(Type messageType, out ProtocolHandlerBinding handler)
-        {
-            return CurrentSnapshot.TryGetHandler(messageType, out handler);
         }
 
         internal void RaiseRejection(MessageRejection rejection)
@@ -516,7 +526,8 @@ namespace CardShopCoop.Net.Protocol
                 _pendingDescriptors.Clear();
                 _handlers.Clear();
                 _pendingHandlers.Clear();
-                _sessionLease = null;
+                _sessionSnapshot = null;
+                _sessionLeaseCount = 0;
                 _frozen = false;
                 _snapshot = new ProtocolSnapshot(_generation, false,
                     new Dictionary<string, MessageDescriptor>(StringComparer.Ordinal),

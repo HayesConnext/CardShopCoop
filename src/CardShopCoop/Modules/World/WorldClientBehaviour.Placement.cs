@@ -261,6 +261,11 @@ namespace CardShopCoop.Modules.World
             // The game already placed the object, so its settled state is the post-action state
             // (unboxed with the final pose); the prediction only records how to redo and undo it.
             var after = PlacementEntityState.Capture(obj, _movingBefore.Key).ToEntry();
+            // A move must never carry the object type. Identity is the stable key the host bound at
+            // creation, and a coalesced object's local type is only the peer's equivalent: sending it
+            // would make the host reject the move (its object is the richer type) or, worse, let it
+            // restate the host's real one. NoType tells the host to settle whatever the key names.
+            after.Type = PlacementInterop.NoType;
             var before = _movingBefore;
             _movingObject = null;
             _movingBefore = null;

@@ -75,7 +75,7 @@
   </Target>
 
   <Target Name="DeployTv" AfterTargets="Build" Condition="'$(Deploy)' == 'true'">
-    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(GamePath)/BepInEx/plugins" />
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(DeployPath)/BepInEx/plugins" />
   </Target>
 
   <Target Name="Package" AfterTargets="Build" Condition="'$(Package)' == 'true'">

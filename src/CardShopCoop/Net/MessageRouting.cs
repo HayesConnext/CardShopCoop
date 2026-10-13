@@ -39,23 +39,51 @@ namespace CardShopCoop.Net
     }
 
     /// <summary>
-    /// A reliable handler failed after the router requested peer recovery. The exception remains
-    /// visible to the bounded Core dispatch loop so it can stop consuming this peer's messages
-    /// for the current frame instead of treating the failed reliable message as handled.
+    /// A reliable message handler threw. The router discards that one message and leaves the
+    /// connection up, so this carries the failure out to the core instead of a session-killing
+    /// exception: the core surfaces it to the player, and the cause survives the frame's
+    /// continued dispatch.
     /// </summary>
-    internal sealed class ReliableMessageHandlerException : Exception
+    public sealed class HandlerFailure
     {
-        internal ReliableMessageHandlerException(Type messageType, Exception innerException)
-            : base("Reliable handler failed for " + (messageType?.FullName ?? "<unknown>"),
-                innerException)
-        {
-            MessageType = messageType;
-        }
-
-        internal Type MessageType
+        public MessageDescriptor Descriptor
         {
             get;
         }
+
+        public MessageContext Context
+        {
+            get;
+        }
+
+        public Exception Error
+        {
+            get;
+        }
+
+        public string WireName => Descriptor?.WireName;
+
+        public Type MessageType => Descriptor?.MessageType;
+
+        public HandlerFailure(MessageDescriptor descriptor, MessageContext context, Exception error)
+        {
+            Descriptor = descriptor;
+            Context = context;
+            Error = error;
+        }
+    }
+
+    /// <summary>
+    /// How one dispatch ended. The core needs to tell a genuine protocol rejection (an unknown,
+    /// unauthorized, or unhandled pre-activation frame - a peer violation) from a message whose
+    /// handler ran and threw: only the former may trigger the pre-activation protocol-violation
+    /// disconnect, because a thrown handler is a bug on THIS side, not misbehavior by the peer.
+    /// </summary>
+    internal enum DispatchOutcome
+    {
+        Handled,
+        Rejected,
+        HandlerFailed,
     }
 
     public sealed class MessageRouter : ICoopMessageRegistry
@@ -71,6 +99,11 @@ namespace CardShopCoop.Net
 
         /// <summary>Contextual rejection seam for diagnostics, metrics, or disconnect policy.</summary>
         public event Action<MessageRejection> Rejected;
+
+        /// <summary>Raised after a reliable handler throws and its message is discarded. The
+        /// connection is deliberately kept, so this is the seam the core uses to surface the
+        /// failure (and any rate-limited diagnostics) to the player.</summary>
+        public event Action<HandlerFailure> HandlerFailed;
 
         public MessageRouter()
         {
@@ -99,6 +132,13 @@ namespace CardShopCoop.Net
             }
 
             MessageRegistry.EnsureInitialized();
+
+            // Probe: which behaviours actually REACH registration on this process. A module whose
+            // handlers are missing never got this far, which separates "the behaviour was never enabled"
+            // from "it was enabled and bound nothing" - and those are the two candidates left for the
+            // client dropping every message. Cheap, and only until that is settled.
+            CoopPlugin.Log?.LogInfo("handler registration: " + target.GetType().FullName
+                + (coreOwner ? " (core)" : ""));
             var methods = target.GetType().GetMethods(BindingFlags.Instance
                 | BindingFlags.Public | BindingFlags.NonPublic);
             var pending = new List<ProtocolHandlerRegistration>();
@@ -208,14 +248,16 @@ namespace CardShopCoop.Net
 
         public bool Dispatch(MessageContext context, INetMessage message)
         {
-            return Dispatch(context, message, false);
+            return Dispatch(context, message, false) == DispatchOutcome.Handled;
         }
 
         /// <summary>
         /// Internal core lifecycle path for handshake/control dispatch before the generic
-        /// authenticated-session gate is established. External assemblies cannot call it.
+        /// authenticated-session gate is established. External assemblies cannot call it. Unlike
+        /// the public <see cref="Dispatch(MessageContext, INetMessage)"/> it reports the exact
+        /// outcome, so the core can keep a thrown handler from being read as a peer violation.
         /// </summary>
-        internal bool DispatchCore(MessageContext context, INetMessage message)
+        internal DispatchOutcome DispatchCore(MessageContext context, INetMessage message)
         {
             return Dispatch(context, message, true);
         }
@@ -230,7 +272,7 @@ namespace CardShopCoop.Net
                 out _);
         }
 
-        private bool Dispatch(MessageContext context, INetMessage message, bool corePath)
+        private DispatchOutcome Dispatch(MessageContext context, INetMessage message, bool corePath)
         {
             if (context == null)
             {
@@ -271,26 +313,26 @@ namespace CardShopCoop.Net
             {
                 handler.Invoke(context, message);
                 completed = true;
-                return true;
+                return DispatchOutcome.Handled;
             }
             catch (Exception error)
             {
                 var typeName = descriptor.WireName;
                 if (descriptor.Reliability == Reliability.Reliable)
                 {
+                    // A reliable handler is no longer allowed to take the session down. Drop the
+                    // one message it could not process, keep the connection, and hand the failure
+                    // to the core so the player is told instead of being silently disconnected.
                     CoopPlugin.Log.LogError("reliable handler failed for " + typeName
                         + " on connection " + context.ConnectionId
-                        + "; requesting session recovery: " + error);
-                    context.Transport?.GracefulDisconnect(context.Connection,
-                        new DisconnectInfo(
-                            "reliable message handler failed; session recovery required", false,
-                            "handler_failed", true, context.Connection.State));
-                    throw new ReliableMessageHandlerException(descriptor.MessageType, error);
+                        + "; discarding the message and keeping the session: " + error);
+                    RaiseHandlerFailed(new HandlerFailure(descriptor, context, error));
+                    return DispatchOutcome.HandlerFailed;
                 }
 
                 CoopPlugin.Log.LogWarning("transient handler failed for " + typeName
                     + " on connection " + context.ConnectionId + "; dropping message: " + error);
-                return false;
+                return DispatchOutcome.HandlerFailed;
             }
             finally
             {
@@ -299,12 +341,30 @@ namespace CardShopCoop.Net
             }
         }
 
-        private bool Reject(string wireName, Type messageType, string reason, MessageContext context)
+        /// <summary>Runs the <see cref="HandlerFailed"/> observers. This is a boundary between the
+        /// router and pluggable subscribers, so one observer throwing must not escape into the
+        /// dispatch loop (where a reliable message's exception would be read as a dispatch failure
+        /// and disconnect the peer the failure was just reported against).</summary>
+        private void RaiseHandlerFailed(HandlerFailure failure)
+        {
+            try
+            {
+                HandlerFailed?.Invoke(failure);
+            }
+            catch (Exception subscriberError)
+            {
+                CoopPlugin.Log.LogError("HandlerFailed observer threw; the failure was still "
+                    + "discarded and the session kept: " + subscriberError);
+            }
+        }
+
+        private DispatchOutcome Reject(string wireName, Type messageType, string reason,
+            MessageContext context)
         {
             var rejection = new MessageRejection(wireName, messageType, reason, context);
             Rejected?.Invoke(rejection);
             ProtocolRegistry.Default.RaiseRejection(rejection);
-            return false;
+            return DispatchOutcome.Rejected;
         }
     }
 }

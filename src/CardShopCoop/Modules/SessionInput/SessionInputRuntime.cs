@@ -2,6 +2,7 @@ using System;
 using System.Reflection;
 using CardShopCoop.Runtime;
 using HarmonyLib;
+using CardShopCoop.Api;
 
 namespace CardShopCoop.Modules.SessionInput
 {
@@ -269,7 +270,7 @@ namespace CardShopCoop.Modules.SessionInput
             }
             catch (Exception e)
             {
-                Swallow.Log(e);
+                CoopLog.Swallow(e);
                 _pauseMenuOpen = false;
                 SetOwner(ModalOwner.Pause, false);
             }
@@ -373,7 +374,7 @@ namespace CardShopCoop.Modules.SessionInput
             }
             catch (Exception e)
             {
-                Swallow.Log(e);
+                CoopLog.Swallow(e);
             }
         }
 
@@ -426,7 +427,7 @@ namespace CardShopCoop.Modules.SessionInput
             }
             catch (Exception e)
             {
-                Swallow.Log(e);
+                CoopLog.Swallow(e);
             }
             finally
             {
@@ -478,7 +479,7 @@ namespace CardShopCoop.Modules.SessionInput
             }
             catch (Exception e)
             {
-                Swallow.Log(e);
+                CoopLog.Swallow(e);
             }
         }
 
@@ -510,7 +511,7 @@ namespace CardShopCoop.Modules.SessionInput
             }
             catch (Exception e)
             {
-                Swallow.Log(e);
+                CoopLog.Swallow(e);
             }
         }
 
@@ -542,7 +543,7 @@ namespace CardShopCoop.Modules.SessionInput
             }
             catch (Exception e)
             {
-                Swallow.Log(e);
+                CoopLog.Swallow(e);
             }
             finally
             {

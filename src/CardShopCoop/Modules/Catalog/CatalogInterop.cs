@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Reflection;
 using CardShopCoop.Runtime;
+using CardShopCoop.Api;
 
 namespace CardShopCoop.Modules.Catalog
 {
@@ -34,9 +35,7 @@ namespace CardShopCoop.Modules.Catalog
         private static PropertyInfo _eplSmallUnlocked;
         private static PropertyInfo _eplBigUnlocked;
         private static FieldInfo _licenseList;
-        private static readonly HashSet<string> ReportedAmbiguities = new(StringComparer.Ordinal);
-        private static readonly Dictionary<int, long> ReportedUnwireableItemTypes = new();
-        private const long UnwireableItemLogIntervalTicks = TimeSpan.TicksPerMinute;
+        private const int UnwireableItemLogIntervalMs = 60000;
 
         /// <summary>
         /// A complete catalog license snapshot.  The raw list is only the legacy game's part of
@@ -102,15 +101,13 @@ namespace CardShopCoop.Modules.Catalog
                 return true;
             }
 
-            var now = DateTime.UtcNow.Ticks;
-            if (!ReportedUnwireableItemTypes.TryGetValue(value, out var last)
-                || now - last >= UnwireableItemLogIntervalTicks)
+            if (CoopLog.FirstWithin("catalog:unwireable:" + value, UnwireableItemLogIntervalMs))
             {
-                ReportedUnwireableItemTypes[value] = now;
                 CoopPlugin.Log.LogWarning("Catalog rejected non-wireable EItemType " + value
                     + (string.IsNullOrEmpty(context) ? "" : " while building " + context)
                     + "; the raw price-list slot was skipped.");
             }
+
             return false;
         }
 
@@ -459,8 +456,7 @@ namespace CardShopCoop.Modules.Catalog
         private static void ReportAmbiguous(string name, bool isBigBox, EItemType itemType,
             int count)
         {
-            var key = IdentityKey(name, isBigBox, itemType);
-            if (!ReportedAmbiguities.Add(key))
+            if (!CoopLog.First(IdentityKey(name, isBigBox, itemType)))
             {
                 return;
             }

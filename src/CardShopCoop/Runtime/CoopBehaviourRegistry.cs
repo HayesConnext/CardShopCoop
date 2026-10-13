@@ -4,7 +4,10 @@ using System.Linq;
 using System.Reflection;
 using CardShopCoop.Attributes;
 using CardShopCoop.Net.Connection;
+using CardShopCoop.Util;
 using UnityEngine;
+using CoopLog = CardShopCoop.Api.CoopLog;
+using CardShopCoop.Net;
 
 namespace CardShopCoop.Runtime
 {
@@ -334,7 +337,12 @@ namespace CardShopCoop.Runtime
             {
                 foreach (var type in SafeTypes(assembly))
                 {
-                    if (!typeof(MonoBehaviour).IsAssignableFrom(type) || type.IsAbstract)
+                    // IsAssignableTo, not IsAssignableFrom: a type whose field signature names a
+                    // type from a missing/stub assembly throws TypeLoadException on load, and this
+                    // scan sees CONTRIBUTED assemblies too (the Steam transport is one), so it must
+                    // skip such a type rather than abort.
+                    if (!ReflectionSurface.IsAssignableTo(type, typeof(MonoBehaviour))
+                        || type.IsAbstract)
                     {
                         continue;
                     }
@@ -353,7 +361,7 @@ namespace CardShopCoop.Runtime
 
         private static bool HasAttribute(Type type, Type attributeType)
         {
-            foreach (var attribute in type.GetCustomAttributes(false))
+            foreach (var attribute in ReflectionSurface.SafeAttributes(type))
             {
                 if (attribute == null)
                 {
@@ -382,12 +390,26 @@ namespace CardShopCoop.Runtime
             var external = ExternalCoopMods.Instance.Assemblies;
             for (var i = 0; i < external.Count; i++)
             {
-                if (external[i] != null && external[i] != core)
+                if (external[i] != null && external[i] != core && IsScannable(external[i]))
                 {
                     yield return external[i];
                 }
             }
         }
+
+        private const string SteamAssemblyName = "CardShopCoop.Steam";
+
+        /// <summary>
+        /// CardShopCoop.Steam is ours and binds the real Steamworks wrapper. On a build that ships the
+        /// stub instead (the Game Pass one) none of its transport types can load, so there is nothing
+        /// to discover - and asking for its types produced a page of TypeLoadExceptions in the log on
+        /// every start. Skipping the scan is what turns an expected absence into no line at all; the
+        /// assembly stays in <see cref="ExternalCoopMods"/> because this only decides what behaviour
+        /// discovery reads, not what the mod set is.
+        /// </summary>
+        private static bool IsScannable(Assembly assembly)
+            => !(string.Equals(assembly.GetName().Name, SteamAssemblyName, StringComparison.Ordinal)
+                && !PlatformProbe.SteamworksPresent);
 
         private static Type[] SafeTypes(Assembly assembly)
         {
@@ -398,12 +420,31 @@ namespace CardShopCoop.Runtime
             catch (ReflectionTypeLoadException exception)
             {
                 var types = exception.Types.Where(type => type != null).ToArray();
-                CoopPlugin.Log.LogError("Co-op behaviour discovery loaded " + types.Length
-                    + " types from " + assembly.GetName().Name + " with reflection errors: "
-                    + string.Join(" | ", exception.LoaderExceptions.Where(error => error != null)
-                        .Select(error => error.ToString())));
+                var failed = exception.LoaderExceptions.Where(error => error != null).ToArray();
+
+                // Warning with a summary, not an Error with the whole list: an assembly that only partly
+                // loads reports that once per unresolvable field, which is thousands of characters
+                // saying one thing. Once per assembly, and the count plus first reason is what matters.
+                CoopLog.WarnOnce("assembly-types:" + assembly.GetName().Name,
+                    "Co-op behaviour discovery loaded " + types.Length
+                    + " types from " + assembly.GetName().Name + " and skipped " + failed.Length
+                    + " that cannot load on this build"
+                    + (failed.Length > 0 ? " (first reason: " + Shorten(failed[0].Message) + ")" : "")
+                    + ".");
                 return types;
             }
+        }
+
+        private static string Shorten(string message)
+        {
+            if (string.IsNullOrEmpty(message))
+            {
+                return "no detail";
+            }
+
+            const int Limit = 180;
+            message = message.Replace('\r', ' ').Replace('\n', ' ');
+            return message.Length <= Limit ? message : message.Substring(0, Limit) + "...";
         }
 
         private static void Validate(Attribute attribute, MethodInfo method)

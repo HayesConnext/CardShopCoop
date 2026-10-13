@@ -1,6 +1,7 @@
 using System;
 using System.Reflection;
 using BepInEx.Logging;
+using CardShopCoop.Net.Networking;
 
 namespace CardShopCoop.Api
 {
@@ -12,6 +13,7 @@ namespace CardShopCoop.Api
     internal interface ICoopBinding
     {
         void Register(Assembly assembly);
+        IDisposable RegisterNetworkingBackend(INetworkingBackend backend);
         ICoopContext Context
         {
             get;
@@ -91,6 +93,32 @@ namespace CardShopCoop.Api
             }
 
             binding.Register(assembly);
+        }
+
+        /// <summary>
+        /// Registers a networking transport, so the co-op window offers it as another way to host
+        /// or join. Returns a handle that unregisters it; dispose the handle from your plugin's
+        /// unload. Only valid once CardShopCoopCommunity is loaded (declare a BepInDependency on
+        /// dev.meepen.cardshopcoop, or guard with <see cref="IsAvailable"/>); otherwise this throws.
+        /// </summary>
+        public static IDisposable RegisterNetworkingBackend(INetworkingBackend backend)
+        {
+            if (backend == null)
+            {
+                throw new ArgumentNullException(nameof(backend));
+            }
+
+            var binding = Binding;
+            if (binding == null)
+            {
+                throw new InvalidOperationException(
+                    "CardShopCoopCommunity has not installed its API binding yet; call "
+                    + "CoopApi.RegisterNetworkingBackend from your plugin's Awake after "
+                    + "CardShopCoopCommunity is loaded (declare a BepInDependency on "
+                    + "dev.meepen.cardshopcoop, or guard with CoopApi.IsAvailable).");
+            }
+
+            return binding.RegisterNetworkingBackend(backend);
         }
     }
 }

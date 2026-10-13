@@ -7,6 +7,7 @@ using CardShopCoop.Modules.Catalog;
 using CardShopCoop.Modules.World;
 using CardShopCoop.Runtime;
 using UnityEngine;
+using CardShopCoop.Api;
 
 namespace CardShopCoop.Modules.SaveTransfer
 {
@@ -26,12 +27,32 @@ namespace CardShopCoop.Modules.SaveTransfer
         /// reads PrefabLoader/EnhancedPrefabLoader_-100, neither of which the save UI ever shows,
         /// so a guest's own local saves are never touched.</summary>
         public const int ReservedCoopSlot = -100;
-        public const int MaxTransferBytes = 32 * 1024 * 1024;
+        /// <summary>The largest single payload either side will hold: the save, the mod-data bundle, and
+        /// the aggregate of the sidecar files inside it. Raised from 32 MiB so a bundled asset of the
+        /// size <see cref="SaveTransferSidecars"/>'s per-file cap allows can actually cross. The receive
+        /// buffers GROW to what arrives rather than reserving this, so this bounds a legitimate transfer
+        /// instead of being allocated up front.</summary>
+        public const int MaxTransferBytes = 256 * 1024 * 1024;
         public const int MaxSidecarRawBytes = MaxTransferBytes;
-        public const int MaxExpandedBytes = 64 * 1024 * 1024;
+
+        /// <summary>Decompression cap. It must stay above <see cref="MaxTransferBytes"/>, or a payload we
+        /// permit would be refused the moment it expanded. Still a bomb guard - just sized for the new
+        /// transfer cap rather than the old one.</summary>
+        public const int MaxExpandedBytes = 512 * 1024 * 1024;
 
         private const int FreshnessSlackSeconds = 1;
+        private const int NoSlot = int.MinValue;
         private static string _startSceneName;
+
+        // ONE-SHOT BORROWED-WORLD PAYLOAD consumed by the CSaveLoad.Load prefix (SaveTransferPatches).
+        // The guest load entry point is CGameManager.LoadData, whose first act is CSaveLoad.Load(slot);
+        // on the local-file backend that reads the JSON we wrote, but on the Xbox/Gamecore backend
+        // CSaveLoad.Load reads PlatformManager's native store and the file we wrote is never read -
+        // which is exactly why a Game Pass guest used to fall through to CreateDefaultData. The prefix
+        // injects this payload straight into CSaveLoad.m_SavedGame with the same Unity parser the host
+        // serialized with, so the world loads identically on both backends. Main-thread only.
+        private static byte[] _borrowedWorldPayload;
+        private static int _borrowedWorldSlot = NoSlot;
 
         public static int CoopSlot
         {
@@ -163,7 +184,7 @@ namespace CardShopCoop.Modules.SaveTransfer
             }
             catch (Exception error)
             {
-                Swallow.Log(error);
+                CoopLog.Swallow(error);
                 return false;
             }
         }
@@ -228,7 +249,7 @@ namespace CardShopCoop.Modules.SaveTransfer
             }
             catch (Exception error)
             {
-                Swallow.Log(error);
+                CoopLog.Swallow(error);
                 return true;
             }
         }
@@ -245,7 +266,7 @@ namespace CardShopCoop.Modules.SaveTransfer
             }
             catch (Exception error)
             {
-                Swallow.Log(error);
+                CoopLog.Swallow(error);
                 return null;
             }
         }
@@ -294,7 +315,7 @@ namespace CardShopCoop.Modules.SaveTransfer
             }
             catch (Exception error)
             {
-                Swallow.Log(error);
+                CoopLog.Swallow(error);
                 return "";
             }
         }
@@ -416,15 +437,78 @@ namespace CardShopCoop.Modules.SaveTransfer
                 throw new InvalidOperationException("The game manager is not available for world load.");
             }
 
-            // The bytes are already on disk at the reserved slot. The ONLY way the world loads is
-            // the game's own CSaveLoad.Load(slot) (reached via ForceLoadSlot), so EPL's per-slot
-            // load prefix and the native restore both run exactly as they do for a local save.
+            // The bytes are also already on disk at the reserved slot, in case anything else reads
+            // that file, but the disk file is NOT the load path on every backend: the public/Steam
+            // builds read it through CSaveLoad.Load(slot), while the Xbox/Gamecore backend reads its
+            // native store and would ignore the file entirely (falling through to LoadBackupData ->
+            // CreateDefaultData). The CSaveLoad.Load prefix (SaveTransferPatches.SaveLoadPrefix)
+            // therefore injects the armed payload into CSaveLoad.m_SavedGame and reports the load as
+            // successful on BOTH backends, so EPL's per-slot load prefix and the game's
+            // PropagateLoadData both still run exactly as they do for a local save.
             manager.m_ForceNoCloudSaveLoad = true;
             CoopPlugin.Log.LogInfo("Coop save received (" + saveBytes.Length / 1024 + " KB), loading world...");
             // One-shot: the native load that follows is the host's save, whose gated enum ids are
             // in the host's space; translate them before the game propagates them.
             SaveEnumRemap.Arm();
+            ArmBorrowedWorld(saveBytes, CoopSlot);
             ForceLoadSlot(CoopSlot);
+        }
+
+        /// <summary>Arm the one-shot borrowed-world payload the CSaveLoad.Load prefix consumes.
+        /// Called on Unity's main thread immediately before the load of the borrowed world.</summary>
+        internal static void ArmBorrowedWorld(byte[] saveBytes, int slot)
+        {
+            _borrowedWorldSlot = slot;
+            _borrowedWorldPayload = saveBytes;
+        }
+
+        /// <summary>
+        /// If a borrowed world is armed for <paramref name="slot"/>, deserialize it into
+        /// CSaveLoad.m_SavedGame with <see cref="JsonUtility"/> - the exact parser the host used to
+        /// serialize it - and report the load as successful so CGameManager.LoadData propagates it
+        /// instead of falling through to a default world. Returns false (letting the game's own
+        /// load run) when no world is armed for this slot. Consumed once. Main-thread only.
+        /// </summary>
+        internal static bool TryInjectBorrowedWorld(int slot, out bool loaded)
+        {
+            loaded = false;
+            var payload = _borrowedWorldPayload;
+            if (payload == null || slot != _borrowedWorldSlot)
+            {
+                return false;
+            }
+
+            _borrowedWorldPayload = null;
+            _borrowedWorldSlot = NoSlot;
+
+            var field = typeof(CSaveLoad).GetField("m_SavedGame",
+                BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+            if (field == null)
+            {
+                throw new InvalidOperationException(
+                    "CSaveLoad.m_SavedGame was not found, so the borrowed world cannot be injected.");
+            }
+
+            var json = new UTF8Encoding(false).GetString(payload)
+                .TrimStart('\uFEFF', ' ', '\r', '\n', '\t');
+            var world = JsonUtility.FromJson(json, field.FieldType);
+            if (world == null)
+            {
+                throw new InvalidDataException("The game rejected the received world JSON.");
+            }
+
+            field.SetValue(null, world);
+            loaded = true;
+            CoopPlugin.Log.LogInfo("coop: injected the borrowed world into CSaveLoad for slot " + slot);
+            return true;
+        }
+
+        /// <summary>Drop any world armed for a load that never reached CSaveLoad.Load (the session
+        /// ended first), so a later session cannot consume a stale transfer.</summary>
+        internal static void ResetBorrowedWorld()
+        {
+            _borrowedWorldPayload = null;
+            _borrowedWorldSlot = NoSlot;
         }
 
         internal static void TryDelete(string path)
@@ -472,7 +556,7 @@ namespace CardShopCoop.Modules.SaveTransfer
             }
             catch (Exception error)
             {
-                Swallow.Log(error);
+                CoopLog.Swallow(error);
             }
 
             if (string.IsNullOrEmpty(_startSceneName))

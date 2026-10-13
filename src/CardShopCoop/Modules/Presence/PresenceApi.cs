@@ -4,6 +4,37 @@ using UnityEngine;
 
 namespace CardShopCoop.Modules.Presence
 {
+    /// <summary>One player in the session, for the window's roster. <see cref="Id"/> is the host's
+    /// canonical connection id (0 is the host on its own screen; 1 is the host as a client sees it).
+    /// </summary>
+    public readonly struct PresencePlayer
+    {
+        public PresencePlayer(int id, string name, bool isHost, bool isSelf)
+        {
+            Id = id;
+            Name = name;
+            IsHost = isHost;
+            IsSelf = isSelf;
+        }
+
+        public int Id
+        {
+            get;
+        }
+        public string Name
+        {
+            get;
+        }
+        public bool IsHost
+        {
+            get;
+        }
+        public bool IsSelf
+        {
+            get;
+        }
+    }
+
     /// <summary>
     /// Narrow, cutover-safe surface for other features. Trade and Deodorant should consume the
     /// host-side peer sample API; Register and UI should use only the camera/model/position calls
@@ -20,6 +51,23 @@ namespace CardShopCoop.Modules.Presence
 
         public static string PeerName(int connectionId)
             => Names.TryGetValue(connectionId, out var name) ? name : null;
+
+        /// <summary>Everyone in the session, host first, then this player, then the other clients.
+        /// Empty when no session is active. Allocates, so the window snapshots it once per layout.</summary>
+        public static IReadOnlyList<PresencePlayer> SessionPlayers
+        {
+            get
+            {
+                var host = PresenceHostBehaviour.Active;
+                if (host != null)
+                {
+                    return host.BuildPlayers();
+                }
+
+                var client = PresenceClientBehaviour.Active;
+                return client != null ? client.BuildPlayers() : Array.Empty<PresencePlayer>();
+            }
+        }
 
         internal static void ConfigureIdentity(Func<string> localName)
         {

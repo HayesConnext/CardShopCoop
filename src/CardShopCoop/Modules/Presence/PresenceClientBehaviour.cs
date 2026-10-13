@@ -15,6 +15,8 @@ namespace CardShopCoop.Modules.Presence
     {
         private static PresenceClientBehaviour _active;
         private readonly HashSet<int> _rosterIds = new();
+        // Host connection id -> display name, kept from the roster so the window can list players.
+        private readonly Dictionary<int, string> _rosterNames = new();
         private readonly HashSet<int> _modelIds = new();
         private CoopRuntimeContext _context;
         private PresenceService _service;
@@ -30,6 +32,33 @@ namespace CardShopCoop.Modules.Presence
 
         internal bool IsLocalConnection(int connectionId)
             => _selfId > 0 && connectionId == _selfId;
+
+        /// <summary>The session roster for the window: the host first (id 1 from a client's view),
+        /// then this player, then the other clients in id order.</summary>
+        internal IReadOnlyList<PresencePlayer> BuildPlayers()
+        {
+            var players = new List<PresencePlayer>(_rosterIds.Count + 2);
+            var hostName = PresenceApi.PeerName(1);
+            players.Add(new PresencePlayer(1,
+                string.IsNullOrEmpty(hostName) ? "Host" : hostName, true, false));
+
+            if (_selfId > 0)
+            {
+                players.Add(new PresencePlayer(_selfId, PresenceApi.LocalPlayerName, false, true));
+            }
+
+            var ids = new List<int>(_rosterIds);
+            ids.Sort();
+            for (var i = 0; i < ids.Count; i++)
+            {
+                var id = ids[i];
+                var name = _rosterNames.TryGetValue(id, out var stored) ? stored : null;
+                players.Add(new PresencePlayer(id,
+                    string.IsNullOrEmpty(name) ? "Player " + id : name, false, false));
+            }
+
+            return players;
+        }
 
         private void OnEnable()
         {
@@ -127,6 +156,7 @@ namespace CardShopCoop.Modules.Presence
 
                 seen.Add(entry.Id);
                 _rosterIds.Add(entry.Id);
+                _rosterNames[entry.Id] = entry.Name;
                 _service.SetName(1000 + entry.Id, entry.Name);
             }
 
@@ -142,6 +172,7 @@ namespace CardShopCoop.Modules.Presence
             foreach (var id in stale)
             {
                 _rosterIds.Remove(id);
+                _rosterNames.Remove(id);
                 _service.Remove(1000 + id);
             }
 
@@ -168,6 +199,7 @@ namespace CardShopCoop.Modules.Presence
             if (message.Kind == PresenceEntityDeltaKind.Remove)
             {
                 _rosterIds.Remove(message.Id);
+                _rosterNames.Remove(message.Id);
                 _service.Remove(avatarId);
                 return;
             }
@@ -178,6 +210,7 @@ namespace CardShopCoop.Modules.Presence
             }
 
             _rosterIds.Add(message.Id);
+            _rosterNames[message.Id] = message.Entry.Name;
             _service.SetName(avatarId, message.Entry.Name);
         }
 
@@ -355,6 +388,7 @@ namespace CardShopCoop.Modules.Presence
 
             PresenceApi.ClearPeerNames();
             _rosterIds.Clear();
+            _rosterNames.Clear();
             _modelIds.Clear();
             _joined = false;
             _service?.ClearRemoteAvatars();
@@ -398,6 +432,7 @@ namespace CardShopCoop.Modules.Presence
             }
 
             _rosterIds.Clear();
+            _rosterNames.Clear();
             _modelIds.Clear();
             _joined = false;
             _modelPending = false;

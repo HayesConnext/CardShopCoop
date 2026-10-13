@@ -6,6 +6,7 @@ using CardShopCoop.Runtime;
 using CardShopCoop.Util;
 using HarmonyLib;
 using UnityEngine;
+using CardShopCoop.Api;
 
 namespace CardShopCoop.Modules.Staff
 {
@@ -22,10 +23,6 @@ namespace CardShopCoop.Modules.Staff
             AccessTools.Field(typeof(HireWorkerPanelUI), "m_IsHired");
         internal static readonly FieldInfo PanelIndex =
             AccessTools.Field(typeof(HireWorkerPanelUI), "m_Index");
-        internal static readonly FieldInfo PanelLevelRequired =
-            AccessTools.Field(typeof(HireWorkerPanelUI), "m_LevelRequired");
-        internal static readonly FieldInfo PanelHireFee =
-            AccessTools.Field(typeof(HireWorkerPanelUI), "m_TotalHireFee");
         internal static readonly FieldInfo PanelScreen =
             AccessTools.Field(typeof(HireWorkerPanelUI), "m_HireWorkerScreen");
         internal static readonly MethodInfo PanelEvaluateHired =
@@ -100,11 +97,6 @@ namespace CardShopCoop.Modules.Staff
             => IsAddressable(manager, index) && TryGetWorker(manager, index, out var worker)
                 && IsHired(index);
 
-        internal static bool IsValidTask(byte value)
-        {
-            return Enum.IsDefined(typeof(EWorkerTask), (EWorkerTask)value);
-        }
-
         internal static bool IsValidIntentTask(byte value)
         {
             var task = (EWorkerTask)value;
@@ -135,7 +127,7 @@ namespace CardShopCoop.Modules.Staff
                 }
                 catch (Exception exception)
                 {
-                    Swallow.Log(exception);
+                    CoopLog.Swallow(exception);
                 }
             }
 

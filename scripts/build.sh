@@ -6,12 +6,12 @@
 #   scripts/build.sh
 #
 # Requires the game assemblies (GamePath / CARDSHOP_GAMEPATH) for compilation. Produces:
-#   dist/CardShopCoop-<version>.zip                  GitHub release / manual install
-#   dist/CardShopCoop.Api-<version>.zip              API-only package
-#   dist/CardShopCoop.ExternalModInterop.zip         Custom TV bundle
-#   dist/CardShopCoop.SampleMod-src-<version>.zip    Example-mod source (Nexus "miscellaneous")
-#   dist/thunderstore/...                            Thunderstore packages (see scripts/thunderstore-package.sh)
-#   dist/nexus/...                                   Nexus Mods packages   (see scripts/nexus-package.sh)
+#   dist/CardShopCoop.zip                       GitHub release / manual install
+#   dist/CardShopCoop.Api.zip                   API-only package
+#   dist/CardShopCoop.ExternalModInterop.zip    Custom TV bundle
+#   dist/CardShopCoop.SampleMod.zip             Example-mod source (Nexus "miscellaneous")
+#   dist/thunderstore/...                       Thunderstore packages (see scripts/thunderstore-package.sh)
+#   dist/nexus/...                              Nexus Mods packages   (see scripts/nexus-package.sh)
 #
 # Publishing is separate: scripts/publish-github.sh and scripts/publish-thunderstore.sh.
 set -euo pipefail
@@ -34,17 +34,17 @@ dotnet build src/CardShopCoop.Api/CardShopCoop.Api.csproj -c Release -p:Package=
 dotnet build src/CardShopCoop/CardShopCoop.csproj -c Release -p:Deploy=false -p:Package=true --no-restore
 dotnet build src/CardShopCoop.CustomTv/CardShopCoop.CustomTv.csproj -c Release -p:Deploy=false -p:Package=true
 
-cp "src/CardShopCoop/bin/Release/CardShopCoop-${version}.zip" dist/
-cp "src/CardShopCoop.Api/bin/Release/CardShopCoop.Api-${version}.zip" dist/
+cp "src/CardShopCoop/bin/Release/CardShopCoop.zip" dist/
+cp "src/CardShopCoop.Api/bin/Release/CardShopCoop.Api.zip" dist/
 cp "src/CardShopCoop.CustomTv/bin/Release/CardShopCoop.ExternalModInterop.zip" dist/
 
 # Example-mod source, tracked files only (for a Nexus "miscellaneous" file). git archive excludes
 # bin/obj and anything else not committed.
 git archive --format=zip --prefix=CardShopCoop.SampleMod/ \
-  -o "dist/CardShopCoop.SampleMod-src-${version}.zip" HEAD:samples/CardShopCoop.SampleMod
+  -o "dist/CardShopCoop.SampleMod.zip" HEAD:samples/CardShopCoop.SampleMod
 
 bash scripts/thunderstore-package.sh "$version"
-bash scripts/nexus-package.sh "$version"
+bash scripts/nexus-package.sh
 
 echo
 echo "All packages:"

@@ -40,10 +40,15 @@ namespace CardShopCoop.Modules.World
             => PlacementIdentity.TryMakeBoxableFurnitureEntityId(obj, worldEpoch, out entityId,
                 WorldHostBehaviour.Active != null);
 
+        /// <summary>Resolves the exact furniture a stable entity id names. <paramref name="requireTypeMatch"/>
+        /// is true when the caller's type is authoritative (a peer materializing a host descriptor); it
+        /// is FALSE for a client→host request, whose carried type is only the SENDER's local value and
+        /// may be a coalesced equivalent, so the stable id alone identifies the object.</summary>
         public static bool TryResolveBoxableFurnitureEntityId(string entityId, long worldEpoch,
-            EObjectType expectedType, out InteractableObject result, bool requireUnboxed = false)
+            EObjectType expectedType, out InteractableObject result, bool requireUnboxed = false,
+            bool requireTypeMatch = true)
             => PlacementIdentity.TryResolveBoxableFurnitureEntityId(entityId, worldEpoch,
-                expectedType, out result, requireUnboxed);
+                expectedType, out result, requireUnboxed, requireTypeMatch);
 
         /// <summary>Creates the exact boxed furniture a host entity id names, through the game's
         /// factory, and binds that identity to it. Used when an authoritative box descriptor
@@ -74,7 +79,16 @@ namespace CardShopCoop.Modules.World
     internal static class PlacementInterop
     {
         internal const int NoType = int.MinValue;
-        internal static event Action<int> StructureChanged;
+        // Raised from inside the placement/box apply paths that its own subscribers drive, so it is
+        // coalesced: a nested change is delivered after the current delivery instead of recursing
+        // back into the subscriber that caused it. See CoalescedEvent.
+        private static readonly CoalescedEvent<int> StructureChangedEvent = new();
+
+        internal static event Action<int> StructureChanged
+        {
+            add => StructureChangedEvent.Handlers += value;
+            remove => StructureChangedEvent.Handlers -= value;
+        }
 
         private static readonly FieldInfo FiMoveValid = AccessTools.Field(
             typeof(InteractableObject), "m_IsMovingObjectValidState");
@@ -168,7 +182,7 @@ namespace CardShopCoop.Modules.World
         {
             try
             {
-                StructureChanged?.Invoke(kind);
+                StructureChangedEvent.Raise(kind);
             }
             catch (Exception error)
             {
@@ -513,7 +527,8 @@ namespace CardShopCoop.Modules.World
         }
 
         internal static bool TryResolveBoxableFurnitureEntityId(string entityId, long worldEpoch,
-            EObjectType expectedType, out InteractableObject result, bool requireUnboxed)
+            EObjectType expectedType, out InteractableObject result, bool requireUnboxed,
+            bool requireTypeMatch)
         {
             result = null;
             if (expectedType == EObjectType.None
@@ -530,7 +545,8 @@ namespace CardShopCoop.Modules.World
             }
 
             if (!TryResolve(PlacementInterop.FindShelfManager(), kind, ObjectIdFromObjectKey(key),
-                out result) || result.m_ObjectType != expectedType
+                out result)
+                || (requireTypeMatch && result.m_ObjectType != expectedType)
                 || (requireUnboxed && (result.GetIsBoxedUp() || result.GetIsMovingObject())))
             {
                 result = null;

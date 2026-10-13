@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using BepInEx;
 using Newtonsoft.Json;
+using CardShopCoop.Api;
 
 namespace CardShopCoop.Modules.Presence
 {
@@ -72,7 +73,7 @@ namespace CardShopCoop.Modules.Presence
                 }
                 catch (Exception cleanupError)
                 {
-                    Swallow.Log(cleanupError);
+                    CoopLog.Swallow(cleanupError);
                 }
             }
         }

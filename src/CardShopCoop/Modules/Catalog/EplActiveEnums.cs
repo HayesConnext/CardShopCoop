@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Reflection;
 using System.Text.RegularExpressions;
+using CardShopCoop.Api;
 
 namespace CardShopCoop.Modules.Catalog
 {
@@ -229,7 +230,7 @@ namespace CardShopCoop.Modules.Catalog
             }
             catch (Exception e)
             {
-                Swallow.Log(e);
+                CoopLog.Swallow(e);
                 return null;
             }
         }
@@ -312,7 +313,7 @@ namespace CardShopCoop.Modules.Catalog
             }
             catch (Exception e)
             {
-                Swallow.Log(e);
+                CoopLog.Swallow(e);
                 return null;
             }
         }
@@ -341,7 +342,7 @@ namespace CardShopCoop.Modules.Catalog
             }
             catch (Exception e)
             {
-                Swallow.Log(e);
+                CoopLog.Swallow(e);
                 return null;
             }
         }
@@ -362,7 +363,7 @@ namespace CardShopCoop.Modules.Catalog
                 }
                 catch (Exception e)
                 {
-                    Swallow.Log(e);
+                    CoopLog.Swallow(e);
                 }
             }
             return null;
@@ -393,7 +394,7 @@ namespace CardShopCoop.Modules.Catalog
                 }
                 catch (Exception e)
                 {
-                    Swallow.Log(e);
+                    CoopLog.Swallow(e);
                 }
             }
         }
@@ -421,7 +422,7 @@ namespace CardShopCoop.Modules.Catalog
             }
             catch (Exception e)
             {
-                Swallow.Log(e);
+                CoopLog.Swallow(e);
             }
         }
 
@@ -439,7 +440,7 @@ namespace CardShopCoop.Modules.Catalog
             }
             catch (Exception e)
             {
-                Swallow.Log(e);
+                CoopLog.Swallow(e);
             }
         }
 

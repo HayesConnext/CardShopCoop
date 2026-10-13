@@ -7,6 +7,7 @@ using System.Text;
 using HarmonyLib;
 using UnityEngine;
 using CardShopCoop.Net.Messages;
+using CardShopCoop.Api;
 
 namespace CardShopCoop.Modules.Catalog
 {
@@ -221,12 +222,12 @@ namespace CardShopCoop.Modules.Catalog
                     return t;
                 }
             }
-            catch (Exception e) { Swallow.Log(e); /* a lookup must never throw into a handshake, a probe or OnGUI */ }
+            catch (Exception e) { CoopLog.Swallow(e); /* a lookup must never throw into a handshake, a probe or OnGUI */ }
             try
             {
                 return HarmonyLib.AccessTools.TypeByName(typeName);
             }
-            catch (Exception e) { Swallow.Log(e); return null; }
+            catch (Exception e) { CoopLog.Swallow(e); return null; }
         }
 
         /// <summary>The enum types EPL mints custom ids into - exactly the six sections a live
@@ -327,7 +328,7 @@ namespace CardShopCoop.Modules.Catalog
 
                 return identity;
             }
-            catch (Exception e) { Swallow.Log(e); return new List<EnumKindIdentityDto>(); }
+            catch (Exception e) { CoopLog.Swallow(e); return new List<EnumKindIdentityDto>(); }
         }
 
         /// <summary>The canonical "Type:Name=Value" view of a typed identity, used only to hash it
@@ -385,7 +386,7 @@ namespace CardShopCoop.Modules.Catalog
             {
                 CoopPlugin.Log.LogInfo("enum identity source: " + source);
             }
-            catch (Exception e) { Swallow.Log(e); }
+            catch (Exception e) { CoopLog.Swallow(e); }
         }
 
         /// <summary>The typed identity resolved from the LOADED types, per kind, members sorted by
@@ -520,7 +521,7 @@ namespace CardShopCoop.Modules.Catalog
                     _eplLoaded = true;
                     break;
                 }
-                catch (Exception e) { Swallow.Log(e); /* a probe must never throw into a handshake or into OnGUI */ }
+                catch (Exception e) { CoopLog.Swallow(e); /* a probe must never throw into a handshake or into OnGUI */ }
             }
             if (!_eplLoaded)
             {
@@ -541,7 +542,7 @@ namespace CardShopCoop.Modules.Catalog
                         }
                     }
                 }
-                catch (Exception e) { Swallow.Log(e); /* same rule: a probe must never throw */ }
+                catch (Exception e) { CoopLog.Swallow(e); /* same rule: a probe must never throw */ }
             }
             if (_eplLoaded && !_eplLoadedLogged)
             {
@@ -550,7 +551,7 @@ namespace CardShopCoop.Modules.Catalog
                 {
                     CoopPlugin.Log.LogInfo("EnhancedPrefabLoader detected - a custom id registry is in play");
                 }
-                catch (Exception e) { Swallow.Log(e); }
+                catch (Exception e) { CoopLog.Swallow(e); }
             }
             return _eplLoaded;
         }
@@ -582,7 +583,7 @@ namespace CardShopCoop.Modules.Catalog
 
                 return File.Exists(EnumMarkerPath());
             }
-            catch (Exception e) { Swallow.Log(e); return false; }
+            catch (Exception e) { CoopLog.Swallow(e); return false; }
         }
 
         /// <summary>Undo a registry a previous build of this mod installed: put the player's OWN
@@ -644,7 +645,7 @@ namespace CardShopCoop.Modules.Catalog
                 {
                     File.Delete(EnumMarkerPath());
                 }
-                catch (Exception e) { Swallow.Log(e); }
+                catch (Exception e) { CoopLog.Swallow(e); }
                 message = "your card database was restored from backup - RESTART the game before loading your solo saves";
                 CoopPlugin.Log.LogInfo("enum restore: " + message + " (from " + Path.GetFileName(newest) + ")");
                 return true;

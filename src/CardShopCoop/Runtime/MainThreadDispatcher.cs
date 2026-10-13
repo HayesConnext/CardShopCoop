@@ -64,19 +64,6 @@ namespace CardShopCoop.Runtime
         /// <summary>Current session epoch. Capture it before handing work to another thread.</summary>
         public int Epoch => Volatile.Read(ref _epoch);
 
-        public bool IsRunning
-        {
-            get
-            {
-                lock (_lifecycleGate)
-                {
-                    return _running;
-                }
-            }
-        }
-
-        public int PendingCount => Math.Max(0, Volatile.Read(ref _pending));
-
         /// <summary>
         /// Starts a fresh session epoch and removes any work left by the previous owner.
         /// A producer holding the previous epoch can still enqueue only stale work; Drain
@@ -103,15 +90,6 @@ namespace CardShopCoop.Runtime
             {
                 _running = false;
                 _epoch = unchecked(_epoch + 1);
-                ClearUnsafe();
-            }
-        }
-
-        /// <summary>Removes queued work without changing the current epoch or running state.</summary>
-        public void Clear()
-        {
-            lock (_lifecycleGate)
-            {
                 ClearUnsafe();
             }
         }
@@ -157,15 +135,6 @@ namespace CardShopCoop.Runtime
                 _queue.Enqueue(new Work(epoch, stage ?? "unspecified", action, retryable));
                 _pending++;
                 return true;
-            }
-        }
-
-        /// <summary>Strict variant of TryEnqueue for callers that require admission.</summary>
-        public void Enqueue(string stage, Action action, bool retryable = false)
-        {
-            if (!TryEnqueue(stage, action, retryable))
-            {
-                throw new InvalidOperationException("MainThreadDispatcher is stopped or full.");
             }
         }
 

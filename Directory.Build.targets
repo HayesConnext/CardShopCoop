@@ -1,0 +1,32 @@
+<Project>
+
+  <PropertyGroup>
+    <!-- The "Deploy" solution configuration reaches every project as Configuration=Deploy (the
+         solution maps it that way, and Directory.Build.props keys the Deploy=true copy step off
+         it). The .NET SDK only defaults Optimize for the "Release" configuration, so WITHOUT this
+         a `-c Deploy` build compiles UNOPTIMIZED - a debug-grade plugin shipped by the documented
+         build command, contradicting AGENTS.md's "the Deploy configuration only changes where
+         output goes". Deploy is a release build that also copies into the game.
+
+         It lives in Directory.Build.targets, not Directory.Build.props: it must apply AFTER the
+         SDK's configuration defaults, and this file is auto-imported into every project so each
+         one (CardShopCoop, .Api, .Steam, .CustomTv, the sample) gets it. -->
+    <Optimize Condition="'$(Configuration)' == 'Deploy'">true</Optimize>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <!-- Where every project's Deploy copy drops its plugin. Defaults to GamePath, so a plain
+         `-c Deploy` (or `-p:Deploy=true`) is unchanged: build and deploy to the same install.
+
+         Override it to build against ONE install and deploy into ANOTHER - the case that matters
+         on this machine, where GamePath is the Steam install (the compile/reference root) but the
+         Xbox / Game Pass mirror is a different directory:
+             dotnet build src\CardShopCoop\CardShopCoop.csproj -c Release -p:Deploy=true ^
+                 -p:DeployPath="Z:\XboxApps\TCG Card Shop Simulator\Content"
+         Do NOT use -p:GamePath= for that: GamePath also feeds ManagedPath/BepInExPath, so the
+         build would compile against that install's assemblies. This file is imported AFTER
+         Directory.Build.props and Directory.Build.user.props, so GamePath is final here. -->
+    <DeployPath Condition="'$(DeployPath)' == ''">$(GamePath)</DeployPath>
+  </PropertyGroup>
+
+</Project>

@@ -48,7 +48,7 @@
   </ItemGroup>
 
   <Target Name="DeploySample" AfterTargets="Build" Condition="'$(DeploySample)' == 'true'">
-    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(GamePath)/BepInEx/plugins" />
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(DeployPath)/BepInEx/plugins" />
   </Target>
 
 </Project>

@@ -36,12 +36,5 @@ namespace CardShopCoop.Util
                 _windowStart = now;
             }
         }
-
-        internal static void Reset()
-        {
-            _frames = 0;
-            _windowStart = 0d;
-            _fps = 0d;
-        }
     }
 }

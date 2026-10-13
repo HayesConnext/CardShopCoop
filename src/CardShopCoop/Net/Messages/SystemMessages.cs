@@ -19,12 +19,10 @@ namespace CardShopCoop.Net.Messages
     }
 
     // ---------------------------------------------------------------- handshake
-    // Every field below is in WIRE ORDER, and each Serialize/Deserialize pair is the
-    // single source of truth for its message's byte layout. The same shape is produced
-    // and consumed by CoopCore (SendHello / SendWorldTo / the DTO-type switch in
-    // Dispatch); these DTOs are the typed mirror of those payloads.
+    // Every field below is in WIRE ORDER. The layout is owned by the handshake codec, not by
+    // these declarations: they are the typed shape the codec reads and writes.
 
-    /// <summary>client -> host. See CoopCore.SendHello and case HelloMessage.</summary>
+    /// <summary>client -> host.</summary>
     [NetworkMessage]
     public sealed class HelloMessage : INetMessage
     {
@@ -45,13 +43,17 @@ namespace CardShopCoop.Net.Messages
         public byte[] MessageReliability = new byte[0];
     }
 
-    /// <summary>host -> client. See CoopCore.SendWorldTo and case WelcomeMessage.</summary>
+    /// <summary>host -> client.</summary>
     [NetworkMessage]
     public sealed class WelcomeMessage : INetMessage
     {
         public int WireVersion;
         public string Version;
         public string HostName;
+        // The host's own game/Unity build, so a cross-build client can SHOW what it joined. The
+        // client already sends its build in Hello; this is the host's reply.
+        public string GameVersion;
+        public string UnityVersion;
         public int SaveLength;
         public int BundleLength;
         public bool SidecarsComplete;

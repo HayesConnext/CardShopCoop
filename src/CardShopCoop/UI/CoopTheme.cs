@@ -1,3 +1,4 @@
+﻿using System;
 using UnityEngine;
 
 namespace CardShopCoop.UI
@@ -13,7 +14,7 @@ namespace CardShopCoop.UI
     ///
     /// Public surface used by CoopUI:
     ///   CoopTheme.EnsureBuilt();                       // call early in OnGUI
-    ///   CoopTheme.Window / Label / ButtonPrimary / ...  // GUIStyle fields
+    ///   CoopTheme.Window / Label / ButtonSecondary / ...  // GUIStyle fields
     ///   CoopTheme.DrawWindowShadow(Rect win);          // soft drop shadow (screen space)
     ///   CoopTheme.DrawWindowChrome(Rect r, title, ver);// header strip + title + version
     ///   CoopTheme.Divider();                           // 1px horizontal rule
@@ -33,7 +34,6 @@ namespace CardShopCoop.UI
         public static readonly Color SectionBorder = Rgb(58, 63, 70);
         public static readonly Color Primary = Rgb(62, 158, 140);        // #3E9E8C
         public static readonly Color PrimaryHover = Rgb(71, 178, 158);        // #47B29E
-        public static readonly Color PrimaryActive = Rgb(54, 139, 123);        // #368B7B
         public static readonly Color Secondary = Rgb(48, 52, 58);
         public static readonly Color SecondaryHover = Rgb(59, 64, 71);
         public static readonly Color SecondaryBorder = Rgb(74, 80, 88);
@@ -47,22 +47,42 @@ namespace CardShopCoop.UI
 
         // ---- built styles (all created once in EnsureBuilt) -----------------------------
         public static GUIStyle Window, HeaderStrip, Header, HeaderVersion, SectionHeader;
-        public static GUIStyle Label, LabelDim, LabelDimMiddle, LabelDimWrap, LabelBold, LabelWrap, LabelDanger, LabelWarn;
+        public static GUIStyle Label, LabelDim, LabelDimWrap, LabelBold, LabelWrap, LabelDanger, LabelWarn;
         public static GUIStyle SectionBox, ContentPanel, ScrollView, ScrollContent, Toggle, Tab, TabSelected;
-        public static GUIStyle ButtonPrimary, ButtonSecondary, ButtonDanger;
+        public static GUIStyle Tooltip;
+
+        /// <summary>Font used for button glyphs, resolved from <see cref="IconFontNames"/> against the
+        /// fonts actually installed. Null when this machine has none of them, in which case
+        /// <see cref="IconGlyph"/> hands out nothing and callers fall back to words.</summary>
+        public static Font IconFont;
+
+        /// <summary>Small square button that draws a single glyph, for field actions that would
+        /// otherwise be a word each.</summary>
+        public static GUIStyle IconButton;
+        public static GUIStyle ButtonSecondary, ButtonDanger;
+
+        /// <summary>Twins of the buttons above with the right margin removed, for the LAST control in
+        /// a row. A margin is invisible space, so a trailing one leaves that control's right edge short
+        /// of the inputs it is meant to line up with.</summary>
+        public static GUIStyle ButtonSecondaryFlush, IconButtonFlush;
+
+        /// <summary>The start/stop twins of <see cref="IconButton"/>: a glyph button in the success
+        /// colour for starting and the danger colour for stopping, so the one control in a container
+        /// header reads at a glance.</summary>
+        public static GUIStyle IconButtonStart, IconButtonDanger;
         public static GUIStyle TextField;
-        public static GUIStyle ChipSuccess, ChipWarn, ChipDanger, ChipInfo;
+        public static GUIStyle ChipSuccess, ChipWarn, ChipInfo;
         public static GUIStyle HudPill, HudPillBig;
-        public static GUIStyle RowEven, RowOdd;
 
         // ---- cached textures ------------------------------------------------------------
         private static Texture2D _panelTex, _headerTex, _shadowTex, _fieldTex, _fieldFocusTex,
             _sectionTex, _contentTex, _tabTex, _tabHoverTex, _tabSelectedTex, _dotOffTex, _dotWaitTex, _dotOkTex,
-            _dividerTex, _rowEvenTex, _rowOddTex, _hudTex;
-        private static Texture2D _primaryTex, _primaryHoverTex, _primaryActiveTex;
+            _dividerTex, _hudTex;
         private static Texture2D _secondaryTex, _secondaryHoverTex, _secondaryActiveTex;
         private static Texture2D _dangerTex, _dangerHoverTex, _dangerActiveTex;
-        private static Texture2D _chipSuccessTex, _chipWarnTex, _chipDangerTex, _chipInfoTex;
+        private static Texture2D _successTex, _successHoverTex, _successActiveTex;
+        private static Texture2D _chipSuccessTex, _chipWarnTex, _chipInfoTex;
+        private static Texture2D _crownTex;   // baked crown for the host's roster row
 
         private static bool _built;
 
@@ -72,6 +92,7 @@ namespace CardShopCoop.UI
         private const int SecTex = 20, SecRadius = 8;
         private const int PillTex = 20, PillRadius = 8;
         private const int HudTexSz = 32, HudRadius = 14;
+        public const int CrownSize = 18;   // baked crown icon for the host's roster row
 
         public static void EnsureBuilt()
         {
@@ -96,14 +117,9 @@ namespace CardShopCoop.UI
             _dotOffTex = MakeRounded(16, 16, 8, TextDim, TextDim, 0);
             _dotWaitTex = MakeRounded(16, 16, 8, Warn, Warn, 0);
             _dotOkTex = MakeRounded(16, 16, 8, Success, Success, 0);
+            _crownTex = MakeCrown(CrownSize, Warn);
             _dividerTex = Solid(DividerCol);
-            _rowEvenTex = Solid(Rgb(255, 255, 255, 0.28f));
-            _rowOddTex = Solid(Rgb(120, 110, 90, 0.10f));
             _hudTex = MakeRounded(HudTexSz, HudTexSz, HudRadius, HudBg, HudBg, 0);
-
-            _primaryTex = MakeRounded(CtlTex, CtlTex, CtlRadius, Primary, Mul(Primary, 0.85f), 1);
-            _primaryHoverTex = MakeRounded(CtlTex, CtlTex, CtlRadius, PrimaryHover, Mul(PrimaryHover, 0.85f), 1);
-            _primaryActiveTex = MakeRounded(CtlTex, CtlTex, CtlRadius, PrimaryActive, Mul(PrimaryActive, 0.85f), 1);
 
             _secondaryTex = MakeRounded(CtlTex, CtlTex, CtlRadius, Secondary, SecondaryBorder, 1);
             _secondaryHoverTex = MakeRounded(CtlTex, CtlTex, CtlRadius, SecondaryHover, SecondaryBorder, 1);
@@ -113,9 +129,12 @@ namespace CardShopCoop.UI
             _dangerHoverTex = MakeRounded(CtlTex, CtlTex, CtlRadius, Lerp(Danger, Color.white, 0.10f), Mul(Danger, 0.85f), 1);
             _dangerActiveTex = MakeRounded(CtlTex, CtlTex, CtlRadius, Mul(Danger, 0.88f), Mul(Danger, 0.80f), 1);
 
+            _successTex = MakeRounded(CtlTex, CtlTex, CtlRadius, Success, Mul(Success, 0.85f), 1);
+            _successHoverTex = MakeRounded(CtlTex, CtlTex, CtlRadius, Lerp(Success, Color.white, 0.10f), Mul(Success, 0.85f), 1);
+            _successActiveTex = MakeRounded(CtlTex, CtlTex, CtlRadius, Mul(Success, 0.88f), Mul(Success, 0.80f), 1);
+
             _chipSuccessTex = MakeRounded(PillTex, PillTex, PillRadius, WithA(Success, 0.18f), WithA(Success, 0.55f), 1);
             _chipWarnTex = MakeRounded(PillTex, PillTex, PillRadius, WithA(Warn, 0.18f), WithA(Warn, 0.55f), 1);
-            _chipDangerTex = MakeRounded(PillTex, PillTex, PillRadius, WithA(Danger, 0.18f), WithA(Danger, 0.55f), 1);
             _chipInfoTex = MakeRounded(PillTex, PillTex, PillRadius, WithA(Primary, 0.18f), WithA(Primary, 0.55f), 1);
 
             // ---- styles -------------------------------------------------------------
@@ -172,10 +191,6 @@ namespace CardShopCoop.UI
             LabelDim = new GUIStyle(GUI.skin.label) { richText = true, fontSize = 11 };
             LabelDim.normal.textColor = TextDim;
 
-            // LabelDim, but vertically centred inside a taller row (the copy rows give it the
-            // button height). Labels default to upper-left, which is what looked off.
-            LabelDimMiddle = new GUIStyle(LabelDim) { alignment = TextAnchor.MiddleLeft };
-
             LabelBold = new GUIStyle(GUI.skin.label) { richText = true, fontSize = 12, fontStyle = FontStyle.Bold };
             LabelBold.normal.textColor = Text;
 
@@ -202,6 +217,18 @@ namespace CardShopCoop.UI
                 margin = new RectOffset(0, 0, 4, 4)
             };
             SectionBox.normal.background = _sectionTex;
+
+            // Hover tooltips (shown by the UI only after the pointer has rested on a control).
+            Tooltip = new GUIStyle(GUI.skin.box)
+            {
+                richText = true,
+                fontSize = 11,
+                wordWrap = true,
+                padding = new RectOffset(6, 6, 5, 5),
+                border = new RectOffset(SecRadius, SecRadius, SecRadius, SecRadius)
+            };
+            Tooltip.normal.background = _sectionTex;
+            Tooltip.normal.textColor = Text;
 
             ContentPanel = new GUIStyle(GUI.skin.box)
             {
@@ -231,9 +258,77 @@ namespace CardShopCoop.UI
             Toggle = new GUIStyle(GUI.skin.toggle) { richText = true, fontSize = 12 };
             SetTextColorAllStates(Toggle, Text);
 
-            ButtonPrimary = MakeButton(_primaryTex, _primaryHoverTex, _primaryActiveTex, Color.white);
             ButtonSecondary = MakeButton(_secondaryTex, _secondaryHoverTex, _secondaryActiveTex, Text);
             ButtonDanger = MakeButton(_dangerTex, _dangerHoverTex, _dangerActiveTex, Color.white);
+
+            // Action icons. These are button STYLES, so they must be cloned from a button that
+            // already exists - cloning ButtonSecondary before it was built produced an unstyled
+            // (default-constructed) style with no background and no text colour, which is exactly
+            // what a bare, wrongly-coloured glyph in the row looks like.
+            //
+            // The glyph itself needs a font the IMGUI default does not have: Arial covers none of
+            // these code points, and Unity cannot tell us at runtime whether a font covers a glyph
+            // (Font.HasCharacter returns true for every dynamic font), so guessing a font would be a
+            // silent missing-glyph box. If no icon font is installed, IconGlyph hands out nothing and
+            // the buttons say their words instead.
+            IconFont = FindIconFont();
+            if (IconFont == null)
+            {
+                // Once, at startup: from here on the buttons quietly read as words, and this is the
+                // answer to "why are there no icons".
+                CoopPlugin.Log?.LogInfo("No icon font installed (tried "
+                    + string.Join(", ", IconFontNames)
+                    + "); backend action buttons will show their labels instead of icons.");
+            }
+            else
+            {
+                CoopPlugin.Log?.LogInfo("Backend action icons will use " + IconFont.name + ".");
+            }
+
+            IconButton = new GUIStyle(ButtonSecondary)
+            {
+                fontSize = IconGlyphSize,
+                fontStyle = FontStyle.Normal, // an icon font has no bold face to ask for
+                padding = new RectOffset(0, 0, 0, 0)
+            };
+            if (IconFont != null)
+            {
+                IconButton.font = IconFont;
+                CentreGlyphInk(IconButton, GlyphRefresh);
+            }
+
+            ButtonSecondaryFlush = new GUIStyle(ButtonSecondary)
+            {
+                margin = new RectOffset(ButtonSecondary.margin.left, 0,
+                    ButtonSecondary.margin.top, ButtonSecondary.margin.bottom)
+            };
+            IconButtonFlush = new GUIStyle(IconButton)
+            {
+                margin = new RectOffset(IconButton.margin.left, 0,
+                    IconButton.margin.top, IconButton.margin.bottom)
+            };
+            IconButtonDanger = new GUIStyle(ButtonDanger)
+            {
+                fontSize = IconGlyphSize,
+                fontStyle = FontStyle.Normal,
+                padding = new RectOffset(0, 0, 0, 0)
+            };
+
+            // Green for go, so a container header reads at a glance: play green, stop red.
+            var success = MakeButton(_successTex, _successHoverTex, _successActiveTex, Color.white);
+            IconButtonStart = new GUIStyle(success)
+            {
+                fontSize = IconGlyphSize,
+                fontStyle = FontStyle.Normal,
+                padding = new RectOffset(0, 0, 0, 0)
+            };
+            if (IconFont != null)
+            {
+                IconButtonDanger.font = IconFont;
+                CentreGlyphInk(IconButtonDanger, GlyphStop);
+                IconButtonStart.font = IconFont;
+                CentreGlyphInk(IconButtonStart, GlyphPlay);
+            }
 
             TextField = new GUIStyle(GUI.skin.textField)
             {
@@ -250,7 +345,6 @@ namespace CardShopCoop.UI
 
             ChipSuccess = MakeChip(_chipSuccessTex, Success);
             ChipWarn = MakeChip(_chipWarnTex, Mul(Warn, 0.92f));
-            ChipDanger = MakeChip(_chipDangerTex, Danger);
             // Info chips use the teal accent like the other chips use their hue; the old
             // HeaderBg text was near-black on a near-black background and unreadable.
             ChipInfo = MakeChip(_chipInfoTex, PrimaryHover);
@@ -276,9 +370,6 @@ namespace CardShopCoop.UI
             };
             HudPillBig.normal.background = _hudTex;
             HudPillBig.normal.textColor = Color.white;
-
-            RowEven = MakeRow(_rowEvenTex);
-            RowOdd = MakeRow(_rowOddTex);
         }
 
         // --------------------------------------------------------------------------------
@@ -456,18 +547,6 @@ namespace CardShopCoop.UI
             return s;
         }
 
-        private static GUIStyle MakeRow(Texture2D bg)
-        {
-            var s = new GUIStyle
-            {
-                padding = new RectOffset(8, 6, 4, 4),
-                margin = new RectOffset(0, 0, 1, 1),
-                border = new RectOffset(2, 2, 2, 2)
-            };
-            s.normal.background = bg;
-            return s;
-        }
-
         private static void SetTextColorAllStates(GUIStyle s, Color c)
         {
             s.normal.textColor = c;
@@ -566,6 +645,187 @@ namespace CardShopCoop.UI
         private static Texture2D Solid(Color c)
         {
             return Bake(1, 1, new[] { c });
+        }
+
+        // ---- action glyphs ---------------------------------------------------------------
+
+        private const int IconGlyphSize = 16;
+
+        /// <summary>Fonts tried, in order, for button glyphs. Both are Windows icon fonts that map the
+        /// same code points (E72C refresh, E8C8 copy): Segoe MDL2 Assets ships on every Windows 10
+        /// desktop, Segoe Fluent Icons on Windows 11 (and Windows 10 via updates). The name is looked
+        /// up in the installed fonts before use - CreateDynamicFontFromOSFont quietly falls back to the
+        /// default font when a name is missing, and that would draw a missing-glyph box, not an icon.</summary>
+        private static readonly string[] IconFontNames = { "Segoe Fluent Icons", "Segoe MDL2 Assets" };
+
+        // Code points, checked against both font files above. They are absent from Arial, which is
+        // what IMGUI uses by default, so the font is chosen rather than assumed.
+        private const string GlyphRefresh = "\uE72C"; // refresh arrow - generate / regenerate
+        private const string GlyphCopy = "\uE8C8";    // stacked sheets - copy
+        private const string GlyphPlay = "\uE768";    // play triangle - start
+        private const string GlyphStop = "\uE71A";    // stop square - stop
+
+        /// <summary>The first icon font actually installed, or null when this machine has none
+        /// (Proton, a trimmed Windows image, or someone who removed them).</summary>
+        private static Font FindIconFont()
+        {
+            var installed = Font.GetOSInstalledFontNames();
+            foreach (var wanted in IconFontNames)
+            {
+                foreach (var name in installed)
+                {
+                    if (!string.Equals(name, wanted, StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    var font = Font.CreateDynamicFontFromOSFont(wanted, 16);
+                    if (font == null)
+                    {
+                        continue;
+                    }
+
+                    font.hideFlags = HideFlags.HideAndDontSave; // survive scene loads
+                    return font;
+                }
+            }
+
+            return null;
+        }
+
+        /// <summary>An icon font draws its glyph sitting on the text baseline, so MiddleCenter centres
+        /// the LINE BOX (ascent plus descent) and the descent space the glyph never uses pushes the
+        /// icon visually high. Ask the font where the glyph's ink actually is and pad the style so the
+        /// ink, not the line box, lands in the middle of the button.</summary>
+        private static void CentreGlyphInk(GUIStyle style, string glyph)
+        {
+            if (string.IsNullOrEmpty(glyph))
+            {
+                return;
+            }
+
+            IconFont.RequestCharactersInTexture(glyph, IconGlyphSize, FontStyle.Normal);
+            if (!IconFont.GetCharacterInfo(glyph[0], out var info, IconGlyphSize)
+                || IconFont.ascent <= 0)
+            {
+                // No usable metrics: MiddleCenter is a reasonable fallback, and a nudge computed from
+                // numbers we do not trust would be worse than none.
+                return;
+            }
+
+            // Font has no descent property; it is whatever the line height has above the ascent.
+            var descent = Mathf.Max(0, IconFont.lineHeight - IconFont.ascent);
+
+            // Where the baseline sits relative to the line box centre, minus how far the ink's own
+            // centre sits above the baseline. Positive means the glyph renders low and must come up.
+            var inkMid = (info.minY + info.maxY) * 0.5f;
+            var shift = Mathf.RoundToInt((IconFont.ascent - descent) * 0.5f - inkMid);
+            if (shift == 0)
+            {
+                return;
+            }
+
+            if (Mathf.Abs(shift) > IconGlyphSize)
+            {
+                // Metrics that far out mean we read them in units we do not understand; leaving the
+                // glyph where it lands beats shoving it off the button.
+                CoopPlugin.Log?.LogWarning("Icon font metrics for " + IconFont.name + " look wrong ("
+                    + shift + "px at " + IconGlyphSize + "px); leaving the glyph un-nudged.");
+                return;
+            }
+
+            // Padding insets the CONTENT, so a top inset moves the glyph down and a bottom inset up.
+            style.padding = shift > 0
+                ? new RectOffset(0, 0, 0, shift)
+                : new RectOffset(0, 0, -shift, 0);
+        }
+
+        /// <summary>The glyph for a named action icon, or null when the UI has no artwork for that name
+        /// or this machine has no icon font to draw it with. Null means "use the action's words" - a
+        /// caller falls back rather than drawing a box.</summary>
+        public static string IconGlyph(string icon)
+        {
+            if (IconFont == null || string.IsNullOrEmpty(icon))
+            {
+                return null;
+            }
+
+            switch (icon)
+            {
+                case "refresh":
+                    return GlyphRefresh;
+                case "copy":
+                    return GlyphCopy;
+                case "play":
+                    return GlyphPlay;
+                case "stop":
+                    return GlyphStop;
+                default:
+                    return null;
+            }
+        }
+
+        /// <summary>The baked crown used to mark the host in the roster. Null only before the theme
+        /// has been built; callers guard on that.</summary>
+        public static Texture2D CrownTexture => _crownTex;
+
+        /// <summary>A small crown silhouette, filled from a normalized polygon with 4x4 supersampling
+        /// so the edges read cleanly at this size. No icon font carries a crown, so it is baked.</summary>
+        private static Texture2D MakeCrown(int size, Color fill)
+        {
+            // Normalized outline (y DOWN): left peak, valley, centre peak, valley, right peak, then
+            // down the right side, across the base and back up the left.
+            var poly = new[]
+            {
+                new Vector2(0.06f, 0.30f), new Vector2(0.28f, 0.58f), new Vector2(0.50f, 0.14f),
+                new Vector2(0.72f, 0.58f), new Vector2(0.94f, 0.30f), new Vector2(0.94f, 0.90f),
+                new Vector2(0.06f, 0.90f),
+            };
+
+            var px = new Color[size * size];
+            const int Ss = 4;
+            for (var y = 0; y < size; y++)
+            {
+                for (var x = 0; x < size; x++)
+                {
+                    var hits = 0;
+                    for (var sy = 0; sy < Ss; sy++)
+                    {
+                        for (var sx = 0; sx < Ss; sx++)
+                        {
+                            var u = (x + (sx + 0.5f) / Ss) / size;
+                            // Unity textures are bottom-up, so flip y to keep the crown upright.
+                            var v = 1f - (y + (sy + 0.5f) / Ss) / size;
+                            if (InPolygon(poly, u, v))
+                            {
+                                hits++;
+                            }
+                        }
+                    }
+
+                    var a = (float)hits / (Ss * Ss);
+                    px[y * size + x] = new Color(fill.r, fill.g, fill.b, fill.a * a);
+                }
+            }
+
+            return Bake(size, size, px);
+        }
+
+        /// <summary>Even-odd point-in-polygon (ray cast to the left).</summary>
+        private static bool InPolygon(Vector2[] poly, float x, float y)
+        {
+            var inside = false;
+            for (int i = 0, j = poly.Length - 1; i < poly.Length; j = i++)
+            {
+                if ((poly[i].y > y) != (poly[j].y > y)
+                    && x < (poly[j].x - poly[i].x) * (y - poly[i].y) / (poly[j].y - poly[i].y)
+                        + poly[i].x)
+                {
+                    inside = !inside;
+                }
+            }
+
+            return inside;
         }
 
         private static Texture2D Bake(int w, int h, Color[] px)

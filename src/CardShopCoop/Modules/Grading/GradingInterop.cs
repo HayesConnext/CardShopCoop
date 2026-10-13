@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Reflection;
 using BepInEx.Configuration;
 using CardShopCoop.Util;
+using CardShopCoop.Api;
 
 namespace CardShopCoop.Modules.Grading
 {
@@ -387,7 +388,7 @@ namespace CardShopCoop.Modules.Grading
                 }
                 catch (Exception error)
                 {
-                    Swallow.Log(error);
+                    CoopLog.Swallow(error);
                     return NoCompany;
                 }
             }
@@ -404,7 +405,7 @@ namespace CardShopCoop.Modules.Grading
                 }
                 catch (Exception error)
                 {
-                    Swallow.Log(error);
+                    CoopLog.Swallow(error);
                     return false;
                 }
             }
@@ -485,7 +486,7 @@ namespace CardShopCoop.Modules.Grading
             }
             catch (Exception error)
             {
-                Swallow.Log(error);
+                CoopLog.Swallow(error);
                 return card.cardGrade;
             }
         }
@@ -501,7 +502,7 @@ namespace CardShopCoop.Modules.Grading
             }
             catch (Exception error)
             {
-                Swallow.Log(error);
+                CoopLog.Swallow(error);
                 return encoded;
             }
         }
@@ -557,7 +558,7 @@ namespace CardShopCoop.Modules.Grading
             }
             catch (Exception error)
             {
-                Swallow.Log(error);
+                CoopLog.Swallow(error);
                 return false;
             }
         }
@@ -779,7 +780,7 @@ namespace CardShopCoop.Modules.Grading
             }
             catch (Exception error)
             {
-                Swallow.Log(error);
+                CoopLog.Swallow(error);
                 return false;
             }
         }
@@ -794,7 +795,7 @@ namespace CardShopCoop.Modules.Grading
             }
             catch (Exception error)
             {
-                Swallow.Log(error);
+                CoopLog.Swallow(error);
                 return false;
             }
         }
@@ -828,7 +829,7 @@ namespace CardShopCoop.Modules.Grading
             }
             catch (Exception error)
             {
-                Swallow.Log(error);
+                CoopLog.Swallow(error);
                 return false;
             }
 

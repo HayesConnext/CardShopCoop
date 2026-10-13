@@ -16,6 +16,17 @@ namespace CardShopCoop.Modules.SaveTransfer
             TryPatch(harmony, typeof(CGameManager), "SaveGameData",
                 prefix: new HarmonyMethod(typeof(SaveTransferPatches), nameof(SaveGuardPrefix)));
 
+            // The guest's borrowed world is injected here, BEFORE the game's own CSaveLoad.Load
+            // runs. This is the only load entry point (CGameManager.LoadData calls it first), and
+            // the ONLY cross-backend way to make it succeed: the public/Steam backend would read
+            // the JSON file the transfer wrote, but the Xbox/Gamecore backend reads its native
+            // store and would ignore that file, falling through to LoadBackupData ->
+            // CreateDefaultData and leaving the guest in a fresh tutorial. The prefix sets
+            // CSaveLoad.m_SavedGame from the received payload and reports success, so
+            // PropagateLoadData runs with the host's world on every backend.
+            TryPatch(harmony, typeof(CSaveLoad), "Load",
+                prefix: new HarmonyMethod(typeof(SaveTransferPatches), nameof(SaveLoadPrefix)));
+
             TryPatch(harmony, typeof(CustomerManager), "SaveCustomerData",
                 prefix: new HarmonyMethod(typeof(SaveTransferPatches), nameof(CustomerSaveGuardPrefix)));
 
@@ -48,6 +59,24 @@ namespace CardShopCoop.Modules.SaveTransfer
         internal static bool SaveGuardPrefix()
         {
             return SaveTransferRuntime.CanWriteSave;
+        }
+
+        /// <summary>
+        /// Guest-side borrowed-world load. Runs before the game's own <c>CSaveLoad.Load(slot)</c>:
+        /// when the transfer has armed the received world for this slot, deserialize it into
+        /// CSaveLoad.m_SavedGame and report the load successful (skipping the backend read that
+        /// would otherwise return false on the Xbox/Gamecore build). Falls through to the game's
+        /// own load when no world is armed, so an ordinary local load is untouched.
+        /// </summary>
+        internal static bool SaveLoadPrefix(int slotIndex, ref bool __result)
+        {
+            if (!SaveTransferStorage.TryInjectBorrowedWorld(slotIndex, out var loaded))
+            {
+                return true;
+            }
+
+            __result = loaded;
+            return false;
         }
 
         /// <summary>

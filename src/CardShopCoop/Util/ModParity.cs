@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Security.Cryptography;
 using System.Text;
+using CardShopCoop.Api;
 
 namespace CardShopCoop.Util
 {
@@ -34,7 +35,7 @@ namespace CardShopCoop.Util
             {
                 return PluginEntries();
             }
-            catch (Exception e) { Swallow.Log(e); return new List<string>(); }
+            catch (Exception e) { CoopLog.Swallow(e); return new List<string>(); }
         }
 
         private static List<string> PluginEntries()
@@ -201,12 +202,12 @@ namespace CardShopCoop.Util
                     return t;
                 }
             }
-            catch (Exception e) { Swallow.Log(e); }
+            catch (Exception e) { CoopLog.Swallow(e); }
             try
             {
                 return HarmonyLib.AccessTools.TypeByName(typeName);
             }
-            catch (Exception e) { Swallow.Log(e); return null; }
+            catch (Exception e) { CoopLog.Swallow(e); return null; }
         }
 
         private static string Sha1(string value)

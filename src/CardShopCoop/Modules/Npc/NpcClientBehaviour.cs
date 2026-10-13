@@ -29,14 +29,54 @@ namespace CardShopCoop.Modules.Npc
     {
         private static NpcClientBehaviour _active;
         internal static event Action<int, int, Customer> ExistingCustomerPuppetReady;
-        internal static event Action CustomerManagerReady;
-        internal static event Action WorkerManagerReady;
-        internal static event Action CustomerPoolChanged;
         internal static event Action<int> CustomerCapacityChanged;
         internal static event Action<int, int, Customer> ExistingCustomerChanged;
+        // The customer "something changed, re-check" signals are coalesced (see CoalescedEvent):
+        // they are raised from inside game calls that a subscriber's own apply drives
+        // (ActivateCustomer, attach/detach), so a plain event let that subscriber re-enter itself
+        // through this class and recurse.
+        private static readonly CoalescedEvent _customerManagerReady = new();
+        private static readonly CoalescedEvent _customerPoolChanged = new();
+        private static readonly CoalescedEvent _workerManagerReady = new();
+        // The per-slot signals name an index a subscriber acts on, so they cannot be folded into one
+        // delivery. They queue here and are delivered from the frame loop instead (see
+        // FlushPendingCustomerSignals): a subscriber that drives a call back into this class can only
+        // queue more, never re-enter.
+        private static readonly HashSet<int> _pendingCapacityChanged = new();
+        private static readonly Dictionary<int, ExistingCustomerChange> _pendingExistingCustomerChanged = new();
         private CoopRuntimeContext _context;
         private Harmony _harmony;
         private bool _shutdown;
+
+        private readonly struct ExistingCustomerChange
+        {
+            internal readonly int Generation;
+            internal readonly Customer Customer;
+
+            internal ExistingCustomerChange(int generation, Customer customer)
+            {
+                Generation = generation;
+                Customer = customer;
+            }
+        }
+
+        internal static event Action CustomerManagerReady
+        {
+            add => _customerManagerReady.Handlers += value;
+            remove => _customerManagerReady.Handlers -= value;
+        }
+
+        internal static event Action WorkerManagerReady
+        {
+            add => _workerManagerReady.Handlers += value;
+            remove => _workerManagerReady.Handlers -= value;
+        }
+
+        internal static event Action CustomerPoolChanged
+        {
+            add => _customerPoolChanged.Handlers += value;
+            remove => _customerPoolChanged.Handlers -= value;
+        }
 
         public int PuppetCount => _puppets.Count;
 
@@ -80,6 +120,37 @@ namespace CardShopCoop.Modules.Npc
             var inGame = _context.InGame();
             var delta = Time.deltaTime;
             TickPuppets(delta, inGame);
+            FlushPendingCustomerSignals();
+        }
+
+        /// <summary>Delivers the per-slot customer signals queued since the last frame. They are
+        /// delivered here rather than from the raise site so a subscriber that synchronously drives
+        /// a call back into this class can only queue more - an <see cref="Update"/> drain can never
+        /// be re-entered the way the raise path could. One frame's delay is invisible for a
+        /// "this slot changed, re-check" retry.</summary>
+        private static void FlushPendingCustomerSignals()
+        {
+            if (_pendingCapacityChanged.Count > 0)
+            {
+                var indexes = new List<int>(_pendingCapacityChanged);
+                _pendingCapacityChanged.Clear();
+                for (var i = 0; i < indexes.Count; i++)
+                {
+                    CustomerCapacityChanged?.Invoke(indexes[i]);
+                }
+            }
+
+            if (_pendingExistingCustomerChanged.Count > 0)
+            {
+                var changes = new List<KeyValuePair<int, ExistingCustomerChange>>(
+                    _pendingExistingCustomerChanged);
+                _pendingExistingCustomerChanged.Clear();
+                for (var i = 0; i < changes.Count; i++)
+                {
+                    ExistingCustomerChanged?.Invoke(changes[i].Key, changes[i].Value.Generation,
+                        changes[i].Value.Customer);
+                }
+            }
         }
 
         private void SuppressInitialPopulation(CustomerManager manager)
@@ -362,10 +433,10 @@ namespace CardShopCoop.Modules.Npc
                 return;
             }
 
-            CustomerManagerReady?.Invoke();
+            _customerManagerReady.Raise();
             ApplyPendingBaseline();
             ApplyPendingIdentities();
-            CustomerPoolChanged?.Invoke();
+            _customerPoolChanged.Raise();
         }
 
         private void SignalWorkerManagerReady()
@@ -375,7 +446,7 @@ namespace CardShopCoop.Modules.Npc
                 return;
             }
 
-            WorkerManagerReady?.Invoke();
+            _workerManagerReady.Raise();
             ApplyPendingBaseline();
             ApplyPendingIdentities();
 
@@ -497,7 +568,7 @@ namespace CardShopCoop.Modules.Npc
             private static bool Prefix(Customer __instance)
             {
                 _active?.TrackNativeRoot(__instance?.gameObject);
-                CustomerPoolChanged?.Invoke();
+                _customerPoolChanged.Raise();
                 return _active == null;
             }
         }
@@ -655,6 +726,8 @@ namespace CardShopCoop.Modules.Npc
             }
             _existing.Clear();
             ClearPuppets();
+            _pendingCapacityChanged.Clear();
+            _pendingExistingCustomerChanged.Clear();
             _now = 0f;
             _clockOffset = 0f;
             s_diagCm = null;
@@ -1596,8 +1669,9 @@ namespace CardShopCoop.Modules.Npc
             // The caller owns the real carrier it passes in: always take it off the scene.
             // A ready puppet was revealed above; if none exists yet, the next snapshot spawns it.
             DeactivateCustomerRoot(customer);
-            CustomerPoolChanged?.Invoke();
-            ExistingCustomerChanged?.Invoke(index, existing?.Generation ?? 0, customer);
+            _customerPoolChanged.Raise();
+            _pendingExistingCustomerChanged[index] =
+                new ExistingCustomerChange(existing?.Generation ?? 0, customer);
         }
 
         public static void AttachExistingCustomer(int index, int generation, Customer customer, bool keepPuppetVisible = false)
@@ -1647,8 +1721,9 @@ namespace CardShopCoop.Modules.Npc
             {
                 puppet.Go?.SetActive(!keepPuppetVisible);
             }
-            CustomerPoolChanged?.Invoke();
-            ExistingCustomerChanged?.Invoke(index, generation, customer);
+            _customerPoolChanged.Raise();
+            _pendingExistingCustomerChanged[index] =
+                new ExistingCustomerChange(generation, customer);
         }
 
         public static bool IsExistingCustomer(Customer customer)
@@ -1745,8 +1820,8 @@ namespace CardShopCoop.Modules.Npc
                 // silently grown slot left that state stranded. A customer's identity can reach
                 // the host's incremental scan after its counter trade offer, so this is the only
                 // signal the guest gets that the slot its offer refers to now exists.
-                CustomerPoolChanged?.Invoke();
-                CustomerCapacityChanged?.Invoke(index);
+                _customerPoolChanged.Raise();
+                _pendingCapacityChanged.Add(index);
             }
         }
 
@@ -1771,8 +1846,8 @@ namespace CardShopCoop.Modules.Npc
 
             if (grew)
             {
-                CustomerPoolChanged?.Invoke();
-                CustomerCapacityChanged?.Invoke(capacity - 1);
+                _customerPoolChanged.Raise();
+                _pendingCapacityChanged.Add(capacity - 1);
             }
         }
 

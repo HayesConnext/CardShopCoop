@@ -2,6 +2,7 @@ using System;
 using System.Collections;
 using System.Reflection;
 using HarmonyLib;
+using CardShopCoop.Api;
 
 namespace CardShopCoop.Modules.SaveTransfer
 {
@@ -51,7 +52,7 @@ namespace CardShopCoop.Modules.SaveTransfer
             }
             catch (Exception e)
             {
-                Swallow.Log(e);
+                CoopLog.Swallow(e);
             }
 
             // When the screen is not instantiated yet, the game still has its fixed four-slot
@@ -74,7 +75,7 @@ namespace CardShopCoop.Modules.SaveTransfer
             }
             catch (Exception e)
             {
-                Swallow.Log(e);
+                CoopLog.Swallow(e);
                 return false;
             }
         }

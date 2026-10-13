@@ -11,9 +11,6 @@ namespace CardShopCoop.Api
     /// </summary>
     public static class CoopReflection
     {
-        private static readonly HashSet<string> Reported = new();
-        private static readonly object Gate = new();
-
         public static Type OptionalType(string typeName, string assemblyName)
         {
             var type = ResolveType(typeName, assemblyName);
@@ -154,12 +151,9 @@ namespace CardShopCoop.Api
         private static void Report(string kind, string name, bool required)
         {
             var key = (required ? "required:" : "optional:") + kind + ":" + name;
-            lock (Gate)
+            if (!CoopLog.First(key))
             {
-                if (!Reported.Add(key))
-                {
-                    return;
-                }
+                return;
             }
 
             var message = "coop api: reflection surface changed: " + kind + " " + name

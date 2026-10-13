@@ -6,6 +6,7 @@ using CardShopCoop.Net.Connection;
 using CardShopCoop.Runtime;
 using HarmonyLib;
 using UnityEngine;
+using CardShopCoop.Api;
 
 namespace CardShopCoop.Modules.Presence
 {
@@ -865,7 +866,7 @@ namespace CardShopCoop.Modules.Presence
             }
             catch (Exception error)
             {
-                Swallow.Log(error);
+                CoopLog.Swallow(error);
             }
 
             return 0;

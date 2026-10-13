@@ -5,6 +5,7 @@ using System.Reflection;
 using CardShopCoop.Runtime;
 using HarmonyLib;
 using UnityEngine;
+using CardShopCoop.Api;
 
 namespace CardShopCoop.Modules.World
 {
@@ -198,7 +199,7 @@ namespace CardShopCoop.Modules.World
             {
                 absolute = CPlayerData.GetCardPricePercentChange(cardIndex, expansionType, isDestiny);
             }
-            catch (Exception e) { Swallow.Log(e); return; }
+            catch (Exception e) { CoopLog.Swallow(e); return; }
             var key = ModCardKey(expansionType, cardIndex, isDestiny);
             s_modCardPending.TryGetValue(key, out var p);
             p.Expansion = expansionType;
@@ -632,7 +633,7 @@ namespace CardShopCoop.Modules.World
                     s_eplPctChange = save?.GetProperty("ItemPriceChangePercent", F);
                     s_eplAvgCost = save?.GetProperty("AverageItemCost", F);
                 }
-                catch (Exception e) { Swallow.Log(e); }
+                catch (Exception e) { CoopLog.Swallow(e); }
                 if (s_eplTryGet == null || s_eplItemDataProp == null || s_eplGenMarket == null
                     || s_eplGenCost == null || s_eplPctChange == null || s_eplAvgCost == null)
                 {
@@ -729,7 +730,7 @@ namespace CardShopCoop.Modules.World
                         }
                     }
                 }
-                catch (Exception e) { Swallow.Log(e); }
+                catch (Exception e) { CoopLog.Swallow(e); }
             }
             s_eplModdedCache = result;
             return result;

@@ -247,6 +247,26 @@ namespace CardShopCoop.Modules.Presence
             return _context != null && _context.PeerPresence.TryGet(connectionId, out presence);
         }
 
+        /// <summary>The session roster for the window: this host first, then each joined peer in id
+        /// order. Ids are the host's canonical connection ids (0 is this host).</summary>
+        internal IReadOnlyList<PresencePlayer> BuildPlayers()
+        {
+            var players = new List<PresencePlayer>(_joined.Count + 1);
+            players.Add(new PresencePlayer(0, PresenceApi.LocalPlayerName, true, true));
+
+            var ids = new List<int>(_joined);
+            ids.Sort();
+            for (var i = 0; i < ids.Count; i++)
+            {
+                var id = ids[i];
+                var name = _context?.PeerName?.Invoke(id);
+                players.Add(new PresencePlayer(id,
+                    string.IsNullOrEmpty(name) ? "Player " + id : name, false, false));
+            }
+
+            return players;
+        }
+
         internal void Shutdown()
         {
             if (_shutdown)

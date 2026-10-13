@@ -42,7 +42,12 @@ namespace CardShopCoop.Modules.SaveTransfer
     internal static class SaveTransferSidecars
     {
         internal const int MaxFiles = 4096;
-        internal const int MaxFileBytes = 16 * 1024 * 1024;
+        /// <summary>Per-file cap for a sidecar. It was 16 MiB, which silently dropped any bundled mod
+        /// asset larger than that: a 17.7 MB EnhancedPrefabLoader bundle is exactly what hit it, and the
+        /// outcome was a knowingly PARTIAL transfer rather than a failure - the join then stalled on the
+        /// missing data. Raised to 256 MiB. The wire is unaffected, because the payload is sliced into
+        /// fixed ChunkSize frames regardless, and the aggregate budget below still bounds the whole set.</summary>
+        internal const int MaxFileBytes = 256 * 1024 * 1024;
         internal const int MaxAggregateRawBytes = SaveTransferStorage.MaxSidecarRawBytes;
         private const int MaxWarningLength = 512;
         private const int MaxWarningDetails = 8;

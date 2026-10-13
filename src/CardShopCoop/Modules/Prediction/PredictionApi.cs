@@ -40,8 +40,18 @@ namespace CardShopCoop.Modules.Prediction
         private static bool _reconciling;
         private static int _applying;
 
+        // A retirement is a one-shot fact whose cleanup must run exactly once, so it is delivered
+        // through a queue that preserves every id: a handler that retires another prediction during
+        // this delivery queues it for the next pass instead of re-entering the publisher (which
+        // nested the cleanup handlers and could recurse). Delivery order is the retirement order.
+        private static readonly CoalescedQueue<Guid> Retired = new();
+
         /// <summary>Raised when a prediction leaves the tracker.</summary>
-        public static event Action<Guid> PredictionRetired;
+        public static event Action<Guid> PredictionRetired
+        {
+            add => Retired.Handlers += value;
+            remove => Retired.Handlers -= value;
+        }
 
         /// <summary>True while a rejection is being layered (undo/replay), so the hook code that
         /// forwards game changes can skip the changes this reconciliation itself performs.</summary>
@@ -277,7 +287,7 @@ namespace CardShopCoop.Modules.Prediction
             {
                 predictions.RemoveAt(index);
                 ById.Remove(prediction.Id);
-                PredictionRetired?.Invoke(prediction.Id);
+                Retired.Raise(prediction.Id);
 
                 for (var i = undo.Count - 1; i >= 0; i--)
                     undo[i].Undo();
@@ -346,7 +356,7 @@ namespace CardShopCoop.Modules.Prediction
         private static void Remove(Prediction prediction)
         {
             if (ById.Remove(prediction.Id))
-                PredictionRetired?.Invoke(prediction.Id);
+                Retired.Raise(prediction.Id);
             // A prediction still held back by a reconcile was never appended to a key list.
             if (Deferred.Remove(prediction))
                 return;

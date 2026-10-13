@@ -182,6 +182,7 @@ namespace CardShopCoop.Modules.SaveTransfer
         internal static void ResetForShutdown()
         {
             SetReloading(false);
+            SaveTransferStorage.ResetBorrowedWorld();
             if (CurrentRole != CoopRole.Client)
             {
                 SetGuestBorrowedWorld(false);

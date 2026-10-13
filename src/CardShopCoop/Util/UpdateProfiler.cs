@@ -5,6 +5,7 @@ using System.Linq;
 using System.Reflection;
 using HarmonyLib;
 using UnityEngine;
+using CardShopCoop.Api;
 
 namespace CardShopCoop.Util
 {
@@ -122,7 +123,7 @@ namespace CardShopCoop.Util
             }
             catch (Exception error)
             {
-                Swallow.Log(error);
+                CoopLog.Swallow(error);
             }
             _harmony = null;
             lock (StatsLock)

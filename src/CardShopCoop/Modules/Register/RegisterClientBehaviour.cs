@@ -83,7 +83,11 @@ namespace CardShopCoop.Modules.Register
         private bool _joined;
         private int _applyingRemote;
         private int _applyingPrediction;
-        private bool _applyingBaseline;
+        // A readiness pass is single-entry: applying a baseline or a deferred delta synchronously
+        // raises the Npc customer events (AttachExistingCustomer) that this module subscribes to,
+        // so a signal that arrives mid-pass is queued for the running pass instead of re-entered.
+        private bool _applyingPending;
+        private bool _readinessQueued;
         private bool _evaluatingCreditCard;
         private RegisterBaselineMessage _pendingBaseline;
         private readonly Dictionary<int, int> _owners = new();
@@ -171,7 +175,7 @@ namespace CardShopCoop.Modules.Register
         private void Joined(PeerConnection _)
         {
             _joined = true;
-            TryApplyPending();
+            OnReadinessSignal();
         }
 
         private bool IsSceneReady()
@@ -183,36 +187,47 @@ namespace CardShopCoop.Modules.Register
 
         private void OnReadinessSignal()
         {
-            if (_shutdown || !_context.InGame() || !IsSceneReady())
+            if (_shutdown)
             {
                 return;
             }
 
-            TryApplyPending();
-            foreach (var pair in new List<KeyValuePair<string, RegisterDeltaMessage>>(_deferredDeltas))
+            if (_applyingPending)
             {
-                if (ApplyDelta(pair.Value))
+                // Applying a baseline or a deferred delta synchronously raises the Npc customer
+                // PoolChanged/ExistingCustomerChanged events (Attach/DetachExistingCustomer) and
+                // this module subscribes to them. Re-entering here re-applied material the running
+                // pass still held - a deferred delta is only removed once its apply returns - which
+                // re-raised the event without bound and took the main thread down. Queue the signal
+                // and let the pass that owns the work run once more when it finishes.
+                _readinessQueued = true;
+                return;
+            }
+
+            _applyingPending = true;
+            try
+            {
+                do
                 {
-                    CoopPlugin.Log.LogInfo("[register] applied deferred delta kind="
-                        + pair.Value.Kind + " counter=" + pair.Value.CounterKey + " pred="
-                        + pair.Value.PredictionId);
-                    _deferredDeltas.Remove(pair.Key);
+                    _readinessQueued = false;
+                    if (!_context.InGame() || !IsSceneReady())
+                    {
+                        return;
+                    }
+
+                    ApplyPendingBaseline();
+                    DrainDeferredDeltas();
                 }
+                while (_readinessQueued);
+            }
+            finally
+            {
+                _applyingPending = false;
             }
         }
 
-        private void TryApplyPending()
+        private void ApplyPendingBaseline()
         {
-            if (_applyingBaseline)
-            {
-                // ApplyBaseline can synchronously raise the Npc customer
-                // PoolChanged/ExistingCustomerChanged events (Attach/DetachExistingCustomer) and
-                // this module subscribes to them. Re-entering here re-applied the still-pending
-                // baseline and could recurse without bound.
-                CoopPlugin.Log.LogDebug("[register] re-entrant baseline apply suppressed");
-                return;
-            }
-
             if (_pendingBaseline == null || !_context.InGame() || !IsSceneReady())
             {
                 return;
@@ -220,7 +235,6 @@ namespace CardShopCoop.Modules.Register
 
             var baseline = _pendingBaseline;
             _pendingBaseline = null;
-            _applyingBaseline = true;
             _applyingRemote++;
             try
             {
@@ -234,7 +248,35 @@ namespace CardShopCoop.Modules.Register
             finally
             {
                 _applyingRemote--;
-                _applyingBaseline = false;
+            }
+        }
+
+        /// <summary>Applies the deltas the register was not ready for. The pending set is taken out
+        /// before applying so a synchronous event raised by one of the applies can never re-apply
+        /// the entries this pass owns; anything still not applicable goes back for the next
+        /// signal.</summary>
+        private void DrainDeferredDeltas()
+        {
+            if (_deferredDeltas.Count == 0)
+            {
+                return;
+            }
+
+            var pending = new List<KeyValuePair<string, RegisterDeltaMessage>>(_deferredDeltas);
+            _deferredDeltas.Clear();
+            for (var i = 0; i < pending.Count; i++)
+            {
+                var pair = pending[i];
+                if (ApplyDelta(pair.Value))
+                {
+                    CoopPlugin.Log.LogInfo("[register] applied deferred delta kind="
+                        + pair.Value.Kind + " counter=" + pair.Value.CounterKey + " pred="
+                        + pair.Value.PredictionId);
+                }
+                else
+                {
+                    _deferredDeltas[pair.Key] = pair.Value;
+                }
             }
         }
 
@@ -263,7 +305,7 @@ namespace CardShopCoop.Modules.Register
         private void HandleBaseline(MessageContext _, RegisterBaselineMessage message)
         {
             _pendingBaseline = message;
-            TryApplyPending();
+            OnReadinessSignal();
         }
 
         [MessageHandler(typeof(RegisterDeltaMessage))]

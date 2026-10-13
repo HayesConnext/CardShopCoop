@@ -6,7 +6,9 @@ using BepInEx.Bootstrap;
 using CardShopCoop.Api;
 using CardShopCoop.Modules.Prediction;
 using CardShopCoop.Net;
+using CardShopCoop.Net.Networking;
 using CardShopCoop.Net.Protocol;
+using CardShopCoop.Util;
 
 namespace CardShopCoop.Runtime
 {
@@ -222,9 +224,20 @@ namespace CardShopCoop.Runtime
 
             foreach (var type in types)
             {
-                if (type != null && type.GetCustomAttribute<NetworkMessageAttribute>(false) != null)
+                // A contributed assembly can hold types that cannot load on this build (the Steam
+                // transport's SteamLobby, against the Game Pass stub). CanLoad probes defensively;
+                // reading the attribute of a type that cannot load is what used to fault.
+                if (!ReflectionSurface.CanLoad(type))
                 {
-                    return true;
+                    continue;
+                }
+
+                foreach (var attribute in ReflectionSurface.SafeAttributes(type))
+                {
+                    if (attribute is NetworkMessageAttribute)
+                    {
+                        return true;
+                    }
                 }
             }
 
@@ -246,12 +259,12 @@ namespace CardShopCoop.Runtime
             var wanted = typeof(CardShopCoop.Attributes.PersistentBehaviourAttribute).FullName;
             foreach (var type in types)
             {
-                if (type == null)
+                if (!ReflectionSurface.CanLoad(type))
                 {
                     continue;
                 }
 
-                foreach (var attribute in type.GetCustomAttributes(false))
+                foreach (var attribute in ReflectionSurface.SafeAttributes(type))
                 {
                     if (attribute != null && attribute.GetType().FullName == wanted)
                     {
@@ -287,5 +300,8 @@ namespace CardShopCoop.Runtime
 
         public void Rollback(ICoopContext context, int connectionId, Guid predictionId)
             => PredictionApi.Rollback(context, connectionId, predictionId);
+
+        public IDisposable RegisterNetworkingBackend(INetworkingBackend backend)
+            => NetworkingBackends.Register(backend);
     }
 }

@@ -48,6 +48,10 @@ namespace CardShopCoop.Modules.World
             _cardInteraction.Containers.SendOp = message => SendWorldCommand(1, message);
             _cardInteraction.Containers.InGameProvider = _context.InGame;
             _cardInteraction.Containers.ReloadingProvider = _context.PreloadHold;
+            // The join container baseline can name a placement the guest rebuilds only after it,
+            // so the container module holds those records until the placement layer reports the
+            // object. This is the same late-join signal PlayTable, Register and CardDisplay use.
+            PlacementApi.StructureChanged += OnPlacementStructureChanged;
             _harmony = new Harmony("dev.meepen.cardshopcoop.world.client");
             InstallBoxNetworkInteractionPatches();
             InstallPlayerBoxInteractionPatches();
@@ -67,6 +71,7 @@ namespace CardShopCoop.Modules.World
                 return;
 
             _shutdown = true;
+            PlacementApi.StructureChanged -= OnPlacementStructureChanged;
             UninstallPlayerBoxPresenceHook();
             ShutdownPlacementHold();
             ShutdownPlacement();
@@ -106,6 +111,11 @@ namespace CardShopCoop.Modules.World
             _warehouseShelfInteraction?.FlushClientState();
             FlushPlayerShelfState();
         }
+
+        /// <summary>The placement layer rebuilt or re-posed an object. Records the container
+        /// module deferred because their target did not exist yet can now be applied.</summary>
+        private void OnPlacementStructureChanged(int _)
+            => _cardInteraction?.Containers.FlushClientState();
 
         [OnFullyJoined]
         private void SendWorldReady(PeerConnection connection)

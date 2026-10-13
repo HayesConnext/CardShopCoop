@@ -67,13 +67,6 @@ namespace CardShopCoop.Net.Kcp
             errorCallback = onError;
         }
 
-        /// <summary>Convenience overload for callers that subscribe to events.</summary>
-        public KcpSession(KcpConfig config, bool isServer, uint cookie, Action<ArraySegment<byte>> rawSend,
-            uint initialTime)
-            : this(config, isServer, cookie, rawSend, null, null, null, null, initialTime)
-        {
-        }
-
         private static KcpConfig ValidateConfig(KcpConfig config)
         {
             if (config == null)
@@ -96,28 +89,14 @@ namespace CardShopCoop.Net.Kcp
             return cookie;
         }
 
-        /// <summary>True for the responder/server side of the cookie handshake.</summary>
-        public bool IsServer => isServer;
-
         /// <summary>True for the initiator/client side of the cookie handshake.</summary>
         public bool IsClient => !isServer;
 
-        public bool IsStarted => started;
         public bool IsAuthenticated => state == KcpState.Authenticated;
         public bool IsDisconnected => state == KcpState.Disconnected;
-        public KcpState State => state;
-
-        /// <summary>The currently accepted security cookie. Clients learn this from Hello.</summary>
-        public uint Cookie => cookie;
 
         /// <summary>The complete outer datagram size, including KCP metadata.</summary>
         public int Mtu => mtu;
-
-        /// <summary>Largest application payload on the reliable channel.</summary>
-        public new int ReliableMaxMessageSize => reliableMax;
-
-        /// <summary>Largest application payload on the unreliable channel.</summary>
-        public new int UnreliableMaxMessageSize => unreliableMax;
 
         // Friendly aliases matching kcp2k's original terminology.
         public int ReliableMax => reliableMax;
@@ -152,12 +131,6 @@ namespace CardShopCoop.Net.Kcp
             if (IsClient)
                 SendHello();
             return true;
-        }
-
-        /// <summary>Starts a session whose caller uses a zero-based monotonic clock.</summary>
-        public bool Start()
-        {
-            return Start(0);
         }
 
         public override void TickIncoming(uint now)
@@ -297,21 +270,6 @@ namespace CardShopCoop.Net.Kcp
             return foundHello;
         }
 
-        /// <summary>Array overload for transport adapters that already own a byte[].</summary>
-        public bool InputDatagram(byte[] datagram, int offset, int count)
-        {
-            if (datagram == null)
-                throw new ArgumentNullException(nameof(datagram));
-            return InputDatagram(new ArraySegment<byte>(datagram, offset, count));
-        }
-
-        public bool InputDatagram(byte[] datagram)
-        {
-            if (datagram == null)
-                throw new ArgumentNullException(nameof(datagram));
-            return InputDatagram(new ArraySegment<byte>(datagram));
-        }
-
         /// <summary>Queues an application payload for the requested KCP channel.</summary>
         public bool Send(ArraySegment<byte> data, KcpChannel channel)
         {
@@ -326,49 +284,14 @@ namespace CardShopCoop.Net.Kcp
             return SendData(data, channel);
         }
 
-        public bool Send(byte[] data, KcpChannel channel)
-        {
-            if (data == null)
-                throw new ArgumentNullException(nameof(data));
-            return Send(new ArraySegment<byte>(data), channel);
-        }
-
         public bool SendReliable(ArraySegment<byte> data)
         {
             return Send(data, KcpChannel.Reliable);
         }
 
-        public bool SendReliable(byte[] data)
-        {
-            if (data == null)
-                throw new ArgumentNullException(nameof(data));
-            return SendReliable(new ArraySegment<byte>(data));
-        }
-
-        public bool SendReliable(byte[] data, int offset, int count)
-        {
-            if (data == null)
-                throw new ArgumentNullException(nameof(data));
-            return SendReliable(new ArraySegment<byte>(data, offset, count));
-        }
-
         public bool SendUnreliable(ArraySegment<byte> data)
         {
             return Send(data, KcpChannel.Unreliable);
-        }
-
-        public bool SendUnreliable(byte[] data)
-        {
-            if (data == null)
-                throw new ArgumentNullException(nameof(data));
-            return SendUnreliable(new ArraySegment<byte>(data));
-        }
-
-        public bool SendUnreliable(byte[] data, int offset, int count)
-        {
-            if (data == null)
-                throw new ArgumentNullException(nameof(data));
-            return SendUnreliable(new ArraySegment<byte>(data, offset, count));
         }
 
         private bool RejectOversize(int actual, int limit, bool reliable)

@@ -53,11 +53,6 @@ namespace CardShopCoop.Net
         private readonly ConcurrentQueue<ReadyMessage> _incoming = new();
         private readonly object _incomingGate = new object();
         private readonly Queue<Pending> _delay = new();
-        internal int DelayCount => _delay.Count;
-        // The decorator deliberately knows only the transport contract, never Steam.
-        internal int InnerReassemblyCount => 0;
-        internal int InnerReliableOutboxCount => 0;
-        internal int InnerTransientOutboxCount => 0;
         private readonly Random _random = new();
         private bool _overflowWarned;
         private long _delayBytes;
@@ -106,13 +101,8 @@ namespace CardShopCoop.Net
             }
         }
 
-        public ConcurrentQueue<ConnectionEvent> Disconnects
-        {
-            get
-            {
-                return _inner.Disconnects;
-            }
-        }
+        public bool TryDequeueDisconnect(out ConnectionEvent disconnect)
+            => _inner.TryDequeueDisconnect(out disconnect);
 
         public event Action<PeerConnection> PeerConnected
         {

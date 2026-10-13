@@ -1,4 +1,5 @@
 using System;
+using CardShopCoop.Api;
 
 namespace CardShopCoop.Modules.Catalog
 {
@@ -51,7 +52,7 @@ namespace CardShopCoop.Modules.Catalog
             }
             catch (Exception error)
             {
-                Swallow.Log(error);
+                CoopLog.Swallow(error);
                 return null;
             }
         }

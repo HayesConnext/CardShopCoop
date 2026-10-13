@@ -74,6 +74,30 @@ namespace CardShopCoop.Net.Kcp
         private bool _disposed;
         private bool _resourcesDisposed;
         private int _nextHostConnectionId = 1;
+
+        /// <summary>Disjoint id band for this transport. A host running several backends at once
+        /// allocates each backend's peers from a different band so a PeerConnection.Id is never
+        /// handed out twice; <see cref="CoopTransportGroup"/> routes by which band an id falls in.
+        /// The default [1, int.MaxValue) leaves single-backend numbering exactly as it was.</summary>
+        private int _connectionIdBase = 1;
+        private int _connectionIdLimit = int.MaxValue;
+
+        /// <summary>Sets the id band before the transport is started. <paramref name="limitExclusive"/>
+        /// must be greater than <paramref name="baseId"/>.</summary>
+        internal void SetConnectionIdBand(int baseId, int limitExclusive)
+        {
+            if (baseId <= 0 || limitExclusive <= baseId)
+            {
+                throw new ArgumentOutOfRangeException(nameof(baseId));
+            }
+
+            lock (_gate)
+            {
+                _connectionIdBase = baseId;
+                _connectionIdLimit = limitExclusive;
+                _nextHostConnectionId = baseId;
+            }
+        }
         // When a disconnect carries a reason, hold the KCP close until the terminal frame is
         // acknowledged (or this grace elapses) so the peer receives the reason before the goodbye.
         private const int TerminalFrameAckGraceMs = 1000;
@@ -105,30 +129,13 @@ namespace CardShopCoop.Net.Kcp
         private int _framesThisPump;
         private readonly Queue<ConnectionEvent> _pendingDisconnectResults
             = new Queue<ConnectionEvent>();
+        public bool TryDequeueDisconnect(out ConnectionEvent disconnect) => Disconnects.TryDequeue(out disconnect);
+
         public ConcurrentQueue<ConnectionEvent> Disconnects
         {
             get;
         }
             = new ConcurrentQueue<ConnectionEvent>();
-
-        internal int PendingPeerSignalCount
-        {
-            get
-            {
-                lock (_gate)
-                    return _peerSignals.Count;
-            }
-        }
-        internal int PendingDisconnectRequestCount
-            => Math.Max(0, Volatile.Read(ref _disconnectRequestCount));
-        internal int PendingDisconnectResultCount
-        {
-            get
-            {
-                lock (_gate)
-                    return _pendingDisconnectResults.Count + Disconnects.Count;
-            }
-        }
 
         public event Action<PeerConnection> PeerConnected;
 
@@ -152,12 +159,6 @@ namespace CardShopCoop.Net.Kcp
                 return true;
             }
         }
-
-        /// <summary>Whether this manager creates responder sessions and host-side ids.</summary>
-        public bool IsHost => _isHost;
-
-        /// <summary>Configuration used to create every KCP session.</summary>
-        public KcpConfig Config => CopyConfig(_config);
 
         public double TimeoutSeconds => _config.Timeout / 1000.0;
 
@@ -199,17 +200,6 @@ namespace CardShopCoop.Net.Kcp
         {
         }
 
-        public KcpSessionManager(IDatagramTransport datagrams, bool isHost, KcpConfig config)
-            : this(datagrams, isHost, config, null)
-        {
-        }
-
-        public KcpSessionManager(IDatagramTransport datagrams, bool isHost,
-            KcpSessionManagerOptions options)
-            : this(datagrams, isHost, new KcpConfig(), options)
-        {
-        }
-
         public KcpSessionManager(IDatagramTransport datagrams, bool isHost,
             KcpConfig config, KcpSessionManagerOptions options)
         {
@@ -224,23 +214,6 @@ namespace CardShopCoop.Net.Kcp
             _datagrams.PeerClosed += OnPeerClosed;
             CoopPlugin.Log?.LogInfo("[net] datagram transport=" + _datagrams.GetType().Name
                 + " host=" + isHost);
-        }
-
-        public KcpSessionManager(bool isHost, IDatagramTransport datagrams)
-            : this(datagrams, isHost)
-        {
-        }
-
-        public KcpSessionManager(bool isHost, IDatagramTransport datagrams, KcpConfig config,
-            KcpSessionManagerOptions options = null)
-            : this(datagrams, isHost, config, options)
-        {
-        }
-
-        public KcpSessionManager(bool isHost, IDatagramTransport datagrams,
-            KcpSessionManagerOptions options)
-            : this(datagrams, isHost, new KcpConfig(), options)
-        {
         }
 
         /// <summary>
@@ -618,13 +591,14 @@ namespace CardShopCoop.Net.Kcp
         private void FanOut(INetMessage message, int? exceptConnectionId, string operation)
         {
             string failure = null;
+            var notRunning = false;
             List<SessionState> saturated = null;
             lock (_gate)
             {
                 if (!Volatile.Read(ref _started) || Volatile.Read(ref _stopRequested)
                     || Volatile.Read(ref _disposed))
                 {
-                    failure = "transport is not running";
+                    notRunning = true;
                 }
                 else
                 {
@@ -690,6 +664,26 @@ namespace CardShopCoop.Net.Kcp
                         }
                     }
                 }
+            }
+
+            if (notRunning)
+            {
+                // FAIL LOUD - ONCE. A broadcast or relay with no running transport has nobody to
+                // reach, so there is nothing to send and nothing to tear down, and the targeted-send
+                // path is unaffected. But that is not a reason to say nothing: the design here is
+                // fail-loud, and "a caller is broadcasting while the transport is not running" is
+                // exactly the symptom worth seeing in a log.
+                //
+                // An Error PER MESSAGE was the first version, and it buried the real failure under a
+                // flood from the presence and NPC modules. The fix for a flood is one report per
+                // session, not silence - silence is what removed the symptom from the log entirely.
+                if (CardShopCoop.Api.CoopLog.First("kcp.fanout.not-running"))
+                {
+                    LogError("KCP transport is not running; the " + operation
+                        + " was dropped (reported once per session)");
+                }
+
+                return;
             }
 
             if (failure != null)
@@ -1543,12 +1537,19 @@ namespace CardShopCoop.Net.Kcp
                 {
                     if (reliable)
                     {
+                        LogBudgetReport(state, "pending compact application queue budget exhausted",
+                            count);
                         DisconnectForProtocol(state,
                             "pending compact application queue budget exhausted");
                     }
-                    else
+                    else if (!state.CompactDropReported)
                     {
-                        LogWarning("KCP transient compact frame dropped while awaiting message-id activation");
+                        // Bounded to one line per session: the drop itself is expected while a peer
+                        // finishes activation, but a peer stuck before activation would otherwise
+                        // log once per compact frame.
+                        state.CompactDropReported = true;
+                        LogBudgetReport(state, "transient compact frame dropped while awaiting "
+                            + "message-id activation", count);
                     }
                 }
                 return;
@@ -1566,7 +1567,10 @@ namespace CardShopCoop.Net.Kcp
             if (!TryReserveDecodeBudget(count))
             {
                 if (reliable)
+                {
+                    LogBudgetReport(state, "incoming application queue budget exhausted", count);
                     DisconnectForProtocol(state, "incoming application queue budget exhausted");
+                }
                 // Never evict an older reliable message merely because a transient update arrived
                 // late. The encoded frame admission is released by DrainDecodeResults.
                 return;
@@ -1818,7 +1822,11 @@ namespace CardShopCoop.Net.Kcp
                 if (!TryEnqueueIncoming(message, result.EncodedBytes))
                 {
                     if (result.Reliable)
+                    {
+                        LogBudgetReport(state, "incoming application queue budget exhausted",
+                            result.EncodedBytes);
                         DisconnectForProtocol(state, "incoming application queue budget exhausted");
+                    }
                     // Never evict an older reliable message merely because a transient update
                     // arrived late. The encoded frame admission is released by TryDequeueIncoming.
                 }
@@ -2290,10 +2298,12 @@ namespace CardShopCoop.Net.Kcp
                 for (var attempts = 0; attempts < int.MaxValue; attempts++)
                 {
                     var id = _nextHostConnectionId++;
-                    if (id <= 0)
+                    // Wrap inside this transport's band (see SetConnectionIdBand) rather than the
+                    // whole int range, so two backends multiplexed into one session never collide.
+                    if (id <= 0 || id >= _connectionIdLimit)
                     {
-                        _nextHostConnectionId = 2;
-                        id = 1;
+                        _nextHostConnectionId = _connectionIdBase + 1;
+                        id = _connectionIdBase;
                     }
                     if (!_connections.ContainsKey(id))
                         return id;
@@ -2580,6 +2590,35 @@ namespace CardShopCoop.Net.Kcp
             CoopPlugin.Log?.LogWarning(message);
         }
 
+        /// <summary>One bounded line naming the connection and the shared inbound counters at a
+        /// queue-budget event. The counters are manager-global, so this is what shows whether one
+        /// session's pre-activation backlog is what starved another session's reliable frame.</summary>
+        private void LogBudgetReport(SessionState state, string reason, int frameBytes)
+        {
+            int incomingFrames;
+            int incomingBytes;
+            int decodeFrames;
+            int decodeBytes;
+            int pendingFrames;
+            int pendingBytes;
+            lock (_gate)
+            {
+                incomingFrames = _incoming.Count;
+                incomingBytes = _incomingBytes;
+                decodeFrames = _decodePendingFrames;
+                decodeBytes = _decodePendingBytes;
+                pendingFrames = _pendingActivationFrames;
+                pendingBytes = _pendingActivationBytes;
+            }
+
+            LogWarning("KCP peer " + state.Connection.Id + " " + reason
+                + ": frame=" + frameBytes + "B sessionPending=" + state.PendingCompact.Count
+                + " globalIncoming=" + incomingFrames + "/" + incomingBytes + "B"
+                + " globalDecode=" + decodeFrames + "/" + decodeBytes + "B"
+                + " globalPendingCompact=" + pendingFrames + "/" + pendingBytes + "B"
+                + " limits=" + _options.MaxIncomingFrames + "/" + _options.MaxIncomingBytes + "B.");
+        }
+
         private static void LogInfo(string message)
         {
             CoopPlugin.Log?.LogInfo(message);
@@ -2653,6 +2692,9 @@ namespace CardShopCoop.Net.Kcp
             internal bool Authenticated;
             internal bool MessageIdsActivated;
             internal bool Terminal;
+            // One bounded report per session for the pre-activation compact-frame drop, so a peer
+            // that floods compact frames before activation cannot turn into a log flood of its own.
+            internal bool CompactDropReported;
             internal bool DisconnectRequested;
             internal bool DisconnectRequestQueued;
             internal DisconnectInfo DisconnectInfo;

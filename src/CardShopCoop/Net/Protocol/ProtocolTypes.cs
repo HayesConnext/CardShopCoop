@@ -69,11 +69,6 @@ namespace CardShopCoop.Net.Protocol
             get;
         }
 
-        public static ProtocolRegistrationOwner Create(string id)
-        {
-            return new ProtocolRegistrationOwner(id);
-        }
-
         internal ProtocolRegistrationOwner(string id)
             : this(id, false)
         {
@@ -399,42 +394,12 @@ namespace CardShopCoop.Net.Protocol
             return _descriptorsById.TryGetValue(id, out descriptor);
         }
 
-        public bool TryGetId(string wireName, out UInt16 id)
-        {
-            id = default(UInt16);
-            return wireName != null && _idsByName.TryGetValue(wireName, out id);
-        }
-
         public bool TryGetId(Type messageType, out UInt16 id)
         {
             id = default(UInt16);
             return messageType != null && messageType.FullName != null
                 && _idsByName.TryGetValue(messageType.FullName, out id)
                 && _descriptorsById[id].MessageType == messageType;
-        }
-
-        public bool TryGetName(UInt16 id, out string wireName)
-        {
-            wireName = null;
-            if (!_descriptorsById.TryGetValue(id, out var descriptor))
-            {
-                return false;
-            }
-
-            wireName = descriptor.WireName;
-            return true;
-        }
-
-        public bool TryGetMessageType(UInt16 id, out Type messageType)
-        {
-            messageType = null;
-            if (!_descriptorsById.TryGetValue(id, out var descriptor))
-            {
-                return false;
-            }
-
-            messageType = descriptor.MessageType;
-            return true;
         }
 
         public bool TryGetHandler(Type messageType, out ProtocolHandlerBinding handler)

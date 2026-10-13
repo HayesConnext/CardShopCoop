@@ -11,6 +11,7 @@ using CardShopCoop.Net.Connection;
 using CardShopCoop.Runtime;
 using HarmonyLib;
 using UnityEngine;
+using CoopLog = CardShopCoop.Api.CoopLog;
 
 namespace CardShopCoop.Modules.Report
 {
@@ -767,8 +768,15 @@ namespace CardShopCoop.Modules.Report
 
                 if (!injected)
                 {
-                    CoopPlugin.Log.LogError("Report host could not find Customer.Update tournament "
-                        + "fee mutation boundary on this game build.");
+                    // Once per session, not per attempt: this transpiler runs again every time the
+                    // patched method is recompiled (a failed host attempt unpatches, the next host
+                    // patches again) and the same line twice looks like two separate faults.
+                    CoopLog.WarnOnce("report:customer-update-boundary",
+                        "Report host could not find the Customer.Update tournament fee mutation boundary "
+                        + "on this game build, so tournament entry fees are not reported through that "
+                        + "hook. The boundary is present in both supported baselines, and another "
+                        + "transpiler has already rewritten this method by the time this mod patches it "
+                        + "at host start, so a mod that rewrites Customer.Update is the usual cause.");
                 }
             }
         }

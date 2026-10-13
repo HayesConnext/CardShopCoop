@@ -5,6 +5,7 @@ using System.Text;
 using Newtonsoft.Json;
 using UnityEngine;
 using UnityEngine.SceneManagement;
+using CardShopCoop.Api;
 
 namespace CardShopCoop.Modules.Presence
 {
@@ -49,6 +50,9 @@ namespace CardShopCoop.Modules.Presence
             public TMPro.TMP_Text EmoteTag;
             public Transform CarryAnchor;  // chest-bone attach point for a real carried box
             public string Name = "Player";
+            // Dictionary key this avatar was created under: 1 is the host on a client, 1000+id is a
+            // remote peer. Logged once at spawn so a duplicate-self avatar is unambiguous.
+            public int ConnId;
             public Vector3 TargetPos;
             public Vector3 Velocity;      // measured between packets, only used when the buffer runs dry
             public float LastStateTime;   // Time.time when TargetPos arrived
@@ -136,7 +140,7 @@ namespace CardShopCoop.Modules.Presence
             }
             else
             {
-                _avatars[connId] = new RemoteAvatar { Name = name };
+                _avatars[connId] = new RemoteAvatar { Name = name, ConnId = connId };
             }
         }
 
@@ -144,7 +148,7 @@ namespace CardShopCoop.Modules.Presence
         {
             if (!_avatars.TryGetValue(connId, out var av))
             {
-                av = new RemoteAvatar();
+                av = new RemoteAvatar { ConnId = connId };
                 _avatars[connId] = av;
             }
             var changed = !av.HasModel || av.Female != female || av.ModelIndex != modelIndex
@@ -414,7 +418,7 @@ namespace CardShopCoop.Modules.Presence
             {
                 data = JsonConvert.DeserializeObject<CC.CC_CharacterData>(customizationJson);
             }
-            catch (System.Exception e) { Swallow.Log(e); return true; }
+            catch (System.Exception e) { CoopLog.Swallow(e); return true; }
             return IsNude(data);
         }
 
@@ -877,7 +881,7 @@ namespace CardShopCoop.Modules.Presence
         {
             if (!_avatars.TryGetValue(connId, out var av))
             {
-                av = new RemoteAvatar();
+                av = new RemoteAvatar { ConnId = connId };
                 _avatars[connId] = av;
             }
             var now = Time.time;
@@ -941,7 +945,7 @@ namespace CardShopCoop.Modules.Presence
         {
             if (!_avatars.TryGetValue(connId, out var av))
             {
-                av = new RemoteAvatar();
+                av = new RemoteAvatar { ConnId = connId };
                 _avatars[connId] = av;
             }
             av.HoldState = holdState;
@@ -1239,7 +1243,7 @@ namespace CardShopCoop.Modules.Presence
             {
                 chest = av.Anim != null ? av.Anim.GetBoneTransform(HumanBodyBones.Chest) : null;
             }
-            catch (System.Exception e) { Swallow.Log(e); }
+            catch (System.Exception e) { CoopLog.Swallow(e); }
 
             if (chest == null)
             {
@@ -1268,7 +1272,7 @@ namespace CardShopCoop.Modules.Presence
                     {
                         item.DisableItem();
                     }
-                    catch (System.Exception e) { Swallow.Log(e); }
+                    catch (System.Exception e) { CoopLog.Swallow(e); }
                 }
             }
 
@@ -1286,7 +1290,7 @@ namespace CardShopCoop.Modules.Presence
                 {
                     av.PackProp.DisableItem();
                 }
-                catch (System.Exception e) { Swallow.Log(e); }
+                catch (System.Exception e) { CoopLog.Swallow(e); }
                 av.PackProp = null;
             }
             if (av.BinderProp != null)
@@ -1305,50 +1309,38 @@ namespace CardShopCoop.Modules.Presence
 
             try
             {
-                if (customer.m_ShoppingBagTransform != null)
-                {
-                    customer.m_ShoppingBagTransform.gameObject.SetActive(false);
-                }
-
-                if (customer.m_CustomerCash != null)
-                {
-                    customer.m_CustomerCash.gameObject.SetActive(false);
-                }
-
-                if (customer.m_GameCardFanOut != null)
-                {
-                    customer.m_GameCardFanOut.SetActive(false);
-                }
-
-                if (customer.m_GameCardSingle != null)
-                {
-                    customer.m_GameCardSingle.SetActive(false);
-                }
-
-                if (customer.m_CleanFX != null)
-                {
-                    customer.m_CleanFX.SetActive(false);
-                }
-
-                if (customer.m_ExclaimationMesh != null)
-                {
-                    customer.m_ExclaimationMesh.SetActive(false);
-                }
-
-                if (customer.m_InteractCollider != null)
-                {
-                    customer.m_InteractCollider.SetActive(false);
-                }
-
-                if (customer.m_SmellyFX != null)
-                {
-                    customer.m_SmellyFX.SetActive(false);
-                }
+                // Each prop field should reference a child object, but on some builds a field
+                // resolves to the prefab's own root instead. Deactivating that root would switch
+                // off the whole customer/avatar, so HideProp refuses to hide the root and only
+                // hides genuine children.
+                HideProp(customer.m_ShoppingBagTransform != null
+                    ? customer.m_ShoppingBagTransform.gameObject : null, customer);
+                HideProp(customer.m_CustomerCash != null
+                    ? customer.m_CustomerCash.gameObject : null, customer);
+                HideProp(customer.m_GameCardFanOut, customer);
+                HideProp(customer.m_GameCardSingle, customer);
+                HideProp(customer.m_CleanFX, customer);
+                HideProp(customer.m_ExclaimationMesh, customer);
+                HideProp(customer.m_InteractCollider, customer);
+                HideProp(customer.m_SmellyFX, customer);
             }
             catch (System.Exception e)
             {
                 CoopPlugin.Log.LogWarning("Customer prop hiding partial (" + context + "): " + e.Message);
             }
+        }
+
+        // Hide a single customer prop unless it is the customer's own root: on some builds a
+        // prop field points at the prefab root, and SetActive(false) on it would deactivate the
+        // entire body (this is what left a remote avatar inactive on the 1.00 client).
+        private static void HideProp(GameObject prop, Customer customer)
+        {
+            if (prop == null || prop.transform == customer.transform)
+            {
+                return;
+            }
+
+            prop.SetActive(false);
         }
 
 
@@ -1362,7 +1354,7 @@ namespace CardShopCoop.Modules.Presence
                     {
                         c.OnDestroyed();
                     }
-                    catch (System.Exception e) { Swallow.Log(e); } // game's own card despawn path
+                    catch (System.Exception e) { CoopLog.Swallow(e); } // game's own card despawn path
                 }
             }
 
@@ -1387,7 +1379,7 @@ namespace CardShopCoop.Modules.Presence
                     av.Anim.SetTrigger("GrabItem");
                 }
             }
-            catch (System.Exception e) { Swallow.Log(e); }
+            catch (System.Exception e) { CoopLog.Swallow(e); }
             // packIndex is ALREADY A LOCAL EItemType: both presence handlers receive it after
             // CatalogIdMap translation, which is the one translation
             // boundary for it. Do NOT translate again here. A pack from a set only the
@@ -1423,7 +1415,7 @@ namespace CardShopCoop.Modules.Presence
                         CoopPlugin.Log.LogInfo($"pack-open visual: no mesh for pack index {packIndex}");
                     }
                 }
-                catch (System.Exception e) { Swallow.Log(e); }
+                catch (System.Exception e) { CoopLog.Swallow(e); }
             }
         }
 
@@ -1597,7 +1589,7 @@ namespace CardShopCoop.Modules.Presence
                                     {
                                         card3d.OnDestroyed();
                                     }
-                                    catch (System.Exception e2) { Swallow.Log(e2); }
+                                    catch (System.Exception e2) { CoopLog.Swallow(e2); }
                                 }
                                 // Always release the group too: OnDestroyed only frees it once
                                 // SetCardUIFollow has run (mid-build throws are before that),
@@ -1608,10 +1600,10 @@ namespace CardShopCoop.Modules.Presence
                                     {
                                         cardUI.DisableCard();
                                     }
-                                    catch (System.Exception e2) { Swallow.Log(e2); }
+                                    catch (System.Exception e2) { CoopLog.Swallow(e2); }
                                 }
 
-                                Swallow.Log(e);
+                                CoopLog.Swallow(e);
                             }
                         }
                     }
@@ -1627,7 +1619,7 @@ namespace CardShopCoop.Modules.Presence
                         {
                             av.PackProp.DisableItem();
                         }
-                        catch (System.Exception e) { Swallow.Log(e); }
+                        catch (System.Exception e) { CoopLog.Swallow(e); }
                         av.PackProp = null;
                     }
                 }
@@ -1690,7 +1682,7 @@ namespace CardShopCoop.Modules.Presence
 
                                 av.HeldItems.Add(item);
                             }
-                            catch (System.Exception e) { Swallow.Log(e); }
+                            catch (System.Exception e) { CoopLog.Swallow(e); }
                         }
                     }
                 }
@@ -1800,6 +1792,12 @@ namespace CardShopCoop.Modules.Presence
             Object.Destroy(holder);
 
             var cust = clone.GetComponent<Customer>();
+            // The character Animator is Customer.m_Anim, not necessarily the first Animator found
+            // in the hierarchy: the 1.00 Game Pass prefab carries an extra parameter-less Animator
+            // that GetComponentInChildren returned first, so the avatar was driven through an
+            // Animator with no MoveSpeed/IsHoldingBox parameters. Capture the game's own reference
+            // before the component strip below destroys the Customer behaviour that holds it.
+            var characterAnimator = cust != null ? cust.m_Anim : null;
             if (cust != null)
             {
                 var hasJson = !string.IsNullOrEmpty(av.CustomizationJson);
@@ -1881,7 +1879,9 @@ namespace CardShopCoop.Modules.Presence
             clone.name = "CoopAvatar_" + av.Name;
 
             av.Go = clone;
-            av.Anim = clone.GetComponentInChildren<Animator>(true);
+            av.Anim = characterAnimator != null
+                ? characterAnimator
+                : clone.GetComponentInChildren<Animator>(true);
             av.EverPositioned = true;
             av.HasMoveSpeed = false;
             av.HasHoldingBox = false;
@@ -1920,7 +1920,38 @@ namespace CardShopCoop.Modules.Presence
             var heightFactor = GetCharacterHeightFactor(cust != null ? cust.m_CharacterCustom : null);
             av.NameTag = MakeTag(clone.transform, av.Name, 2.25f * heightFactor, Color.white);
             av.EmoteTag = MakeTag(clone.transform, "", 2.55f * heightFactor, new Color(1f, 0.85f, 0.2f));
-            CoopPlugin.Log.LogInfo($"Spawned co-op avatar for '{av.Name}' ({(female ? "female" : "male")} model)");
+            // key= names which dictionary slot this body belongs to (1 = host on a client,
+            // 1000+id = a remote peer), so a phantom avatar for the local player is unambiguous.
+            // active/renderers/animator say whether the spawned body is actually a visible,
+            // animatable character on this build - the 1.00 client resolved a zero-parameter
+            // Animator here once, which the old line did not name.
+            var spawnRenderers = clone.GetComponentsInChildren<Renderer>(true);
+            var enabledRenderers = 0;
+            for (var i = 0; i < spawnRenderers.Length; i++)
+            {
+                if (spawnRenderers[i] != null && spawnRenderers[i].enabled)
+                {
+                    enabledRenderers++;
+                }
+            }
+
+            var controller = av.Anim != null && av.Anim.runtimeAnimatorController != null
+                ? av.Anim.runtimeAnimatorController.name : "<none>";
+            // DestroyImmediate above can run a component's OnDestroy callback as a side effect,
+            // and on some builds that callback switches the body off. Re-assert the root here so
+            // the avatar is always spawned visible regardless of what the strip did.
+            clone.SetActive(true);
+            if (!clone.activeInHierarchy)
+            {
+                // Bug telemetry: the stripped avatar body still came up inactive on this build,
+                // so remote players would be invisible even though the spawn succeeded.
+                CoopPlugin.Log.LogWarning($"Co-op avatar body for '{av.Name}' key={av.ConnId} "
+                    + "was inactive after stripping on this build.");
+            }
+
+            CoopPlugin.Log.LogInfo($"Spawned co-op avatar for '{av.Name}' key={av.ConnId} "
+                + $"({(female ? "female" : "male")} model) active={clone.activeInHierarchy} "
+                + $"renderers={enabledRenderers}/{spawnRenderers.Length} animator={controller}");
             // A carried box announced before this body existed rides a standalone anchor; now
             // that the avatar exists, let observers move it onto the skeleton.
             RemoteAvatarsChanged?.Invoke();

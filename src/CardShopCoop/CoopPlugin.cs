@@ -5,6 +5,7 @@ using System;
 using System.Runtime.CompilerServices;
 using System.Reflection;
 using UnityEngine;
+using CardShopCoop.Api;
 
 namespace CardShopCoop
 {
@@ -40,6 +41,7 @@ namespace CardShopCoop
         public static ConfigEntry<int> Port;
         public static ConfigEntry<string> LastJoinIP;
         public static ConfigEntry<string> PlayerName;
+        public static ConfigEntry<bool> NameOverride;
         public static ConfigEntry<float> SendRateHz;
         public static ConfigEntry<bool> AvatarsEnabled;
         public static ConfigEntry<bool> AllowNsfw;
@@ -49,13 +51,25 @@ namespace CardShopCoop
         public static ConfigEntry<float> ServeReach;
         public static ConfigEntry<bool> AllowCrossBuildJoin;
         public static ConfigEntry<bool> AutoPortForward;
-        public static ConfigEntry<bool> AutoLanPassword;
         public static ConfigEntry<GradedAlertMode> GradedDriftAlert;
         public static ConfigEntry<bool> PerfDebug;
         public static ConfigEntry<int> ArtificialLagMs;
         public static ConfigEntry<int> ArtificialJitterMs;
         public static ConfigEntry<bool> EnableGameCheatMenu;
         public static ConfigEntry<bool> ShowHiddenCategory;
+
+        /// <summary>TESTING ONLY, and deliberately not surfaced in the window: it lives in the Hidden
+        /// config section, which players only reach by editing the .cfg by hand. It makes the game
+        /// answer "yes" to every store entitlement, so the deluxe/pre-order object types can be
+        /// exercised on a build or an account that does not own them.</summary>
+        public static ConfigEntry<bool> ForceEntitlements;
+
+        /// <summary>TESTING ONLY, Game Pass ONLY: bound only when this build has the entitlement gate
+        /// (GA.PlatformManager), so it is null - and the hidden-menu toggle is absent - on the Steam
+        /// build. It unlocks ONLY the deluxe furniture (the infinite scent machine), for testing with
+        /// deluxe owners; unlike <see cref="ForceEntitlements"/> it never unlocks pre-order furniture
+        /// and never grants the deluxe coins or packs.</summary>
+        public static ConfigEntry<bool> ForceDeluxeFurniture;
 
         private void Awake()
         {
@@ -65,7 +79,7 @@ namespace CardShopCoop
             Api.CoopApi.Binding = Runtime.ExternalCoopMods.Instance;
             Api.CoopApi.Log = Logger;
             Runtime.SceneRef.Install();
-            Util.ScreenSingletonProbe.Install();
+            Util.ScreenSingletonGuard.Install();
             try
             {
                 Assembly.Load("Newtonsoft.Json");
@@ -83,7 +97,9 @@ namespace CardShopCoop
             LastJoinIP = Config.Bind("Network", "LastJoinIP", "192.168.1.100",
                 "IP address of the host PC (remembered after a successful join).");
             PlayerName = Config.Bind("Player", "Name", System.Environment.UserName,
-                "Name shown above your head on the other player's screen.");
+                "Fallback name shown above your head on the other player's screen. By default the mod uses your platform name instead (your Xbox gamertag on Game Pass, your Steam name on Steam) and this is only the last resort.");
+            NameOverride = Config.Bind("Player", "NameOverride", false,
+                "Set automatically by the co-op window: true once you type your own name into the \"Your name\" box, false again the moment you clear it (the box refills with your platform name once you click away). Leave it alone to keep using your platform name whenever one is available.");
             SendRateHz = Config.Bind("Network", "SendRateHz", 15f,
                 "How many position updates per second to send (8-20 is sensible).");
             if (Mathf.Approximately(SendRateHz.Value, 12f))
@@ -111,9 +127,7 @@ namespace CardShopCoop
             AllowCrossBuildJoin = Config.Bind("Network", "AllowCrossBuildJoin", false,
                 "Let players join even when the GAME build fingerprint (game version / Unity version) differs from the host's. Dangerous: two different game builds can corrupt each other's saves. Only enable for supervised testing of Steam <-> Game Pass cross-play.");
             AutoPortForward = Config.Bind("Network", "AutoPortForward", true,
-                "While you are LAN-hosting, ask your router over UPnP to open the co-op port so a friend outside your house can join with an invite code - and remove that opening again when you stop hosting. Turn it off if you forward the port yourself, or if you would rather nothing touched the router. Either way the invite code still works inside your own house.");
-            AutoLanPassword = Config.Bind("Network", "AutoLanPassword", true,
-                "Hosting via LAN generates a random session password. It is baked into the invite code (so a friend using the code notices nothing), shown in the host panel for a friend typing your IP by hand, and checked exactly like the Steam lobby password. Leave this on: the port your router opens for you is a door into your game, and this is the lock on it.");
+                "While you are hosting, ask your router to open the co-op port so a friend outside your house can join - and remove that opening again when you stop hosting. Turn this off if you forward the port yourself: with it off the mod never touches the router.");
             GradedDriftAlert = Config.Bind("Graded", "DriftAlert", GradedAlertMode.Always,
                 "How loudly to announce that your graded albums have drifted apart. THIS CONTROLS THE HOST'S SCREEN. While you are HOSTING it decides both your own on-screen line and the heads-up sent to the joiner. While you are JOINING it does nothing at all: the host's setting alone decides whether you get that heads-up, because the drift is only ever announced from the host's side. Always: announce every check that finds a difference. OncePerSession: say it once per player per session and then stay quiet - including for a later, bigger difference. Never: never put it on screen at all. The log records every check whichever you pick and on both PCs, so a support log stays complete whatever you choose; this only controls the screen, and it never changes what the co-op panel's adopt button offers.");
             PerfDebug = Config.Bind("Diagnostics", "PerfDebug", false,
@@ -126,6 +140,17 @@ namespace CardShopCoop
                 "TESTING ONLY. Allows the game's 1.00 cheat menu to open in solo mode or for the HOST. Clients are always blocked. Requires ShowHiddenCategory=true as an additional safety gate.");
             ShowHiddenCategory = Config.Bind("Hidden", "ShowHiddenCategory", false,
                 "TESTING ONLY. Shows the hidden category in the CardShopCoopCommunity window. The game cheat menu cannot open unless this and EnableGameCheatMenu are both enabled.");
+            ForceEntitlements = Config.Bind("Hidden", "ForceEntitlements", false,
+                "TESTING ONLY - NOT FOR PLAYERS. Makes the game answer \"yes\" to every store entitlement (the Game Pass deluxe and pre-order bonuses: their furniture and their coins), as if this account owned them. It exists so the deluxe-only object types can be tested on a build that does not have them. It changes only what the furniture shop offers; it grants nothing else. Off by default, and hidden from the window on purpose.");
+
+            // Game Pass only: the deluxe furniture gate exists only where GA.PlatformManager does, so
+            // bind this option there and nowhere else. The hidden menu draws it only when it is bound,
+            // which keeps it off the Steam build entirely.
+            if (Type.GetType("GA.PlatformManager, Assembly-CSharp") != null)
+            {
+                ForceDeluxeFurniture = Config.Bind("Hidden", "ForceDeluxeFurniture", false,
+                    "TESTING ONLY. Makes the game treat the deluxe-edition furniture (the infinite scent machine) as owned, so you can buy and place it while testing with deluxe owners. It does NOT unlock pre-order furniture and does NOT grant the deluxe coins or packs - use ForceEntitlements for that blunt version. Game Pass only.");
+            }
 
             // Bind one enable/disable checkbox per feature module and say exactly what will run.
             // Kept beside the config binds so the [modules] line appears before anything it can
@@ -137,34 +162,15 @@ namespace CardShopCoop
             // setting is turned on later.
             Util.UpdateProfiler.Install();
 
-            // PLATFORM LINE FIRST, ABOVE EVERYTHING THAT CAN FAIL. This is the line a Game
-            // Pass player (or a support thread) is told to look for, and it is most useful
-            // precisely in the session where CoopCore fails to load - so it must not sit
-            // downstream of the very failure it explains.
-            //
-            // IT REPORTS ONLY WHAT IT ACTUALLY KNOWS (1.0.39). PlatformProbe answers exactly
-            // one question - "can this process bind the Steamworks wrapper?" - and the field
-            // proved that is NOT the same question as "will Steam work here": a Game Pass
-            // install carrying a stray com.rlabrecque.steamworks.net.dll answers TRUE, and the
-            // old wording then PROMISED that player "Steam lobbies, invites and P2P available"
-            // on a build where Steam can never run. So this line is now a neutral statement of
-            // fact about the assembly, and the promise moved to CoopCore.Awake - the first
-            // point that knows whether the bridge actually came up. Do not put it back here:
-            // nothing at this point in startup is entitled to make it.
-            if (!Net.PlatformProbe.SteamworksPresent)
-            {
-                Log.LogInfo("Steamworks assembly not detected - LAN and direct IP only (a HarmonyX ReflectionTypeLoadException warning naming Steamworks types may appear when any mod - including this one - enumerates loaded types; it is EXPECTED on this build and harmless)");
-            }
-            else
-            {
-                Log.LogInfo("Steamworks assembly detected.");
-            }
+            // There USED to be a "platform line" here (Steamworks assembly present or not). It is
+            // gone: Steam availability is now reported by the Steam transport plugin when it
+            // registers (see CardShopCoop.Steam), and this assembly no longer probes for
+            // Steamworks itself. Do not re-add a second source for that answer.
 
-            // SECOND LINE, ON PURPOSE. The line above answers "can Steam UI exist here"; this
-            // one answers "where do this game's saves live", and 1.0.38 shipped a field report
-            // where the first was true and the second was not (a stray
-            // com.rlabrecque.steamworks.net.dll in a Game Pass install). SaveTransfer no longer
-            // infers one from the other, and neither should the log.
+            // THE LINE BELOW ANSWERS A DIFFERENT QUESTION: where this game's saves live. 1.0.38
+            // shipped a field report where "can Steam UI exist here" was true and the save backend
+            // was not (a stray com.rlabrecque.steamworks.net.dll in a Game Pass install), so
+            // SaveTransfer no longer infers one from the other - and neither should the log.
             Log.LogInfo("save backend: " + Net.PlatformProbe.SaveBackendDescription +
                         " - decided from the game's own save-completion counter at join time, never from Steamworks presence.");
 
@@ -201,7 +207,7 @@ namespace CardShopCoop
                 {
                     Destroy(go);
                 }
-                catch (Exception ex) { Swallow.Log(ex); }
+                catch (Exception ex) { CoopLog.Swallow(ex); }
             }
 
             // Only claim the window works if the component that draws it actually loaded -
@@ -213,9 +219,9 @@ namespace CardShopCoop
         }
 
         /// <summary>
-        /// THE ONLY METHOD IN THIS FILE THAT NAMES CoopCore, and deliberately NoInlining -
-        /// the same two-method shape as <see cref="Net.SteamBridge.TryCreate"/> /
-        /// <see cref="Net.SteamBridge.Create"/>, for the same reason. A method body that
+        /// THE ONLY METHOD IN THIS FILE THAT NAMES CoopCore, and deliberately NoInlining, for
+        /// the same reason the Steam transport keeps bridge construction behind a type that is
+        /// allowed to fail to load. A method body that
         /// merely MENTIONS a type that cannot load throws at JIT, before the body (and any
         /// try/catch inside it) ever runs, so the handler that saves us has to live in a
         /// CALLER whose own body is clean. Inline this into Awake and the AddComponent

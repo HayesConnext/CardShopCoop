@@ -1,0 +1,508 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Threading.Tasks;
+using CardShopCoop.Net.Connection;
+
+namespace CardShopCoop.Net.Networking
+{
+    /// <summary>
+    /// The values a backend can ask the player for. One shared id space, so the co-op window can
+    /// collect a typed dictionary without knowing which backend it is driving.
+    /// </summary>
+    public enum FieldId
+    {
+        IpAddress,  // join target: the host's address, "ip" or "ip:port"
+        Port,       // host: the local UDP port to listen on
+        Password,   // the session password (the host sets it, a joiner presents it)
+        Lobby,      // join target: a lobby selected from the browser
+        LobbyName,  // host: the advertised name
+        MaxPlayers, // host: session size
+        Public,     // host: advertise publicly
+        AutoForward, // host: let the mod ask the router to open the port (UPnP/NAT-PMP/PCP)
+    }
+
+    /// <summary>How the UI renders a field.</summary>
+    public enum FieldKind
+    {
+        Text,
+        Port,
+        Password,
+        Toggle,
+        Number,
+    }
+
+    public enum ConnectMode
+    {
+        Host,
+        Join,
+    }
+
+    /// <summary>Which phase of a session a backend action belongs to. This is a DIFFERENT axis from
+    /// <see cref="BackendAction.Mode"/>: Mode is the host/join SIDE, Phase is before-vs-after the
+    /// session starts. The window draws the actions matching the view it is drawing, so a button that
+    /// needs a live session is never offered before one exists - and it cannot appear or vanish
+    /// partway through a pass, because the phase is a fixed declaration rather than live state.</summary>
+    public enum ActionPhase
+    {
+        /// <summary>Offered only in the options view, before the session starts.</summary>
+        BeforeStart,
+        /// <summary>Offered only while the backend is actually carrying the session.</summary>
+        Live,
+        /// <summary>Offered in both views.</summary>
+        Any,
+    }
+
+    /// <summary>
+    /// Opaque handle for one Connect attempt and the session it becomes, allocated by the
+    /// backend. Every callback carries it, so a backend can drop a late callback from an attempt
+    /// the player already replaced, and the runtime can drop anything addressed to a session it
+    /// has moved past. NOT the same thing as <see cref="PeerConnection.Id"/> (a small per-peer id
+    /// where 1 is the host) - this identifies the local side's connection attempt.
+    /// </summary>
+    public readonly struct ConnectionId : IEquatable<ConnectionId>
+    {
+        internal ConnectionId(long value)
+        {
+            Value = value;
+        }
+
+        public long Value
+        {
+            get;
+        }
+
+        public bool IsValid => Value != 0;
+
+        public bool Equals(ConnectionId other) => Value == other.Value;
+
+        public override bool Equals(object obj) => obj is ConnectionId other && Equals(other);
+
+        public override int GetHashCode() => Value.GetHashCode();
+
+        public static bool operator ==(ConnectionId left, ConnectionId right) => left.Equals(right);
+
+        public static bool operator !=(ConnectionId left, ConnectionId right) => !left.Equals(right);
+
+        public override string ToString() => Value.ToString();
+    }
+
+    /// <summary>
+    /// The values a backend asked for, keyed by <see cref="FieldId"/>. A named type rather than a
+    /// raw dictionary: the shape is discoverable, and the stringly-typed values are read through
+    /// typed helpers instead of every backend re-parsing "1"/"true" by hand.
+    /// </summary>
+    public sealed class FieldValues : IEnumerable<KeyValuePair<FieldId, string>>
+    {
+        private readonly Dictionary<FieldId, string> _values = new Dictionary<FieldId, string>();
+
+        public string this[FieldId id]
+        {
+            get => _values.TryGetValue(id, out var value) ? (value ?? "") : "";
+            set => _values[id] = value ?? "";
+        }
+
+        public int Count => _values.Count;
+
+        public bool TryGetValue(FieldId id, out string value) => _values.TryGetValue(id, out value);
+
+        public bool Contains(FieldId id) => _values.ContainsKey(id);
+
+        public bool GetBool(FieldId id)
+            => _values.TryGetValue(id, out var value)
+                && (value == "1" || string.Equals(value, "true", StringComparison.OrdinalIgnoreCase));
+
+        public void SetBool(FieldId id, bool value) => this[id] = value ? "1" : "0";
+
+        public int GetInt(FieldId id, int fallback = 0)
+            => _values.TryGetValue(id, out var value)
+                && int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture,
+                    out var parsed)
+                    ? parsed
+                    : fallback;
+
+        public IEnumerator<KeyValuePair<FieldId, string>> GetEnumerator()
+            => _values.GetEnumerator();
+
+        IEnumerator IEnumerable.GetEnumerator() => _values.GetEnumerator();
+    }
+
+    /// <summary>One requested value plus everything the UI needs to render and prefill it.</summary>
+    public sealed class BackendField
+    {
+        public BackendField(FieldId id, string label, FieldKind kind,
+            string value = "", bool required = false, string tooltip = null)
+        {
+            Id = id;
+            Label = label ?? id.ToString();
+            Kind = kind;
+            Value = value ?? "";
+            Required = required;
+            Tooltip = tooltip;
+        }
+
+        public FieldId Id
+        {
+            get;
+        }
+        public string Label
+        {
+            get;
+        }
+        public FieldKind Kind
+        {
+            get;
+        }
+
+        /// <summary>The current value (the last Configure, or the backend's default). The UI shows
+        /// it and hands edits back through the same dictionary the next Configure receives.</summary>
+        public string Value
+        {
+            get;
+        }
+
+        public bool Required
+        {
+            get;
+        }
+
+        /// <summary>Hover help, shown by the UI only after the pointer rests on the field for a few
+        /// seconds; null when there is nothing worth saying.</summary>
+        public string Tooltip
+        {
+            get;
+        }
+    }
+
+    /// <summary>The outcome of one Connect attempt, delivered on the Unity thread.</summary>
+    public readonly struct ConnectResult
+    {
+        public ConnectResult(bool success, string error = null, bool retryable = false)
+        {
+            Success = success;
+            Error = error;
+            Retryable = retryable;
+        }
+
+        public bool Success
+        {
+            get;
+        }
+        public string Error
+        {
+            get;
+        }
+        public bool Retryable
+        {
+            get;
+        }
+    }
+
+    /// <summary>A backend-specific button (invite dialog, refresh lobbies, copy code...).</summary>
+    public sealed class BackendAction
+    {
+        public BackendAction(string id, string label, Action invoke, bool enabled = true,
+            string tooltip = null, FieldId? field = null, string icon = null,
+            ConnectMode? mode = null, ActionPhase phase = ActionPhase.Any)
+        {
+            Id = id;
+            Label = label ?? id;
+            Invoke = invoke;
+            Enabled = enabled;
+            Tooltip = tooltip;
+            Field = field;
+            Icon = icon;
+            Mode = mode;
+            Phase = phase;
+        }
+
+        public string Id
+        {
+            get;
+        }
+        public string Label
+        {
+            get;
+        }
+        public Action Invoke
+        {
+            get;
+        }
+        public bool Enabled
+        {
+            get;
+        }
+
+        /// <summary>The one mode this action is offered in, or null for both. Host-only and join-only
+        /// buttons genuinely exist: inviting friends is meaningless on the join side, and refreshing a
+        /// lobby list is meaningless on the host side. The window draws neither section's buttons in
+        /// the other mode.</summary>
+        public ConnectMode? Mode
+        {
+            get;
+        }
+
+        /// <summary>Which phase the action is offered in (see <see cref="ActionPhase"/>). The options
+        /// view draws every action except <see cref="ActionPhase.Live"/>; the live view draws every
+        /// action except <see cref="ActionPhase.BeforeStart"/>. "Invite friend" is the original
+        /// <see cref="ActionPhase.Live"/> case: before hosting starts there is no lobby to invite
+        /// anyone to.</summary>
+        public ActionPhase Phase
+        {
+            get;
+        }
+
+        /// <summary>Shown only once the pointer has RESTED on the control for a few seconds (see the
+        /// UI) - an instant tooltip covers the panel while the player is just moving across it.</summary>
+        public string Tooltip
+        {
+            get;
+        }
+
+        /// <summary>The field this action belongs to, so the UI draws it ON that field's row as a
+        /// small trailing button instead of in the list below. Null = a plain panel button.</summary>
+        public FieldId? Field
+        {
+            get;
+        }
+
+        /// <summary>Optional artwork, named rather than supplied: the UI owns how an action is drawn
+        /// ("refresh" and "copy" today; an unknown name falls back to the label). A name rather than
+        /// a texture keeps this contract free of Unity types, and lets the UI substitute words when
+        /// it cannot draw the artwork on the machine it is running on.</summary>
+        public string Icon
+        {
+            get;
+        }
+    }
+
+    /// <summary>The outcome of an availability probe: usable now, or not and why. The reason is
+    /// what the co-op window shows beside the cross, so it must be player-readable and specific
+    /// ("Steam isn't running", not "unavailable").</summary>
+    public readonly struct BackendAvailability
+    {
+        public BackendAvailability(bool available, string reason = null)
+        {
+            Available = available;
+            Reason = reason;
+        }
+
+        public bool Available
+        {
+            get;
+        }
+
+        /// <summary>Why the backend is not usable, when <see cref="Available"/> is false; null or
+        /// empty otherwise.</summary>
+        public string Reason
+        {
+            get;
+        }
+
+        public static BackendAvailability Yes => new BackendAvailability(true);
+
+        public static BackendAvailability No(string reason) => new BackendAvailability(false, reason);
+    }
+
+    /// <summary>How far automatic port opening got, for the host panel.</summary>
+    public enum ForwardState
+    {
+        /// <summary>No attempt was made (the player turned it off), or nothing has happened yet.</summary>
+        None,
+        /// <summary>The gateway accepted the mapping request.</summary>
+        Mapped,
+        /// <summary>No router answered, or the gateway refused.</summary>
+        Declined,
+    }
+
+    /// <summary>What the session panel shows for the backend that is currently driving.</summary>
+    public readonly struct ConnectionInfo
+    {
+        public ConnectionInfo(bool active, bool isHost, string summary,
+            ForwardState forwardState = ForwardState.None,
+            string warning = null, string password = null, bool busy = false)
+        {
+            Active = active;
+            IsHost = isHost;
+            Summary = summary;
+            ForwardState = forwardState;
+            Warning = warning;
+            Password = password;
+            Busy = busy;
+        }
+
+        public bool Active
+        {
+            get;
+        }
+        public bool IsHost
+        {
+            get;
+        }
+
+        /// <summary>A short, non-sensitive status line. An address that could leak a home
+        /// connection on stream is never put here - it travels through an action's clipboard.</summary>
+        public string Summary
+        {
+            get;
+        }
+
+        public string Warning
+        {
+            get;
+        }
+
+        /// <summary>How far the host's automatic port opening got, so the panel can say whether the
+        /// router opened the port or the player has to forward it. Always <see cref="ForwardState.None"/>
+        /// for a backend that does not touch a router (Steam, or a joiner).</summary>
+        public ForwardState ForwardState
+        {
+            get;
+        }
+
+        /// <summary>The session password a joiner must present, when this backend uses one; null or
+        /// empty when the backend authenticates its peers itself.</summary>
+        public string Password
+        {
+            get;
+        }
+
+        /// <summary>True while this backend is WORKING - asking STUN for the public address, creating
+        /// or entering a lobby - and <see cref="Summary"/> is the step it
+        /// is on. The window prints that step in the container's header and greys its play button
+        /// until this goes false again, which happens when the start is ready or has FAILED. A failure
+        /// is reported in the container's own body, so the button coming back is not the only signal.</summary>
+        public bool Busy
+        {
+            get;
+        }
+    }
+
+    /// <summary>Reserved width of one transport's <see cref="PeerConnection"/>.Id band. A host
+    /// running several backends at once gives each one a band of this size so a
+    /// PeerConnection.Id is never handed out twice.</summary>
+    public static class NetworkingBands
+    {
+        public const int Size = 1_000_000;
+    }
+
+    /// <summary>
+    /// One way to connect two machines, and everything the co-op window needs to drive and
+    /// describe it. An implementation owns its transport bearer, its own configuration, and its
+    /// own connection metadata; the runtime and the UI only ever touch THIS surface, so a new
+    /// transport is one new implementation and zero changes outside it.
+    ///
+    /// This is a public extension surface: a transport ships in its own assembly (the Steam
+    /// transport does) and registers itself with the runtime at plugin load. Keep implementations
+    /// free of any type that can fail to load on a build the transport does not support.
+    /// </summary>
+    public interface INetworkingBackend
+    {
+        /// <summary>Stable id, e.g. "ip" or "steam".</summary>
+        string Id
+        {
+            get;
+        }
+
+        /// <summary>Player-facing name, e.g. "IP / LAN" or "Steam".</summary>
+        string DisplayName
+        {
+            get;
+        }
+
+        /// <summary>Probe whether this backend can start a session right now, and if not, why. The
+        /// reason is shown beside the group's cross in the co-op window. Async because a real probe
+        /// can touch the platform; the two questions are separate and neither substitutes for the
+        /// other:
+        /// <list type="bullet">
+        /// <item>the runtime decides which backends EXIST at startup (which transports registered),
+        /// not from this;</item>
+        /// <item>this answers "is the backend usable right now", which the UI caches and
+        /// refreshes rather than calling per frame.</item>
+        /// </list>
+        /// Implementations must return quickly and never throw - an unusable backend returns a
+        /// completed <see cref="BackendAvailability.No(string)"/> carrying the reason.</summary>
+        Task<BackendAvailability> GetAvailabilityAsync();
+
+        /// <summary>Apply remembered values and persist them. Never touches the network. Called as
+        /// the player edits fields, and once at startup with the backend's own defaults.</summary>
+        void Configure(FieldValues values);
+
+        /// <summary>The fields this backend wants for <paramref name="mode"/>, prefilled from the
+        /// current configuration. The UI renders one control per field, in order.</summary>
+        IReadOnlyList<BackendField> GetFields(ConnectMode mode);
+
+        /// <summary>
+        /// Begin a session and return its handle. The outcome is reported through
+        /// <paramref name="onResult"/>, which receives the same handle so a caller can ignore a
+        /// late result for an attempt it already replaced. A rejected attempt never throws.
+        /// <paramref name="values"/> is merged over the configured ones.
+        /// </summary>
+        ConnectionId Connect(ConnectMode mode, FieldValues values,
+            Action<ConnectionId, ConnectResult> onResult);
+
+        /// <summary>End the session behind <paramref name="connection"/> and release its
+        /// transport. Ignored if that handle is no longer the active one.</summary>
+        void Disconnect(ConnectionId connection);
+
+        /// <summary>Backend-specific buttons for the current view (may be empty).</summary>
+        IReadOnlyList<BackendAction> Actions
+        {
+            get;
+        }
+
+        /// <summary>What to show while this backend owns the session.</summary>
+        ConnectionInfo ConnectionInfo
+        {
+            get;
+        }
+
+        /// <summary>Local identity for the join handshake: Steam id, or 0 for IP.</summary>
+        ulong LocalUserId
+        {
+            get;
+        }
+
+        /// <summary>The platform-provided local display name (Steam persona), or an EMPTY string when
+        /// this backend has no platform name. The runtime uses a non-empty value as the default name;
+        /// a backend must not answer with the configured or machine name, or it would mask the real
+        /// platform name (the Xbox gamertag on Game Pass) and the configured name on LAN.</summary>
+        string LocalUserName
+        {
+            get;
+        }
+
+        /// <summary>The live transport, or null before a session starts.</summary>
+        ICoopTransport Transport
+        {
+            get;
+        }
+
+        /// <summary>First id in this backend's disjoint PeerConnection.Id band. A host running
+        /// several backends at once needs the bands to not overlap, so the runtime can route a
+        /// send to the transport that owns an id. Use distinct, well-separated bases - band width
+        /// is 1,000,000.</summary>
+        int ConnectionIdBase
+        {
+            get;
+        }
+
+        /// <summary>Raised when a peer's incoming invite was accepted out of band (Steam's overlay
+        /// "Join game"): the runtime should start a CLIENT session on this backend with these
+        /// values. The runtime enqueues the join onto the Unity thread.</summary>
+        event Action<INetworkingBackend, FieldValues> JoinRequested;
+
+        /// <summary>Raised when a connection's transport is created or torn down. The runtime pumps
+        /// the transport from here; the handle lets it ignore a superseded connection.</summary>
+        event Action<ConnectionId, ICoopTransport> TransportChanged;
+
+        /// <summary>Raised when a peer's transport connection comes up, with the owning handle.</summary>
+        event Action<ConnectionId, PeerConnection> PeerConnected;
+
+        /// <summary>Raised for a failure that must end or abort the session after Connect
+        /// returned (a Steam join rejected, a lobby that dies before it is usable), with the
+        /// owning handle.</summary>
+        event Action<ConnectionId, string> Failed;
+    }
+}

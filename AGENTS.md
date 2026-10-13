@@ -63,6 +63,13 @@ dotnet restore src\CardShopCoop\CardShopCoop.csproj
 dotnet format src\CardShopCoop\CardShopCoop.csproj whitespace --verify-no-changes --no-restore
 ```
 
+## Local install
+
+Machine-specific setup — this PC's real game install and mirror paths, deploy targets, log
+locations, the live test pair, and the decompiled baseline inventory — is documented in the
+`local-install` skill (`.opencode/skills/local-install/SKILL.md`), not here. Load it with
+`@local-install` when you need to build, deploy, or read logs on this machine.
+
 ## Decompiled game source
 
 The game ships no source, only bytecode. Use `tools/Decomp` to generate readable C# from

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Threading;
 using CardShopCoop.Modules.Catalog;
@@ -11,11 +12,13 @@ using CardShopCoop.Modules.World;
 using CardShopCoop.Net;
 using CardShopCoop.Net.Connection;
 using CardShopCoop.Net.Messages;
+using CardShopCoop.Net.Networking;
 using CardShopCoop.Net.Protocol;
 using CardShopCoop.Runtime;
 using PeerConnection = CardShopCoop.Net.Connection.PeerConnection;
 using UnityEngine;
 using UnityEngine.SceneManagement;
+using CardShopCoop.Api;
 
 namespace CardShopCoop
 {
@@ -26,12 +29,29 @@ namespace CardShopCoop
         Client
     }
 
-    public enum InviteState
+    /// <summary>What a peer advertised in its Hello: the mod version (always equal to ours - the
+    /// handshake enforces it) and the game/Unity build (which can differ on a cross-build join).</summary>
+    public readonly struct CoopPeerBuild
     {
-        Off,
-        Resolving,
-        Ready,
-        LanOnly
+        public CoopPeerBuild(string version, string gameVersion, string unityVersion)
+        {
+            Version = version;
+            GameVersion = gameVersion;
+            UnityVersion = unityVersion;
+        }
+
+        public string Version
+        {
+            get;
+        }
+        public string GameVersion
+        {
+            get;
+        }
+        public string UnityVersion
+        {
+            get;
+        }
     }
 
     /// <summary>
@@ -47,34 +67,105 @@ namespace CardShopCoop
         }
 
         public static CoopRole Role { get; private set; } = CoopRole.None;
-        public static bool WindowBlocksInput => SessionInputRuntime.WindowBlocksInput;
-        public static bool IsTearingDown
-        {
-            get; private set;
-        }
-        public static bool InSessionWorld => Instance != null && Instance._sessionInGame;
 
         public string StatusLine = "Not connected";
         public string ErrorLine = "";
+
+        /// <summary>Why starting or joining on this backend last failed, for the section the player
+        /// actually pressed. Keyed by backend AND mode, because the window draws the two modes as
+        /// separate areas: a failure to JOIN must not appear as a problem with HOSTING, which is what
+        /// a backend-only key did. Empty when that mode has nothing to report.</summary>
+        public string BackendError(INetworkingBackend backend, ConnectMode mode)
+        {
+            if (backend == null)
+            {
+                return "";
+            }
+
+            lock (_sessionLock)
+            {
+                return _backendErrors.TryGetValue(BackendErrorKey(backend, mode), out var reason)
+                    ? reason
+                    : "";
+            }
+        }
+
+        private void NoteBackendError(INetworkingBackend backend, ConnectMode mode, string reason)
+        {
+            if (backend == null || string.IsNullOrEmpty(reason))
+            {
+                return;
+            }
+
+            lock (_sessionLock)
+            {
+                _backendErrors[BackendErrorKey(backend, mode)] = reason;
+            }
+        }
+
+        private void ClearBackendError(INetworkingBackend backend, ConnectMode mode)
+        {
+            if (backend == null)
+            {
+                return;
+            }
+
+            lock (_sessionLock)
+            {
+                _backendErrors.Remove(BackendErrorKey(backend, mode));
+            }
+        }
+
+        private static string BackendErrorKey(INetworkingBackend backend, ConnectMode mode)
+            => backend.Id + (mode == ConnectMode.Host ? "|host" : "|join");
         public string EffectivePlayerName => PresenceApi.LocalPlayerName;
-        public bool UsingSteamPersona => !string.Equals(EffectivePlayerName,
-            CoopPlugin.PlayerName.Value, StringComparison.Ordinal);
 
         public ICoopTransport Net
         {
             get; private set;
         }
-        public ISteamBridge Steam => _steam;
-        public bool IsSteamSession
+        /// <summary>Every networking backend this process offers: the built-in IP category plus any
+        /// transport that registered with the runtime. The co-op window lists these.
+        ///
+        /// REBUILT WHEN THE SET CHANGES, NOT ONCE AT STARTUP. A transport registers from its own
+        /// plugin's Awake, which BepInEx runs after this core plugin's - the Steam transport is
+        /// registered roughly 20 ms later. A list captured once in Awake would name only "ip", and
+        /// the window would offer no Steam option at all with nothing on screen to say why.</summary>
+        public IReadOnlyList<INetworkingBackend> Backends
         {
-            get; private set;
+            get
+            {
+                var version = NetworkingBackends.Version;
+                if (_backendsVersion != version)
+                {
+                    _backends = NetworkingBackends.All();
+                    _backendsVersion = version;
+                }
+
+                return _backends;
+            }
         }
+
+        /// <summary>The session password a joiner must present, when the active backend uses one
+        /// (Direct IP / LAN); empty for a backend that authenticates itself (Steam).</summary>
         public string HostPassword = "";
-        public ulong LastFailedLobby;
-        public InviteState InviteStatus = InviteState.Off;
-        public string InviteCodeText;
-        public string InviteReason;
-        public int PortForwardState;
+
+        /// <summary>CLIENT ONLY: what the host advertised in its Welcome, so the connected panel can
+        /// name the build it joined. Empty while not connected.</summary>
+        private string _hostVersion = "";
+        private string _hostGameVersion = "";
+        private string _hostUnityVersion = "";
+
+        public string HostVersion => _hostVersion;
+        public string HostGameVersion => _hostGameVersion;
+        public string HostUnityVersion => _hostUnityVersion;
+
+        /// <summary>HOST ONLY: what each joined client advertised in its Hello, keyed by its
+        /// connection id, so the window can show the build a client is running.</summary>
+        private readonly Dictionary<int, CoopPeerBuild> _peerBuilds = new();
+
+        public bool TryGetPeerBuild(int connectionId, out CoopPeerBuild build)
+            => _peerBuilds.TryGetValue(connectionId, out build);
 
         public string LastDisconnectCode { get; private set; } = "";
         public string LastDisconnectReason { get; private set; } = "";
@@ -83,10 +174,29 @@ namespace CardShopCoop
             get; private set;
         }
 
-        private IConnectionProvider _connectionProvider;
-        private ICoopTransport _providerTransportSource;
+        private IReadOnlyList<INetworkingBackend> _backends = Array.Empty<INetworkingBackend>();
+        private int _backendsVersion = -1;
+        private INetworkingBackend _activeBackend;
+        private ConnectMode _activeMode = ConnectMode.Host;
+
+        /// <summary>Join attempts (see <see cref="CheckJoinAttempts"/>) and the current window.</summary>
+        private const int JoinAttempts = 5;
+        private const float JoinAttemptSeconds = 5f;
+        private int _joinAttempt;
+        private float _joinAttemptAt;
+        private readonly Dictionary<INetworkingBackend, ConnectionId> _connections = new();
+        private readonly Dictionary<INetworkingBackend, ICoopTransport> _children = new();
+
+        /// <summary>Those two are per session; this one deliberately outlives it. A failed start ends
+        /// the session and resets the view to baseline, and the reason has to still be there to read
+        /// in the section that failed - it is cleared when that backend is next attempted, or when it
+        /// succeeds.</summary>
+        private readonly Dictionary<string, string> _backendErrors = new();
+        private readonly HashSet<INetworkingBackend> _wired = new();
+        private readonly object _sessionLock = new();
+        private CoopTransportGroup _group;
+        private ICoopTransport _pump;
         private CoopRuntimeContext _liveRuntimeContext;
-        private ISteamBridge _steam;
         private CoopRuntimeBehaviour _runtime;
         private PersistentRuntimeBehaviour _persistentRuntime;
         private UI.CoopUI _ui;
@@ -98,7 +208,6 @@ namespace CardShopCoop
         private bool _worldReady;
         private int _localConnectionId = -1;
         private int _sessionGeneration = 1;
-        private int _inviteGeneration;
         private ulong _autoJoinSteamLobby;
         private int _autoHostSlot = -1;
         private string _autoJoinIp;
@@ -142,12 +251,9 @@ namespace CardShopCoop
             Instance = this;
             _unityThreadId = Thread.CurrentThread.ManagedThreadId;
             _messageRouter.RegisterCoreAttributedHandlers(this);
+            _messageRouter.HandlerFailed += OnHandlerFailed;
             _dispatcher.Start();
-            PresenceApi.ConfigureIdentity(() =>
-            {
-                var persona = _steam == null ? "" : _steam.LocalPersonaName;
-                return string.IsNullOrWhiteSpace(persona) ? CoopPlugin.PlayerName.Value : persona;
-            });
+            PresenceApi.ConfigureIdentity(ResolvePlayerName);
             SaveTransferApi.ConfigureCore(
                 () => Role,
                 () => SessionGeneration,
@@ -181,27 +287,9 @@ namespace CardShopCoop
             SceneManager.sceneLoaded += OnSceneLoaded;
 
             ReadCommandLine();
-            _steam = SteamBridge.TryCreate();
-            if (_steam == null && PlatformProbe.SteamworksPresent)
-            {
-                CoopPlugin.Log.LogInfo("Steamworks assembly present but not functional; LAN and direct IP only.");
-            }
-
-            if (_steam != null)
-            {
-                _steam.Init();
-                _steam.OnError = error =>
-                {
-                    ErrorLine = error ?? "Steam error";
-                    CoopPlugin.Log.LogWarning(ErrorLine);
-                };
-                _steam.OnLobbyLive = lobby =>
-                {
-                    SetStatus("Hosting via Steam - click 'Invite friend'");
-                    CoopPlugin.Log.LogInfo("steam: lobby live " + lobby);
-                };
-                _steam.OnInviteAccepted = lobby => JoinSteamLobby(lobby);
-            }
+            _backends = NetworkingBackends.All();
+            _backendsVersion = NetworkingBackends.Version;
+            NetworkingBackends.LogSet();
 
             RegisterEventListeners();
             CatalogApi.EnumLendState();
@@ -250,162 +338,96 @@ namespace CardShopCoop
             }
         }
 
-        public void JoinSteamLobby(ulong lobby, string password = "")
+        /// <summary>
+        /// Starts or extends a session on <paramref name="backend"/>. A HOST may connect several
+        /// backends at once (Steam friends and LAN friends in one shop), each with its own handle;
+        /// a CLIENT joins through exactly one. The backend reports the outcome through its own
+        /// callback, addressed to the handle it returned.
+        /// </summary>
+        public void ConnectBackend(INetworkingBackend backend, ConnectMode mode,
+            FieldValues values)
         {
             ErrorLine = "";
             ClearDisconnectMetadata();
-            if (Role != CoopRole.None)
+            // Remember which half of the window this attempt belongs to. Every error filed for it goes
+            // under that mode, including the asynchronous ones that arrive after this method returns.
+            _activeMode = mode;
+            ClearBackendError(backend, mode);
+            if (backend == null)
             {
-                ErrorLine = "Already in a session.";
-                return;
-            }
-            if (InGameLevel())
-            {
-                ErrorLine = "Go to the main menu first, then accept the invite again.";
-                return;
-            }
-            if (_steam == null)
-            {
-                ErrorLine = "This build has no Steam support - use LAN or direct IP.";
-                return;
-            }
-            if (!_steam.SteamAvailable())
-            {
-                ErrorLine = "Steam isn't running.";
+                ErrorLine = "No transport selected.";
                 return;
             }
 
-            BeginSession(CoopRole.Client, true);
-            IsSteamSession = true;
-            _joinPassword = password ?? "";
-            LastFailedLobby = lobby;
-            try
+            var hosting = mode == ConnectMode.Host;
+            if (Role == CoopRole.None)
             {
-                SetConnectionProvider(new SteamConnectionProvider(_steam));
-                ConnectionProvider.Join(lobby.ToString(), 0, _joinPassword);
-                SetStatus("Joining Steam lobby...");
-            }
-            catch (Exception error)
-            {
-                AbortSessionStart("Could not join: " + error.Message);
-            }
-        }
-
-        public void StartHostingSteam(bool isPublic, string lobbyName, string password, int maxPlayers)
-        {
-            ErrorLine = "";
-            ClearDisconnectMetadata();
-            if (maxPlayers < SteamLobbyLimits.MinPlayers || maxPlayers > SteamLobbyLimits.MaxPlayers)
-            {
-                ErrorLine = $"Player count must be between {SteamLobbyLimits.MinPlayers} and {SteamLobbyLimits.MaxPlayers}.";
-                return;
-            }
-            if (Role != CoopRole.None)
-            {
-                ErrorLine = "Already in a session.";
-                return;
-            }
-            if (!TryAdmitHostStart(out var admissionError))
-            {
-                ErrorLine = admissionError;
-                return;
-            }
-            if (_steam == null)
-            {
-                ErrorLine = "This build has no Steam support - use LAN instead.";
-                return;
-            }
-            if (!_steam.SteamAvailable())
-            {
-                ErrorLine = "Steam isn't running - use LAN instead.";
-                return;
-            }
-
-            BeginSession(CoopRole.Host, true);
-            HostPassword = password ?? "";
-            try
-            {
-                SetConnectionProvider(new SteamConnectionProvider(_steam));
-                ConnectionProvider.Host(0, isPublic, lobbyName, HostPassword, maxPlayers);
-                SetStatus("Creating Steam lobby...");
-            }
-            catch (Exception error)
-            {
-                AbortSessionStart("Could not host: " + error.Message);
-            }
-        }
-
-        public void OpenSteamInvite() => _steam?.OpenInviteDialog();
-
-        public void StartHosting()
-        {
-            ErrorLine = "";
-            ClearDisconnectMetadata();
-            if (Role != CoopRole.None)
-            {
-                ErrorLine = "Already in a session.";
-                return;
-            }
-            if (!TryAdmitHostStart(out var admissionError))
-            {
-                ErrorLine = admissionError;
-                return;
-            }
-
-            BeginSession(CoopRole.Host, false);
-            try
-            {
-                SetConnectionProvider(new LanConnectionProvider());
-                ConnectionProvider.Host(CoopPlugin.Port.Value);
-                SetStatus("Hosting - waiting for a player...");
-                if (CoopPlugin.AutoLanPassword.Value && string.IsNullOrEmpty(HostPassword))
+                if (hosting)
                 {
-                    HostPassword = GenerateSessionPassword();
+                    if (!TryAdmitHostStart(out var admissionError))
+                    {
+                        ErrorLine = admissionError;
+                        NoteBackendError(backend, mode, admissionError);
+                        return;
+                    }
                 }
-                BeginInviteResolve();
-            }
-            catch (Exception error)
-            {
-                AbortSessionStart("Could not host: " + error.Message);
-            }
-        }
+                else if (InGameLevel())
+                {
+                    ErrorLine = "Join from the main menu (Title screen).";
+                    NoteBackendError(backend, mode, ErrorLine);
+                    return;
+                }
 
-        public void JoinHostedGame(string ip) => JoinHostedGame(ip, CoopPlugin.Port.Value, "");
-
-        public void JoinHostedGame(string ip, int joinPort, string password)
-        {
-            ErrorLine = "";
-            ClearDisconnectMetadata();
-            if (Role != CoopRole.None)
+                BeginSession(hosting ? CoopRole.Host : CoopRole.Client);
+            }
+            else if (!hosting || Role != CoopRole.Host)
             {
                 ErrorLine = "Already in a session.";
-                return;
-            }
-            if (InGameLevel())
-            {
-                ErrorLine = "Join from the main menu (Title screen).";
-                return;
-            }
-            ip = (ip ?? "").Trim();
-            if (ip.Length == 0)
-            {
-                ErrorLine = "Enter the host's IP address.";
+                NoteBackendError(backend, mode, ErrorLine);
                 return;
             }
 
-            CoopPlugin.LastJoinIP.Value = ip;
-            BeginSession(CoopRole.Client, false);
-            _joinPassword = password ?? "";
+            EnsureBackendWired(backend);
+            if (hosting)
+            {
+                if (values != null && values.TryGetValue(FieldId.Password, out var hostPassword))
+                {
+                    HostPassword = hostPassword ?? "";
+                }
+            }
+            else
+            {
+                // The JOIN password is read from the backend's own fields, not from the raw form
+                // values: a pasted invite/reach code carries the password, and the backend unfolds
+                // it into its Password field in Configure. The raw field would still be blank.
+                _joinPassword = FieldValue(backend, ConnectMode.Join, FieldId.Password);
+            }
+
             try
             {
-                SetConnectionProvider(new LanConnectionProvider());
-                var port = joinPort > 0 && joinPort <= 65535 ? joinPort : CoopPlugin.Port.Value;
-                ConnectionProvider.Join(ip, port);
-                SetStatus("Connecting to " + ip + "...");
+                // Capture the generation NOW: a backend whose connect is asynchronous (Steam's lobby
+                // entry) can report back after this session has ended and a new one has started, and
+                // that late result must not touch the new session.
+                var generation = SessionGeneration;
+                var id = backend.Connect(mode, values,
+                    (handle, result) => OnBackendConnectResult(backend, handle, result, generation));
+                lock (_sessionLock)
+                {
+                    _connections[backend] = id;
+                }
+
+                if (!hosting || _activeBackend == null)
+                {
+                    _activeBackend = backend;
+                }
+
+                SetStatus(hosting ? "Hosting..." : "Connecting...");
             }
             catch (Exception error)
             {
-                AbortSessionStart("Could not connect: " + error.Message);
+                // A backend that threw while connecting is a failed ADDITION, not necessarily the end
+                // of the session - see OnBackendFailed, which ends it only when nothing is left.
+                OnBackendFailed(backend, "Could not connect: " + error.Message);
             }
         }
 
@@ -417,111 +439,347 @@ namespace CardShopCoop
 
         public void SendEmote() => PresenceApi.SendEmote();
 
-        private void BeginSession(CoopRole role, bool steam)
+        private void BeginSession(CoopRole role)
         {
             _shutdownCompleted = false;
             _dispatcher.Start();
             Interlocked.Increment(ref _sessionGeneration);
             Role = role;
-            IsSteamSession = steam;
             _localConnectionId = role == CoopRole.Host ? 0 : -1;
+            _joinAttempt = 0;
+            _joinAttemptAt = Time.unscaledTime + JoinAttemptSeconds;
             if (role == CoopRole.Client)
             {
                 SaveTransferApi.SetGuestBorrowedWorld(true);
             }
+
+            // The runtime - and with it EVERY module's message handlers, which each behaviour binds in
+            // its OnEnable - must exist BEFORE the transport starts, because starting the transport is
+            // what freezes the protocol session (KcpSessionManager.Start acquires the catalog lease).
+            // A handler registered after that freeze is parked in _pendingHandlers and is NOT
+            // dispatchable for the whole session, which is what produced "no handler bound" for every
+            // module message and eventually overflowed the client's inbound queue.
+            //
+            // This must NOT wait for Net to exist: at this point the transport has not been created yet,
+            // and waiting is precisely the ordering that broke. Behaviours bind handlers on activation
+            // and only send from their own ticks, by which time the transport is there.
+            ActivateLiveModuleHooks();
         }
 
-        private IConnectionProvider ConnectionProvider
+        /// <summary>
+        /// A join is "attempting" while the session exists and no peer has answered. Nothing else ends it:
+        /// the transport keeps probing happily, so a friend who never made it through leaves the player
+        /// on CONNECTING forever with no reason given. After <see cref="JoinAttempts"/> windows of
+        /// <see cref="JoinAttemptSeconds"/> the attempt is failed, which is what surfaces the reason and
+        /// lets the UI reveal whatever the player needs to change.
+        /// </summary>
+        private void CheckJoinAttempts()
         {
-            get => _connectionProvider;
-            set
+            if (Role != CoopRole.Client || Net == null || Net.ConnectionCount > 0)
             {
-                if (ReferenceEquals(_connectionProvider, value))
+                return;
+            }
+
+            var now = Time.unscaledTime;
+            if (now < _joinAttemptAt)
+            {
+                return;
+            }
+
+            _joinAttempt++;
+            if (_joinAttempt < JoinAttempts)
+            {
+                _joinAttemptAt = now + JoinAttemptSeconds;
+                CoopPlugin.Log.LogInfo("coop: still trying to reach the host (attempt "
+                    + _joinAttempt + " of " + JoinAttempts + ")");
+                return;
+            }
+
+            AbortSessionStart("no answer from your friend's game after "
+                + (JoinAttempts * JoinAttemptSeconds) + "s ("
+                + JoinAttempts + " attempts).");
+        }
+
+        // ------------------------------------------------------------------ backend wiring
+
+        /// <summary>Subscribes to a backend once. Every callback carries the backend's own handle,
+        /// which is how a late callback from a superseded connection is dropped.</summary>
+        private void EnsureBackendWired(INetworkingBackend backend)
+        {
+            lock (_sessionLock)
+            {
+                if (!_wired.Add(backend))
                 {
-                    OnProviderTransportChanged();
+                    return;
+                }
+            }
+
+            backend.TransportChanged += (handle, transport) =>
+                OnBackendTransportChanged(backend, transport);
+            backend.PeerConnected += (handle, connection) => OnBackendPeerConnected(connection);
+            backend.Failed += (handle, reason) => OnBackendFailed(backend, reason);
+            backend.JoinRequested += (requesting, values) => OnBackendJoinRequested(requesting, values);
+        }
+
+        /// <summary>
+        /// A backend received an out-of-band join request the player accepted (a Steam invite).
+        /// Session admission belongs to the runtime, so this just starts a client session - on the
+        /// Unity thread, which is where ConnectBackend must run.
+        /// </summary>
+        private void OnBackendJoinRequested(INetworkingBackend backend, FieldValues values)
+        {
+            if (Role != CoopRole.None)
+            {
+                CoopPlugin.Log.LogInfo("ignoring an inbound join request - already in a session");
+                return;
+            }
+
+            if (!TryEnqueueMainThread(() => ConnectBackend(backend, ConnectMode.Join, values)))
+            {
+                CoopPlugin.Log.LogError(
+                    "coop: could not queue the inbound join request on the Unity thread");
+            }
+        }
+
+        private void OnBackendConnectResult(INetworkingBackend backend, ConnectionId handle,
+            ConnectResult result, int generation)
+        {
+            if (!IsSessionGeneration(generation))
+            {
+                return;
+            }
+
+            if (!result.Success)
+            {
+                // Same treatment as any other backend failure, for the same reason: the BACKEND owns
+                // its transport, so tearing it down here is also what clears a failed attempt's
+                // "active" state. Without that the group kept offering a Stop button for an attempt
+                // that was already over, and pressing it could only do nothing.
+                //
+                // And the session ends ONLY if nothing is left. Aborting it outright - which is what
+                // this path used to do - is why a failed Steam host took working direct-IP hosting
+                // down with it: the two backends are independent on purpose.
+                OnBackendFailed(backend, result.Error ?? "connection failed");
+                return;
+            }
+
+            ClearBackendError(backend, _activeMode);
+
+            // A LAN host generates its session password inside the backend; adopt it here so the
+            // join handshake compares against the real one.
+            var info = backend.ConnectionInfo;
+            if (Role == CoopRole.Host && !string.IsNullOrEmpty(info.Password))
+            {
+                HostPassword = info.Password;
+            }
+
+            ErrorLine = "";
+            SetStatus(Role == CoopRole.Host ? "Hosting - waiting for a player..." : "Connected");
+        }
+
+        private void OnBackendTransportChanged(INetworkingBackend backend, ICoopTransport transport)
+        {
+            if (transport == null)
+            {
+                RemoveBackendChild(backend);
+                return;
+            }
+
+            lock (_sessionLock)
+            {
+                _children[backend] = transport;
+            }
+
+            if (_group == null)
+            {
+                _group = new CoopTransportGroup();
+            }
+
+            _group.Add(transport, backend.ConnectionIdBase);
+            if (_pump == null)
+            {
+                _pump = NetworkPump.Wrap(_group);
+                Net = _pump;
+                ((ICoopStartable)_pump).Start();
+                if (Role != CoopRole.None && _runtime == null)
+                {
+                    ActivateLiveModuleHooks();
+                }
+            }
+        }
+
+        private void RemoveBackendChild(INetworkingBackend backend)
+        {
+            ICoopTransport child;
+            lock (_sessionLock)
+            {
+                if (!_children.TryGetValue(backend, out child))
+                {
+                    return;
+                }
+                _children.Remove(backend);
+            }
+
+            _group?.Remove(child);
+        }
+
+        /// <summary>
+        /// Stops hosting on ONE backend: its listeners go down and the peers that came in through it
+        /// disconnect, while the session and every other hosting backend keep running. A shop can be
+        /// reachable over LAN and Steam friends at once, and either can be closed on its own.
+        ///
+        /// The last one ends the session instead, because a host with no transport is just a dead
+        /// session - the modules and the runtime would keep running with nothing to send over.
+        /// </summary>
+        public void StopHosting(INetworkingBackend backend)
+        {
+            if (backend == null)
+            {
+                return;
+            }
+
+            if (Role != CoopRole.Host)
+            {
+                // Nothing to stop: this is not hosting. Say so rather than returning silently, because
+                // the window draws this container's Stop from the BACKEND's own active flag - so the two
+                // disagreeing is exactly the case worth seeing in a log.
+                CoopPlugin.Log.LogInfo("stop ignored for " + backend.Id + ": role is " + Role);
+                return;
+            }
+
+            var last = false;
+            ConnectionId connection;
+            lock (_sessionLock)
+            {
+                if (!_connections.TryGetValue(backend, out connection))
+                {
+                    // The backend says it is hosting - that is why the button is there - but this
+                    // session has no connection recorded for it. Log the disagreement: it is the only
+                    // way to tell a stale backend flag from a Stop press that did nothing.
+                    CoopPlugin.Log.LogInfo("stop ignored for " + backend.Id
+                        + ": it is not carrying this session (" + _connections.Count
+                        + " backend(s) are)");
                     return;
                 }
 
-                if (_connectionProvider != null)
+                last = _connections.Count <= 1;
+                if (!last)
                 {
-                    _connectionProvider.TransportChanged -= OnProviderTransportChanged;
-                    _connectionProvider.PeerConnected -= OnProviderPeerConnected;
-                    _connectionProvider.Failed -= OnProviderFailed;
+                    _connections.Remove(backend);
                 }
-                _connectionProvider = value;
-                if (_connectionProvider != null)
-                {
-                    _connectionProvider.TransportChanged += OnProviderTransportChanged;
-                    _connectionProvider.PeerConnected += OnProviderPeerConnected;
-                    _connectionProvider.Connected += OnProviderConnected;
-                    _connectionProvider.Failed += OnProviderFailed;
-                }
-                OnProviderTransportChanged();
             }
-        }
 
-        private void OnProviderConnected()
-        {
-        }
-
-        private void OnProviderFailed(string reason)
-        {
-            AbortSessionStart(reason ?? "connection failed");
-        }
-
-        private void OnProviderTransportChanged()
-        {
-            var providerTransport = _connectionProvider?.Transport;
-            if (ReferenceEquals(providerTransport, _providerTransportSource))
+            if (last)
             {
+                Disconnect();
                 return;
             }
 
-            _providerTransportSource = providerTransport;
-            Net = providerTransport;
-            if (Net != null && Role != CoopRole.None && _runtime == null)
-            {
-                ActivateLiveModuleHooks();
-            }
+            // The backend tears its own transport down and reports that through
+            // OnBackendTransportChanged, which removes it from the group; the other children stay.
+            backend.Disconnect(connection);
         }
 
-        private void OnProviderPeerConnected(PeerConnection connection)
+        /// <summary>HOST ONLY: remove one client from the session, telling it why. The host and every
+        /// other client keep playing; only the named peer is dropped. Guarded on the role because
+        /// this is a public API: a client calling it would otherwise drop its OWN host link (its only
+        /// connection) and misreport it as a kick.</summary>
+        public void KickPeer(int connectionId)
         {
+            if (Role != CoopRole.Host || connectionId <= 0)
+            {
+                CoopPlugin.Log.LogWarning("kick ignored: role=" + Role + " connection=" + connectionId);
+                return;
+            }
+
+            var connection = ConnectionFor(connectionId);
             if (connection == null || Net == null)
             {
+                CoopPlugin.Log.LogWarning("kick ignored: no live connection " + connectionId);
                 return;
             }
 
-            if (Role == CoopRole.Host)
+            CoopPlugin.Log.LogInfo("kicking peer " + connectionId);
+            Net.GracefulDisconnect(connection,
+                new DisconnectInfo("the host removed you from the session.", false, "kicked",
+                    false, connection.State));
+        }
+
+        private void OnBackendPeerConnected(PeerConnection connection)
+        {
+            if (connection == null || Net == null || Role != CoopRole.Client)
             {
-                // Feature baselines are admitted only after the named Hello has passed. The
-                // FullyJoined callback owns the authoritative post-transfer baseline; nothing
-                // may queue application traffic for a still-handshaking peer here.
+                return;
             }
-            else if (Role == CoopRole.Client)
+
+            // The transport raises this from its pump thread, which is the network thread.
+            // SendHello reads UnityEngine.Application and does catalog file/reflection work, so it
+            // must stay on the Unity thread rather than blocking the network pump.
+            if (Thread.CurrentThread.ManagedThreadId == _unityThreadId)
             {
-                // The transport raises this from its pump thread, which is the network thread.
-                // SendHello reads UnityEngine.Application and does catalog file/reflection work,
-                // so it must stay on the Unity thread rather than blocking the network pump.
-                if (Thread.CurrentThread.ManagedThreadId == _unityThreadId)
-                {
-                    SendHello();
-                }
-                else if (!TryEnqueueMainThread(SendHello))
-                {
-                    CoopPlugin.Log.LogError(
-                        "coop: could not queue the application Hello on the Unity thread");
-                }
+                SendHello();
+            }
+            else if (!TryEnqueueMainThread(SendHello))
+            {
+                CoopPlugin.Log.LogError(
+                    "coop: could not queue the application Hello on the Unity thread");
             }
         }
 
-        private void SetConnectionProvider(IConnectionProvider provider)
+        private void OnBackendFailed(INetworkingBackend backend, string reason)
         {
-            ConnectionProvider = provider ?? throw new ArgumentNullException(nameof(provider));
+            var text = reason ?? "connection failed";
+
+            // File it against the backend that produced it, in the mode it was started in, so it lands
+            // in that backend's own section instead of reading as a session-wide problem.
+            ErrorLine = text;
+            NoteBackendError(backend, _activeMode, text);
+            CoopPlugin.Log.LogError("coop: " + (backend?.Id ?? "session") + " failed: " + text);
+
+            ConnectionId handle;
+            var remaining = 0;
+            lock (_sessionLock)
+            {
+                handle = _connections.TryGetValue(backend, out var current) ? current : default;
+                _connections.Remove(backend);
+                remaining = _connections.Count;
+            }
+
+            // The BACKEND owns its transport, so it is the one that must tear it down. Removing the
+            // child from the group alone leaves its socket and receive thread alive.
+            if (handle.IsValid)
+            {
+                try
+                {
+                    backend.Disconnect(handle);
+                }
+                catch (Exception error) { CoopLog.Swallow(error); }
+            }
+
+            RemoveBackendChild(backend);
+
+            // The session only ends when nothing is left to carry it. A backend that failed while
+            // another one is still hosting is an addition that did not work, not the end of anything.
+            if (Role == CoopRole.Client || remaining == 0)
+            {
+                Shutdown(text);
+            }
+            else
+            {
+                CoopPlugin.Log.LogWarning("transport '" + backend.Id + "' dropped: " + reason);
+            }
         }
 
         private void ActivateLiveModuleHooks()
         {
+            // Deliberately logged BEFORE the early return: the question this answers is whether the
+            // request arrives at all, with what role, and whether a transport exists yet. A client can
+            // only bind its module handlers once this has actually created a runtime, and every previous
+            // guess about that ordering has been wrong, so the path now says what it saw.
+            CoopPlugin.Log.LogInfo("co-op runtime activation: role=" + Role
+                + ", runtime=" + (_runtime == null ? "none" : _runtime.GetType().Name)
+                + ", net=" + (Net == null ? "none" : "up"));
+
             if (_runtime != null)
             {
                 return;
@@ -580,9 +838,10 @@ namespace CardShopCoop
             }
         }
 
-        private void AbortSessionStart(string reason)
+        private void AbortSessionStart(string reason, INetworkingBackend backend = null)
         {
             ErrorLine = reason ?? "session could not start";
+            NoteBackendError(backend, _activeMode, ErrorLine);
             CoopPlugin.Log.LogError("coop: " + ErrorLine);
             Shutdown(ErrorLine);
         }
@@ -596,7 +855,7 @@ namespace CardShopCoop
                 WireVersion = Msg.WireVersion,
                 Version = CoopPlugin.Version,
                 PlayerName = EffectivePlayerName,
-                SteamId = _steam == null ? 0 : _steam.LocalSteamId,
+                SteamId = _activeBackend == null ? 0UL : _activeBackend.LocalUserId,
                 Password = _joinPassword,
                 PluginHash = Util.ModParity.PluginHash(),
                 EnumHash = catalog.EnumHash,
@@ -886,11 +1145,19 @@ namespace CardShopCoop
 
             var peerName = ResolvePeerName(hello.SteamId, name);
             PresenceApi.SetPeerName(connection.Id, peerName);
+            // Remember the client's enum identity for the cross-build pre-send gate: it is the
+            // only place the host learns which object types this peer can represent.
+            CatalogIdMap.SetPeerIdentity(hello.EnumIdentity);
             if (!connection.TryTransition(ConnectionState.Transferring))
             {
                 CoopPlugin.Log.LogWarning("Ignoring Hello from connection in invalid phase " + connection.State);
                 return;
             }
+
+            // Only once the connection is actually admitted: this branch does NOT disconnect, so a
+            // write before the transition would linger until the handshake timeout reaps the peer.
+            _peerBuilds[connection.Id] = new CoopPeerBuild(
+                hello.Version ?? "", hello.GameVersion ?? "", hello.UnityVersion ?? "");
 
             try
             {
@@ -924,7 +1191,9 @@ namespace CardShopCoop
                     WireVersion = Msg.WireVersion,
                     Version = CoopPlugin.Version,
                     HostName = EffectivePlayerName,
-                    SteamId = _steam == null ? 0 : _steam.LocalSteamId,
+                    GameVersion = Application.version ?? "",
+                    UnityVersion = Application.unityVersion ?? "",
+                    SteamId = _activeBackend == null ? 0UL : _activeBackend.LocalUserId,
                     SaveLength = offer.SaveLength,
                     BundleLength = offer.BundleLength,
                     SidecarsComplete = offer.SidecarsComplete,
@@ -994,6 +1263,10 @@ namespace CardShopCoop
             }
             CatalogIdMap.Build(welcome.HostEnumIdentity);
             _localConnectionId = welcome.SelfId;
+            // Record what the host advertised, so the connected panel can name the build joined.
+            _hostVersion = welcome.Version ?? "";
+            _hostGameVersion = welcome.GameVersion ?? "";
+            _hostUnityVersion = welcome.UnityVersion ?? "";
             PresenceApi.SetPeerName(1, ResolvePeerName(welcome.SteamId, welcome.HostName));
             if (!SaveTransferApi.TryBeginClientTransfer(welcome.SaveLength,
                 welcome.BundleLength, welcome.SidecarsComplete, welcome.SidecarWarning))
@@ -1128,7 +1401,6 @@ namespace CardShopCoop
                 return;
             }
             _shutdownCompleted = true;
-            IsTearingDown = true;
             Interlocked.Increment(ref _sessionGeneration);
             _dispatcher.InvalidateEpoch();
 
@@ -1140,7 +1412,7 @@ namespace CardShopCoop
                         ?? new DisconnectInfo(reason ?? "session ended", false, "shutdown", true));
                 }
                 Net.Stop();
-                while (Net.Disconnects.TryDequeue(out var ended))
+                while (Net.TryDequeueDisconnect(out var ended))
                 {
                     _runtime?.ClientDisconnected(ended.Connection, ended.Disconnect);
                 }
@@ -1161,9 +1433,7 @@ namespace CardShopCoop
                 }
                 finally
                 {
-                    ConnectionProvider?.Dispose();
-                    ConnectionProvider = null;
-                    Net = null;
+                    TearDownTransport();
                     _liveRuntimeContext = null;
                 }
             }
@@ -1171,6 +1441,7 @@ namespace CardShopCoop
             SaveTransferApi.ClearBorrowedWorldIfSafe(InGameLevel());
             SaveTransferRuntimeReset();
             PresenceApi.ClearPeerNames();
+            _peerBuilds.Clear();
             HudApi.Clear();
             CatalogIdMap.Clear();
             Modules.World.WorldHostBehaviour.ResetCardState();
@@ -1180,13 +1451,13 @@ namespace CardShopCoop
             _dispatchRejectedConnections.Clear();
             _localConnectionId = -1;
             _sessionInGame = false;
-            IsSteamSession = false;
             HostPassword = "";
             _joinPassword = "";
-            _steam?.Leave();
+            _hostVersion = "";
+            _hostGameVersion = "";
+            _hostUnityVersion = "";
             Application.runInBackground = false;
             Role = CoopRole.None;
-            IsTearingDown = false;
             SetStatus(reason == null ? "Not connected" : "Not connected (" + reason + ")");
         }
 
@@ -1218,6 +1489,8 @@ namespace CardShopCoop
                 AutoTick(Time.deltaTime);
             }
 
+            CheckJoinAttempts();
+
             if (Input.GetKeyDown(CoopPlugin.UiToggleKey.Value))
             {
                 _ui.Visible = !_ui.Visible;
@@ -1233,6 +1506,13 @@ namespace CardShopCoop
             {
                 SaveTransferApi.ClearBorrowedWorldIfSafe(false);
             }
+            // Keep the game running while it is unfocused for the WHOLE of any session - not merely
+            // once a transport object exists. A host waiting on its address build or its lobby, and a
+            // client still joining, are exactly the moments the player has switched away, and pausing
+            // there stalls the very start they are waiting on. This used to sit BELOW the "Net == null"
+            // return, so a session that had a role but no transport yet never got it.
+            Application.runInBackground = Role != CoopRole.None;
+
             if (Net == null)
             {
                 return;
@@ -1242,8 +1522,6 @@ namespace CardShopCoop
                 _sessionInGame = true;
                 CoopPlugin.Log.LogInfo("co-op session world gate opened");
             }
-
-            Application.runInBackground = true;
             using (Util.PerfProbe.Sample("core.disconnect-drain"))
             {
                 DrainDisconnects();
@@ -1271,11 +1549,12 @@ namespace CardShopCoop
         {
             var drained = 0;
             while (drained++ < MaxDisconnectResultsPerFrame
-                && Net != null && Net.Disconnects.TryDequeue(out var disconnected))
+                && Net != null && Net.TryDequeueDisconnect(out var disconnected))
             {
                 var id = disconnected.Connection.Id;
                 _runtime?.ClientDisconnected(disconnected.Connection, disconnected.Disconnect);
                 PresenceApi.RemovePeer(id);
+                _peerBuilds.Remove(id);
                 if (Role == CoopRole.Client)
                 {
                     var detail = disconnected.Disconnect;
@@ -1288,6 +1567,10 @@ namespace CardShopCoop
                     Shutdown(detail?.Reason ?? "host connection lost", detail);
                     return;
                 }
+
+                // The host keeps hosting; forget the departed peer so the cross-build furniture
+                // gate cannot keep blocking local purchases against a peer that is gone.
+                CatalogIdMap.ClearPeerIdentity();
                 CoopPlugin.Log.LogInfo("peer " + id + " disconnected: "
                     + (disconnected.Disconnect?.Code ?? "?") + " / "
                     + (disconnected.Disconnect?.Reason ?? "no detail"));
@@ -1368,16 +1651,6 @@ namespace CardShopCoop
                 {
                     Dispatch(message);
                 }
-                catch (ReliableMessageHandlerException error)
-                {
-                    MarkDispatchConnectionRejected(message.Connection);
-                    CoopPlugin.Log.LogError("reliable dispatch failed for connection "
-                        + message.Connection?.Id + " type=" + message.MessageType?.FullName
-                        + "; the peer was disconnected and the remaining messages were held: "
-                        + error.InnerException);
-                    consumed = i + 1;
-                    break;
-                }
                 catch (Exception error)
                 {
                     if (IsReliable(message))
@@ -1427,11 +1700,16 @@ namespace CardShopCoop
             // The router owns the pre-authentication control path as well as the authenticated
             // application path. A named frame is allowed before compact-id activation only when
             // its core-owned handler and the connection phase both authorize it.
-            if (_messageRouter.DispatchCore(context, message.Message))
+            var outcome = _messageRouter.DispatchCore(context, message.Message);
+            if (outcome == DispatchOutcome.Handled)
             {
                 return true;
             }
-            if (message.ReceivedBeforeMessageIdActivation)
+            // A pre-activation frame with no handler or an unauthorized one is a peer violation.
+            // A handler that RAN and threw is not: it is our own bug, and the router has already
+            // discarded the message and kept the session, so it must not be reported as a peer
+            // protocol violation and disconnected.
+            if (outcome == DispatchOutcome.Rejected && message.ReceivedBeforeMessageIdActivation)
             {
                 Net.GracefulDisconnect(message.Connection, new DisconnectInfo(
                     "non-handshake message received before catalog activation", false,
@@ -1573,15 +1851,9 @@ namespace CardShopCoop
             return true;
         }
 
-        private string ResolvePeerName(ulong steamId, string wireName)
+        private static string ResolvePeerName(ulong steamId, string wireName)
         {
-            var fallback = string.IsNullOrWhiteSpace(wireName) ? "Player" : wireName;
-            if (steamId == 0 || _steam == null)
-            {
-                return fallback;
-            }
-            var nickname = _steam.FriendNickname(steamId);
-            return string.IsNullOrWhiteSpace(nickname) ? fallback : nickname;
+            return string.IsNullOrWhiteSpace(wireName) ? "Player" : wireName;
         }
 
         private void SetStatus(string status)
@@ -1590,16 +1862,24 @@ namespace CardShopCoop
             HudApi.SetStatusLine(StatusLine, 8f);
         }
 
-        private void Guarded(string stage, Action action)
+        /// <summary>Raised by the router on the main thread when a reliable handler threw and its
+        /// message was discarded. The session is still up, so the player is told rather than being
+        /// disconnected: the alert names the message and the exception, and repeating the same
+        /// failure bumps its count instead of stacking popups.</summary>
+        private void OnHandlerFailed(HandlerFailure failure)
         {
-            try
+            if (failure == null)
             {
-                Util.PerfProbe.Measure(stage, action);
+                return;
             }
-            catch (Exception error)
-            {
-                Runtime.ModuleGuard.Log(stage, error);
-            }
+
+            var error = failure.Error;
+            var detail = (failure.WireName ?? "<unknown>") + " from connection "
+                + (failure.Context?.ConnectionId ?? 0) + ": "
+                + (error == null ? "unknown error" : error.GetType().Name + ": " + error.Message);
+            UI.CoopAlert.Show(
+                "A co-op message could not be processed and was skipped. The session continues.",
+                detail);
         }
 
         private void RememberDisconnect(DisconnectInfo detail)
@@ -1618,7 +1898,6 @@ namespace CardShopCoop
             LastDisconnectCode = "";
             LastDisconnectReason = "";
             LastDisconnectRetryable = false;
-            LastFailedLobby = 0;
         }
 
         private void OnLocalPackOpened(CEventPlayer_OnOpenCardPack eventData)
@@ -1691,6 +1970,17 @@ namespace CardShopCoop
             return manager != null ? manager : SceneRef<CGameManager>.Get();
         }
 
+        /// <summary>True once a save is loaded (a gameplay level is active). This is what decides
+        /// whether the co-op window offers HOST (in a save) or JOIN (at the title screen), replacing
+        /// the old manual host/join toggle.
+        ///
+        /// Deliberately the SAME flag <see cref="TryAdmitHostStart"/> admits a host on: the window
+        /// must not offer HOST in a state hosting would then refuse. In the documented case where
+        /// m_IsGameLevel stays false after an aborted level load, the shop is live but hosting is
+        /// unavailable anyway, so JOIN is the honest half to show - changing THAT is a
+        /// host-admission question (InGameplayScene), not a display one.</summary>
+        public bool InSave => InGameLevel();
+
         private bool InGameLevel()
         {
             var manager = GameManager();
@@ -1732,108 +2022,137 @@ namespace CardShopCoop
                 }
                 else if (_autoPhase == 2 && _autoTimer > 3f)
                 {
-                    StartHosting();
+                    AutoHost();
                     _autoPhase = 99;
                 }
             }
             else if (_autoJoinIp != null && _autoPhase == 0 && _autoTimer > 10f && !InGameLevel())
             {
-                JoinHostedGame(_autoJoinIp);
+                AutoJoinIp(_autoJoinIp);
                 _autoPhase = 99;
             }
-            else if (_autoJoinSteamLobby != 0 && _steam != null && _autoPhase == 0
-                && _autoTimer > 10f && !InGameLevel())
+            else if (_autoJoinSteamLobby != 0 && _autoPhase == 0 && _autoTimer > 10f && !InGameLevel())
             {
-                JoinSteamLobby(_autoJoinSteamLobby);
+                AutoJoinSteam(_autoJoinSteamLobby);
                 _autoPhase = 99;
             }
         }
 
-        private void BeginInviteResolve()
+        /// <summary>Reads a field's current value straight from the backend, so a value the backend
+        /// derived (a password unfolded from a pasted code) is used rather than the raw form.</summary>
+        private static string FieldValue(INetworkingBackend backend, ConnectMode mode, FieldId field)
         {
-            InviteStatus = InviteState.Resolving;
-            InviteCodeText = null;
-            InviteReason = null;
-            PortForwardState = 0;
-            var port = CoopPlugin.Port.Value;
-            var password = HostPassword ?? "";
-            var generation = Interlocked.Increment(ref _inviteGeneration);
-            new Thread(() =>
+            IReadOnlyList<BackendField> fields;
+            try
             {
-                string publicIp = null;
-                string reason = null;
+                fields = backend.GetFields(mode);
+            }
+            catch (Exception error)
+            {
+                CoopLog.Swallow(error);
+                return "";
+            }
+
+            for (var i = 0; i < fields.Count; i++)
+            {
+                if (fields[i].Id == field)
+                {
+                    return fields[i].Value ?? "";
+                }
+            }
+
+            return "";
+        }
+
+        private INetworkingBackend BackendById(string id)
+        {
+            foreach (var backend in Backends)
+            {
+                if (backend.Id == id)
+                {
+                    return backend;
+                }
+            }
+
+            return null;
+        }
+
+        private void AutoHost()
+        {
+            var ip = BackendById("ip");
+            if (ip != null)
+            {
+                ConnectBackend(ip, ConnectMode.Host, null);
+            }
+        }
+
+        private void AutoJoinIp(string address)
+        {
+            var ip = BackendById("ip");
+            if (ip != null)
+            {
+                ConnectBackend(ip, ConnectMode.Join, Values(FieldId.IpAddress, address));
+            }
+        }
+
+        private void AutoJoinSteam(ulong lobby)
+        {
+            var steam = BackendById("steam");
+            if (steam != null)
+            {
+                ConnectBackend(steam, ConnectMode.Join,
+                    Values(FieldId.Lobby, lobby.ToString(CultureInfo.InvariantCulture)));
+            }
+        }
+
+        private static FieldValues Values(FieldId field, string value)
+        {
+            var values = new FieldValues();
+            values[field] = value;
+            return values;
+        }
+
+        /// <summary>Tears down every backend transport and the one pump that drove them. Called
+        /// from Shutdown; idempotent.</summary>
+        private void TearDownTransport()
+        {
+            List<KeyValuePair<INetworkingBackend, ConnectionId>> connections;
+            lock (_sessionLock)
+            {
+                connections = new List<KeyValuePair<INetworkingBackend, ConnectionId>>(_connections);
+                _connections.Clear();
+                _children.Clear();
+                // _wired is deliberately NOT cleared. The backends are process-lifetime singletons
+                // and these are process-lifetime subscriptions, so re-subscribing every session
+                // would stack duplicate callbacks - the same child added to the group once per
+                // session, the same Hello sent once per session, and so on.
+            }
+
+            foreach (var pair in connections)
+            {
                 try
                 {
-                    NetHelpers.BeginDiscovery();
-                    if (CoopPlugin.AutoPortForward.Value)
-                    {
-                        var mapped = NetHelpers.TryMapPort(port, out var why, out var mappingEpoch);
-                        Publish(generation, () => PortForwardState = mapped ? 1 : 2);
-                        if (mapped)
-                        {
-                            publicIp = NetHelpers.UpnpExternalIp();
-                            if (publicIp != null && !NetHelpers.IsPublicIPv4(publicIp))
-                            {
-                                reason = "your router's internet address is private (carrier-grade NAT)";
-                                publicIp = null;
-                            }
-                        }
-                        else if (why != null)
-                        {
-                            CoopPlugin.Log.LogInfo("automatic port forwarding did not happen: " + why);
-                        }
-                    }
-                    publicIp ??= NetHelpers.StunPublicIp();
-                    if (publicIp != null && !NetHelpers.IsPublicIPv4(publicIp))
-                    {
-                        publicIp = null;
-                    }
+                    pair.Key.Disconnect(pair.Value);
                 }
-                catch (Exception error)
-                {
-                    reason = error.Message;
-                    CoopPlugin.Log.LogWarning("invite code resolve failed: " + error);
-                }
-                var address = publicIp ?? NetHelpers.LocalIPv4ForGateway() ?? NetHelpers.LocalIPv4();
-                var code = address == null ? null : InviteCode.Encode(address, port, password);
-                Publish(generation, () =>
-                {
-                    InviteCodeText = code;
-                    InviteReason = reason;
-                    InviteStatus = publicIp == null ? InviteState.LanOnly : InviteState.Ready;
-                });
-            })
-            {
-                IsBackground = true,
-                Name = "CoopInvite"
-            }.Start();
-        }
-
-        private void Publish(int generation, Action action)
-        {
-            _dispatcher.TryEnqueue("invite-publish", () =>
-            {
-                if (Volatile.Read(ref _inviteGeneration) == generation)
-                {
-                    action();
-                }
-            });
-        }
-
-        private static string GenerateSessionPassword()
-        {
-            const string alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-            var bytes = new byte[8];
-            using (var rng = new System.Security.Cryptography.RNGCryptoServiceProvider())
-            {
-                rng.GetBytes(bytes);
+                catch (Exception error) { CoopLog.Swallow(error); }
             }
-            var chars = new char[bytes.Length];
-            for (var i = 0; i < chars.Length; i++)
+
+            try
             {
-                chars[i] = alphabet[bytes[i] & 31];
+                _pump?.Stop();
             }
-            return new string(chars);
+            catch (Exception error) { CoopLog.Swallow(error); }
+
+            try
+            {
+                _pump?.Dispose();
+            }
+            catch (Exception error) { CoopLog.Swallow(error); }
+
+            _pump = null;
+            _group = null;
+            _activeBackend = null;
+            Net = null;
         }
 
         private void OnGUI()
@@ -1846,6 +2165,7 @@ namespace CardShopCoop
 
         private void OnDestroy()
         {
+            _messageRouter.HandlerFailed -= OnHandlerFailed;
             SceneManager.sceneLoaded -= OnSceneLoaded;
             CEventManager.RemoveListener<CEventPlayer_OnOpenCardPack>(OnLocalPackOpened);
             CEventManager.RemoveListener<CEventPlayer_GameDataFinishLoaded>(OnGameDataFinishLoaded);
