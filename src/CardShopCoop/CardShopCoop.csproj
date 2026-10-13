@@ -148,14 +148,23 @@
        cycle: core has finished building by the time this runs. -->
   <Target Name="BuildOptionalSteamAssembly" AfterTargets="Build"
           Condition="'$(SkipOptionalSteamBuild)' != 'true' and Exists('$(MSBuildThisFileDirectory)..\CardShopCoop.Steam\CardShopCoop.Steam.csproj')">
-    <!-- Restore;Build, not just Build: the Steam project is deliberately NOT a ProjectReference, so
-         the restore the outer build runs never covers it, and a nested Build alone dies with
-         NETSDK1004 on a clean checkout. Restore is a no-op once its assets exist.
+    <!-- Restore the Steam project in its OWN process, then build it in a second invocation.
+         The Steam project is deliberately NOT a ProjectReference, so the outer restore never
+         covers it (a bare nested Build dies with NETSDK1004 on a clean checkout). But a
+         same-invocation "Restore;Build" evaluates the project ONCE, BEFORE Restore writes the
+         restored packages' generated props/targets - so the Microsoft.NETFramework.ReferenceAssemblies
+         targets that supply FrameworkPathOverride are never imported, and a machine with no .NET
+         Framework targeting pack (the Linux CI) dies with MSB3644. A separate process guarantees the
+         restore artifacts exist before the Build's evaluation. The Exists() guard skips the restore
+         once the project has been restored.
          Package=false is load-bearing: a global -p:Package=true would otherwise flow through
          Steam's ProjectReference build of Core, run Core's Package target BEFORE Steam has
          compiled, and trip the "CardShopCoop.Steam.dll was not found" guard. -->
+    <Exec Command="dotnet restore &quot;$(MSBuildThisFileDirectory)..\CardShopCoop.Steam\CardShopCoop.Steam.csproj&quot;"
+          Condition="!Exists('$(MSBuildThisFileDirectory)..\CardShopCoop.Steam\obj\project.assets.json')"
+          StandardOutputImportance="low" />
     <MSBuild Projects="$(MSBuildThisFileDirectory)..\CardShopCoop.Steam\CardShopCoop.Steam.csproj"
-             Targets="Restore;Build"
+             Targets="Build"
              Properties="Configuration=$(Configuration);Deploy=$(Deploy);DeployPath=$(DeployPath);Package=false;SkipOptionalSteamBuild=true" />
   </Target>
 
