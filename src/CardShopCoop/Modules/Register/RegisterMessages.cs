@@ -74,8 +74,6 @@ namespace CardShopCoop.Modules.Register
         public bool HasCustomer;
         public int CustomerIndex = -1;
         public int CustomerGeneration;
-        public bool CustomerFemale;
-        public string CharacterName;
         public List<RegisterLine> Lines = new();
 
         public byte State;
@@ -105,8 +103,6 @@ namespace CardShopCoop.Modules.Register
         public bool HasCustomer;
         public int CustomerIndex = -1;
         public int CustomerGeneration;
-        public bool CustomerFemale;
-        public string CharacterName;
         public byte State;
         public bool UsingCard;
         public double Paid;

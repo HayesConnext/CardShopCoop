@@ -469,8 +469,6 @@ namespace CardShopCoop.Modules.Register
             var station = Observe(RegisterInterop.Key(counter), counter);
             result.CustomerIndex = RegisterInterop.CustomerIndex(customer);
             result.CustomerGeneration = (int)station.CustomerGeneration;
-            result.CustomerFemale = customer.m_IsFemale;
-            result.CharacterName = customer.m_CharacterCustom?.CharacterName;
             result.CustomerTotal = Convert.ToDouble(RegisterInterop.Read(customer,
                 "m_TotalScannedItemCost") ?? 0f);
             AddLines(result.Lines, customer);
@@ -569,8 +567,6 @@ namespace CardShopCoop.Modules.Register
             {
                 delta.CustomerIndex = RegisterInterop.CustomerIndex(customer);
                 delta.CustomerGeneration = (int)station.CustomerGeneration;
-                delta.CustomerFemale = customer.m_IsFemale;
-                delta.CharacterName = customer.m_CharacterCustom?.CharacterName;
                 delta.CustomerTotal = Convert.ToDouble(RegisterInterop.Read(customer,
                     "m_TotalScannedItemCost") ?? 0f);
                 AddLines(delta.Lines, customer);

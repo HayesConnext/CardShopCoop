@@ -449,8 +449,7 @@ namespace CardShopCoop.Modules.Register
             }
 
             var station = GetOrBuildStation(index, baseline.CounterGeneration, baseline.CustomerIndex,
-                baseline.CustomerGeneration, baseline.CharacterName,
-                baseline.Lines, counter);
+                baseline.CustomerGeneration, baseline.Lines, counter);
             if (station == null)
             {
                 return;
@@ -528,8 +527,7 @@ namespace CardShopCoop.Modules.Register
             }
 
             var station = GetOrBuildStation(index, message.CounterGeneration, message.CustomerIndex,
-                message.CustomerGeneration, message.CharacterName,
-                message.Lines, counter);
+                message.CustomerGeneration, message.Lines, counter);
             if (station == null)
             {
                 return;
@@ -629,7 +627,7 @@ namespace CardShopCoop.Modules.Register
         }
 
         private LocalStation GetOrBuildStation(int index, uint counterGeneration, int customerIndex,
-            int customerGeneration, string characterName, List<RegisterLine> lines,
+            int customerGeneration, List<RegisterLine> lines,
             InteractableCashierCounter counter)
         {
             if (counter == null)
@@ -668,11 +666,10 @@ namespace CardShopCoop.Modules.Register
             }
 
             RegisterInterop.ReleaseContents(carrier);
-            if (carrier.m_CharacterCustom != null)
-            {
-                carrier.m_CharacterCustom.CharacterName = characterName;
-                carrier.m_CharacterCustom.Initialize();
-            }
+            // The carrier is deliberately NOT dressed here. The Npc module renders the dressed
+            // clone for this customer (see UpdateCarrierVisibility), so the register never resolves
+            // a preset from its own build's tables - the mismatch that gave an Xbox client the wrong
+            // skin on a Steam host. The carrier is only the interaction/logic object.
 
             if (counter.m_QueueStartPos != null)
             {
