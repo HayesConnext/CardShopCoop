@@ -616,6 +616,12 @@ namespace CardShopCoop
                 return;
             }
 
+            // A backend that starts a SECOND transport without having torn the first one down (an
+            // IP re-connect that overwrote its own _transport) would otherwise leave the old child
+            // in the pump forever, because nothing else references it. Drop any superseded child
+            // first: RemoveBackendChild queues its Stop/Dispose on the pump thread.
+            RemoveBackendChild(backend);
+
             lock (_sessionLock)
             {
                 _children[backend] = transport;

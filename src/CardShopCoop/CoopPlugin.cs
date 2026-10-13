@@ -143,13 +143,16 @@ namespace CardShopCoop
             ForceEntitlements = Config.Bind("Hidden", "ForceEntitlements", false,
                 "TESTING ONLY - NOT FOR PLAYERS. Makes the game answer \"yes\" to every store entitlement (the Game Pass deluxe and pre-order bonuses: their furniture and their coins), as if this account owned them. It exists so the deluxe-only object types can be tested on a build that does not have them. It changes only what the furniture shop offers; it grants nothing else. Off by default, and hidden from the window on purpose.");
 
-            // Game Pass only: the deluxe furniture gate exists only where GA.PlatformManager does, so
-            // bind this option there and nowhere else. The hidden menu draws it only when it is bound,
-            // which keeps it off the Steam build entirely.
+            // Bind this option wherever the deluxe/pre-order gate it forces actually exists, i.e.
+            // wherever GA.PlatformManager is present. That is the Unity 6 / 1.00 builds - the Steam
+            // 1.00 beta AND the Xbox/Game Pass build - NOT the legacy public build, which has no
+            // PlatformManager at all. GA.PlatformManager alone is NOT the Game Pass discriminator
+            // (GA.GamecoreUserManager is); see PlatformProbe. The hidden menu draws the option only
+            // when it is bound, so it stays off builds with no such gate.
             if (Type.GetType("GA.PlatformManager, Assembly-CSharp") != null)
             {
                 ForceDeluxeFurniture = Config.Bind("Hidden", "ForceDeluxeFurniture", false,
-                    "TESTING ONLY. Makes the game treat the deluxe-edition furniture (the infinite scent machine) as owned, so you can buy and place it while testing with deluxe owners. It does NOT unlock pre-order furniture and does NOT grant the deluxe coins or packs - use ForceEntitlements for that blunt version. Game Pass only.");
+                    "TESTING ONLY. Makes the game treat the deluxe-edition furniture (the infinite scent machine) as owned, so you can buy and place it while testing with deluxe owners. It does NOT unlock pre-order furniture and does NOT grant the deluxe coins or packs - use ForceEntitlements for that blunt version. Available only on builds that carry the deluxe/pre-order gate (the 1.00 / Unity 6 builds).");
             }
 
             // Bind one enable/disable checkbox per feature module and say exactly what will run.

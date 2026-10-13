@@ -1041,14 +1041,18 @@ namespace CardShopCoop.UI
             {
                 _svPickerTexture = new Texture2D(96, 64, TextureFormat.RGBA32, false)
                 {
-                    wrapMode = TextureWrapMode.Clamp
+                    wrapMode = TextureWrapMode.Clamp,
+                    // Process-lifetime like CoopTheme's textures: HideAndDontSave keeps Unity from
+                    // destroying them on a scene load (which would dangle the cached reference).
+                    hideFlags = HideFlags.HideAndDontSave
                 };
             }
             if (_huePickerTexture == null)
             {
                 _huePickerTexture = new Texture2D(1, 96, TextureFormat.RGBA32, false)
                 {
-                    wrapMode = TextureWrapMode.Clamp
+                    wrapMode = TextureWrapMode.Clamp,
+                    hideFlags = HideFlags.HideAndDontSave
                 };
                 // Top of the strip is the highest hue, matching the marker and click handler, which
                 // both read the bar top-down (hue 1 at the top). The saturation/value box uses the
@@ -1776,7 +1780,9 @@ namespace CardShopCoop.UI
             const float TipWidth = 230f;
             var style = CoopTheme.Tooltip;
             var height = style.CalcHeight(new GUIContent(text), TipWidth) + 2f;
-            var x = Mathf.Min(_pendingTipAt.x + 14f, _win.xMax - TipWidth - 12f);
+            // _pendingTipAt is Event.current.mousePosition inside the window callback, so it is
+            // window-local GUI space - clamp against the window WIDTH, not the screen-space xMax.
+            var x = Mathf.Min(_pendingTipAt.x + 14f, _win.width - TipWidth - 12f);
             var y = _pendingTipAt.y + 18f;
             GUI.Box(new Rect(x, y, TipWidth, height), text, style);
         }

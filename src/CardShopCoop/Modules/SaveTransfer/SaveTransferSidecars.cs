@@ -385,8 +385,11 @@ namespace CardShopCoop.Modules.SaveTransfer
                 throw new InvalidDataException("Sidecar bundle is empty or exceeds its limit.");
             }
 
+            // The slot token can appear in a DIRECTORY component too (a mod that stores per-slot
+            // files under a per-slot directory, e.g. SaveData_6/state.bin), so the lookahead also
+            // accepts a path separator and the rewrite is applied to the whole relative path.
             var renamePattern = new Regex("(?<=_|Release)" + Regex.Escape(hostSlot.ToString())
-                + "(?=_|\\.|$)", RegexOptions.CultureInvariant);
+                + "(?=_|\\.|/|\\\\|$)", RegexOptions.CultureInvariant);
             var applied = 0;
             var skipped = 0;
             long rawBytes = 0;
@@ -428,11 +431,7 @@ namespace CardShopCoop.Modules.SaveTransfer
                         continue;
                     }
 
-                    var directory = Path.GetDirectoryName(relative) ?? "";
-                    var name = Path.GetFileName(relative);
-                    var rewrittenName = renamePattern.Replace(name, clientSlot.ToString());
-                    var rewrittenRelative = string.IsNullOrEmpty(directory)
-                        ? rewrittenName : Path.Combine(directory, rewrittenName);
+                    var rewrittenRelative = renamePattern.Replace(relative, clientSlot.ToString());
                     if (!TryGetSafePath(root, rewrittenRelative, out var targetPath))
                     {
                         RejectUnsafe(relative);

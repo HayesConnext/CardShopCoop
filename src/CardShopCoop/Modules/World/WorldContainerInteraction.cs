@@ -290,6 +290,15 @@ namespace CardShopCoop.Modules.World
             _hostPackIndex = 0;
         }
 
+        /// <summary>Drops records whose target object the world had not produced yet. Called on a
+        /// world re-baseline: the new baseline re-sends every container it knows, so a record that
+        /// never found its target must not survive into the new baseline and later bind to whatever
+        /// object occupies that index.</summary>
+        internal void ClearPendingRecords()
+        {
+            _pendingRecords.Clear();
+        }
+
         /// <summary>Re-applies every record whose target object the world had not produced when it
         /// arrived, and returns immediately when nothing is outstanding. Called from the world-ready
         /// paths (through WorldCardInteraction.FlushWorldReady, the way every interaction class in this

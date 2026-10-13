@@ -178,6 +178,9 @@ namespace CardShopCoop.Modules.World
             _instance._workbenchInteraction?.Reset();
             _instance._boxNetworkInteraction?.ClientBeginBaseline();
             _instance.ResetCardDisplayState();
+            // The new baseline re-sends every container it knows, so any record that never found its
+            // target under the old baseline must not linger and later bind to a reused index.
+            _instance._cardInteraction?.Containers.ClearPendingRecords();
         }
 
         internal static void CompleteWorldBaseline(long baselineId)

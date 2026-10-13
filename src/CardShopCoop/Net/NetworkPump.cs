@@ -39,6 +39,9 @@ namespace CardShopCoop.Net
         private int _disposed;
         private int _innerStopped;
         private int _innerDisposed;
+        // Set once Run has finished its teardown (or failed to start). InvokeOnPump must run inline
+        // after this: the run loop is gone, so anything queued would only time out the 5s join.
+        private int _loopExited;
         private Exception _startError;
 
         private NetworkPump(ICoopTransport inner)
@@ -114,6 +117,12 @@ namespace CardShopCoop.Net
                     CoopPlugin.Log?.LogError(
                         "network pump startup cleanup failed: " + disposeError);
                 }
+
+                // The inner transport is already disposed, so a later Stop is a no-op - and the
+                // loop is gone, so a queued Stop would only block the caller for the whole join
+                // budget. Mark both so InvokeOnPump runs inline and StopInner short-circuits.
+                Interlocked.Exchange(ref _innerStopped, 1);
+                Volatile.Write(ref _loopExited, 1);
                 _started.Set();
                 return;
             }
@@ -167,6 +176,10 @@ namespace CardShopCoop.Net
                     CoopPlugin.Log?.LogError("network pump dispose failed: " + error);
                 }
             }
+
+            // Teardown is complete and the loop will not run again: from here InvokeOnPump must run
+            // inline rather than queue onto a thread that will never drain it.
+            Volatile.Write(ref _loopExited, 1);
         }
 
         private void DrainControl()
@@ -204,7 +217,8 @@ namespace CardShopCoop.Net
         /// queue). Otherwise queued and awaited so ordering and failures reach the caller.</summary>
         private void InvokeOnPump(Action action, string name)
         {
-            if (IsPumpThread() || _thread == null || !_thread.IsAlive)
+            if (IsPumpThread() || _thread == null || !_thread.IsAlive
+                || Volatile.Read(ref _loopExited) != 0)
             {
                 action();
                 return;
