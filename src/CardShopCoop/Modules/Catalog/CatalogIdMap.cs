@@ -74,12 +74,6 @@ namespace CardShopCoop.Modules.Catalog
             "FoodBowl", // public build only, id 56
         };
 
-        /// <summary>True when <paramref name="memberName"/> is an <c>EObjectType</c> name handled
-        /// by the coalesce table (either an alias source or a dropped member).</summary>
-        internal static bool IsObjectTypeCoalesced(string memberName)
-            => memberName != null
-                && (ObjectTypeAliases.ContainsKey(memberName) || ObjectTypeDropped.Contains(memberName));
-
         /// <summary>The local <c>EObjectType</c> member an alias source coalesces onto, or null
         /// when the name is not an alias source.</summary>
         internal static string ObjectTypeAliasTarget(string memberName)
@@ -157,8 +151,6 @@ namespace CardShopCoop.Modules.Catalog
 
             return hostValue;
         }
-
-        internal static bool HasEnumMap => _enumMap != null;
 
         // ------------------------------------------------------------------ peer representability
 
