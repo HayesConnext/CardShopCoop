@@ -97,8 +97,16 @@ namespace CardShopCoop.Api
 
         /// <summary>
         /// Registers a networking transport, so the co-op window offers it as another way to host
-        /// or join. Returns a handle that unregisters it; dispose the handle from your plugin's
-        /// unload. Only valid once CardShopCoopCommunity is loaded (declare a BepInDependency on
+        /// or join. Returns a handle that unregisters it.
+        ///
+        /// BepInEx 5 has no plugin-unload path: a plugin component lives on BepInEx's shared
+        /// manager object for the whole process, and that object can be destroyed by the game
+        /// while the transport is still wanted. So do NOT dispose the handle from your plugin's
+        /// <c>OnDestroy</c> - that is not an unload signal, and disposing there permanently
+        /// removes the transport for the rest of the run. A transport's registration is
+        /// process-lifetime (the built-in IP backend is the reference); dispose the handle only
+        /// from code that deliberately removes a transport that is no longer wanted.
+        /// Only valid once CardShopCoopCommunity is loaded (declare a BepInDependency on
         /// dev.meepen.cardshopcoop, or guard with <see cref="IsAvailable"/>); otherwise this throws.
         /// </summary>
         public static IDisposable RegisterNetworkingBackend(INetworkingBackend backend)

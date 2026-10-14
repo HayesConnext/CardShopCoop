@@ -3,6 +3,9 @@
 True co-op multiplayer for TCG Card Shop Simulator. Both players must run the
 **same version** — the join handshake enforces it.
 
+## 2.1.1
+- Fixed: the option to host via Steam could disappear entirely, leaving only IP / LAN. Thanks @navsigda on Discord for the report!
+
 ## 2.1.0
 - Fixed a freeze and crash that could happen shortly after joining when the host was in the middle of serving customers: the register's join catch-up could re-enter itself while applying the host's checkout state and loop until the game locked up. The catch-up now runs once and queues anything that arrives while it is applying. Thanks @muck270 on Discord for the report and logs!
 - Moved Direct IP connection details to remove invite codes and instead just use password / IP[:port].

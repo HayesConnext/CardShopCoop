@@ -11,6 +11,9 @@ namespace CardShopCoop.Steam
     /// BepInEx loads core first, so this plugin can simply register its backend through the public
     /// API; the core assembly has no reference to Steam at all, and a build carrying a same-named
     /// Steamworks stub just never registers this backend.
+    ///
+    /// Awake is this plugin's ONLY lifecycle hook. The backend registration is process-lifetime:
+    /// see the comment in <see cref="Register"/> for why <c>OnDestroy</c> must not undo it.
     /// </summary>
     [BepInPlugin(Guid, Name, Version)]
     [BepInDependency("dev.meepen.cardshopcoop", BepInDependency.DependencyFlags.HardDependency)]
@@ -19,8 +22,6 @@ namespace CardShopCoop.Steam
         public const string Guid = "dev.meepen.cardshopcoop.steam";
         public const string Name = "CardShopCoop Steam Transport";
         public const string Version = "1.0.0";
-
-        private IDisposable _registration;
 
         private void Awake()
         {
@@ -32,7 +33,7 @@ namespace CardShopCoop.Steam
 
             try
             {
-                _registration = Register();
+                Register();
                 Logger.LogInfo("Steam transport registered.");
             }
             catch (Exception error)
@@ -49,60 +50,21 @@ namespace CardShopCoop.Steam
         /// time, before the body and its handlers ever run).
         /// </summary>
         [MethodImpl(MethodImplOptions.NoInlining)]
-        private IDisposable Register()
+        private void Register()
         {
             var bridge = new SteamBridgeImpl();
             bridge.Init();
-            var registration = CoopApi.RegisterNetworkingBackend(new SteamNetworkingBackend(bridge));
-            return new SteamRegistration(registration, bridge);
-        }
-
-        private void OnDestroy()
-        {
-            _registration?.Dispose();
-            _registration = null;
-        }
-
-        /// <summary>Disposes the backend registration AND the Steam bridge's native callback
-        /// handles. Its own type keeps the JIT of <see cref="OnDestroy"/> free of any Steam-bearing
-        /// type: on a build carrying a Steamworks stub this instance is never created, so this
-        /// Steam-naming Dispose is never JITted - the same reason <see cref="Register"/> is
-        /// separate and NoInlining.</summary>
-        private sealed class SteamRegistration : IDisposable
-        {
-            private IDisposable _registration;
-            private SteamBridgeImpl _bridge;
-
-            internal SteamRegistration(IDisposable registration, SteamBridgeImpl bridge)
-            {
-                _registration = registration;
-                _bridge = bridge;
-            }
-
-            public void Dispose()
-            {
-                var registration = _registration;
-                var bridge = _bridge;
-                _registration = null;
-                _bridge = null;
-                try
-                {
-                    registration?.Dispose();
-                }
-                catch (Exception error)
-                {
-                    CoopPlugin.Log?.LogWarning("Steam backend unregister failed: " + error.Message);
-                }
-
-                try
-                {
-                    bridge?.Dispose();
-                }
-                catch (Exception error)
-                {
-                    CoopPlugin.Log?.LogWarning("Steam bridge dispose failed: " + error.Message);
-                }
-            }
+            // The handle CoopApi hands back is deliberately NOT kept for OnDestroy. BepInEx 5 has
+            // no plugin-unload path: a plugin component lives on BepInEx's shared manager object
+            // for the whole process, so OnDestroy is not an unload signal. It fires either at
+            // process shutdown, where cleanup is pointless, or when something else destroyed that
+            // shared manager - which this game does on a default install, taking every plugin
+            // component with it. The transport itself keeps working there (its pump lives on
+            // CoopCore's own object), so tearing the registration down would permanently remove
+            // the Steam host option for the rest of the run. Registration is process-lifetime,
+            // exactly like the built-in IP backend; the lobby is left through the session's own
+            // teardown, and the process exit releases the native handles.
+            CoopApi.RegisterNetworkingBackend(new SteamNetworkingBackend(bridge));
         }
     }
 }

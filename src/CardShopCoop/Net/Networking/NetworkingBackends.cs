@@ -47,8 +47,13 @@ namespace CardShopCoop.Net.Networking
             }
         }
 
-        /// <summary>Adds a contributed backend. The returned handle removes it again - dispose it
-        /// from the contributing plugin's unload. Idempotent.</summary>
+        /// <summary>Adds a contributed backend. The returned handle removes it again. Idempotent.
+        ///
+        /// Do NOT dispose the handle from a plugin component's OnDestroy: BepInEx 5 has no unload
+        /// path, so OnDestroy is not an unload signal - it also fires when something else destroys
+        /// the shared manager object every plugin component lives on, and unregistering there
+        /// permanently removes a transport that is still perfectly usable. See
+        /// <see cref="Api.CoopApi.RegisterNetworkingBackend"/>.</summary>
         public static IDisposable Register(INetworkingBackend backend)
         {
             if (backend == null)

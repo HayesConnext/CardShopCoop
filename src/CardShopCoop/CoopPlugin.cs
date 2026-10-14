@@ -1,4 +1,5 @@
 using BepInEx;
+using BepInEx.Bootstrap;
 using BepInEx.Configuration;
 using BepInEx.Logging;
 using System;
@@ -78,6 +79,7 @@ namespace CardShopCoop
             // mods may touch CoopApi from their own Awake, which runs after ours.
             Api.CoopApi.Binding = Runtime.ExternalCoopMods.Instance;
             Api.CoopApi.Log = Logger;
+            ProtectPluginHost();
             Runtime.SceneRef.Install();
             Util.ScreenSingletonGuard.Install();
             try
@@ -239,6 +241,42 @@ namespace CardShopCoop
         private static void AttachCore(GameObject go)
         {
             go.AddComponent<CoopCore>();
+        }
+
+        /// <summary>
+        /// Keeps BepInEx's plugin host - and with it EVERY plugin component, ours and third
+        /// parties' - alive past the game's first scene load.
+        ///
+        /// BepInEx 5 adds every plugin as a component of one shared "BepInEx_Manager"
+        /// GameObject that it protects with DontDestroyOnLoad alone
+        /// (BepInEx.Bootstrap.Chainloader.Start). That protection does not hold here: the
+        /// manager is created during engine startup (the Chainloader patch runs inside
+        /// UnityEngine.InputSystem's static constructor), before any scene exists, and this game
+        /// tears it down when the first scene loads. Reproduced on this machine with BepInEx's
+        /// defaults: right after "Chainloader startup complete" every plugin's OnDestroy runs -
+        /// other mods log their own "Unloaded!", and the Steam transport unregistered its
+        /// networking backend, which removed the Steam host option for the rest of the run
+        /// (reported as "after updating to 2.1.0 the option to host via Steam is missing").
+        ///
+        /// This mod's core survives that teardown only because its real work lives on the
+        /// DontDestroyOnLoad + HideAndDontSave object below - the same combination BepInEx
+        /// applies when its own HideManagerGameObject option is on, and the only difference
+        /// between a surviving install and a broken one. Marking the manager DontSave here
+        /// applies exactly that protection while leaving the object visible, so no user setting
+        /// is overridden and no plugin has to survive its own host being destroyed. This runs
+        /// from this mod's Awake, which the chainloader reaches before the first scene loads.
+        /// </summary>
+        private static void ProtectPluginHost()
+        {
+            var manager = Chainloader.ManagerObject;
+            if (manager == null)
+            {
+                return;
+            }
+
+            manager.hideFlags |= HideFlags.DontSave;
+            Log.LogInfo("[host] BepInEx plugin manager marked DontSave so the first scene load "
+                + "cannot destroy it (and every plugin on it).");
         }
     }
 }
