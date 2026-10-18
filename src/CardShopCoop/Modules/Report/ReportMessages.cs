@@ -91,6 +91,14 @@ namespace CardShopCoop.Modules.Report
         public string CustomerName;
     }
 
+    /// <summary>Guest intent: this player pressed End Day. The host runs the game's day-end
+    /// preparation and opens the shared report; the guest must never run those mutations
+    /// locally.</summary>
+    [NetworkMessage]
+    public sealed class ReportEndDayRequestMessage : INetMessage
+    {
+    }
+
     /// <summary>Guest intent: this player pressed Next Day and is ready for the day to roll over.
     /// The host advances only once every connected player has readied.</summary>
     [NetworkMessage]

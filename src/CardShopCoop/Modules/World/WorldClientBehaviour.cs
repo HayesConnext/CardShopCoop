@@ -112,10 +112,14 @@ namespace CardShopCoop.Modules.World
             FlushPlayerShelfState();
         }
 
-        /// <summary>The placement layer rebuilt or re-posed an object. Records the container
-        /// module deferred because their target did not exist yet can now be applied.</summary>
+        /// <summary>The placement layer rebuilt or re-posed an object. Authoritative records that
+        /// arrived before their exact local shelf/container binding can now be applied.</summary>
         private void OnPlacementStructureChanged(int _)
-            => _cardInteraction?.Containers.FlushClientState();
+        {
+            _cardInteraction?.Containers.FlushClientState();
+            _shelfInteraction?.FlushClientState();
+            _warehouseShelfInteraction?.FlushClientState();
+        }
 
         [OnFullyJoined]
         private void SendWorldReady(PeerConnection connection)

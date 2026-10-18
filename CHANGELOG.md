@@ -4,7 +4,10 @@ True co-op multiplayer for TCG Card Shop Simulator. Both players must run the
 **same version** — the join handshake enforces it.
 
 ## 2.1.2
-- Fixed customers sometimes circling a checkout forever for the joining player instead of arriving at the counter. Checkout arrival now follows the game's actual counter assignment and no longer depends on a private state transition that differs between supported game builds.
+- Fixed the joining player's End Day key running day-end cleanup only on their machine, which could leave them stuck or corrupt the rollover. End Day is now requested from the host, who opens one shared report after running the game's shelf and worker cleanup once.
+- Fixed customers sometimes circling or standing next in line at a checkout forever for the joining player instead of putting their items down. Checkout arrival now follows the game's actual counter assignment, is replayed when that counter's stable binding becomes available, and no longer depends on a private state transition that differs between supported game builds.
+- Fixed a rare shelf update being lost when it arrived while that shelf's placed-object binding was being rebuilt. Deferred restocks now replay as soon as the exact shelf identity becomes available, so both players see the filled shelf.
+- Fixed a closed box showing the right item count but opening empty after its contents had been synchronized or restored from storage. Rebuilt boxes now reset the game's one-time opening state so their authoritative contents materialize exactly once, including newly delivered boxes.
 - Fixed item boxes appearing empty to the joining player even though the host could see their contents. Joining now initializes the box's live contents and product display even when the loaded save already reports the right item count.
 - Fixed stocking a shelf from a box sometimes leaving the joining player holding both the box and a loose item, which prevented any further pickups. A box-to-shelf move is now accepted or rejected as one action, and a rejected item goes back into its exact source box.
 - Fixed stored delivery boxes sometimes appearing on only the host's or joining player's warehouse shelf. Stores now follow the exact box that the game added, and a missing guest-side box is rebuilt from the host's stable box ID and authoritative contents.

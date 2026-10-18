@@ -588,6 +588,19 @@ namespace CardShopCoop.Modules.Report
             return false;
         }
 
+        /// <summary>Forwards the guest's End Day key to the host. Vanilla performs shelf and
+        /// worker day-end mutations before opening the report, so none of that path may execute
+        /// on a guest.</summary>
+        private void RequestEndDayReport()
+        {
+            if (_context == null || !_context.InGame() || !LightManager.GetHasDayEnded())
+            {
+                return;
+            }
+
+            _context.Send(1, new ReportEndDayRequestMessage());
+        }
+
         /// <summary>Tells the host this guest is ready for the next day. The recap stays open (with
         /// the wait notice) until every player has readied and the host rolls the day over.</summary>
         private void ReadyForNextDay()
@@ -752,16 +765,29 @@ namespace CardShopCoop.Modules.Report
             private static bool Prefix() => NextDay();
         }
 
-        /// <summary>With the recap already open, the Enter/GoNextDay key belongs to the recap's own
-        /// Next Day action. The vanilla <c>ShowGoNextDayScreen</c> would call <c>OpenScreen</c>,
-        /// which closes an already-open recap, so suppress it while the recap is up. With the recap
-        /// closed this still runs vanilla, which is the first Enter that opens the menu.</summary>
+        /// <summary>The guest never runs vanilla <c>ShowGoNextDayScreen</c>: before opening the
+        /// recap it mutates shelves and workers locally. A closed recap becomes a request for the
+        /// host to run that path; an open recap keeps the existing suppression so the report's own
+        /// Next Day control remains in charge.</summary>
         [HarmonyPatch(typeof(InteractionPlayerController), "ShowGoNextDayScreen")]
         private static class ShowGoNextDayPatch
         {
             [HarmonyPrefix]
             private static bool Prefix()
-                => _active == null || _active._shutdown || !EndOfDayReportScreen.IsActive();
+            {
+                var active = _active;
+                if (active == null || active._shutdown)
+                {
+                    return true;
+                }
+
+                if (!EndOfDayReportScreen.IsActive())
+                {
+                    active.RequestEndDayReport();
+                }
+
+                return false;
+            }
         }
 
         [HarmonyPatch(typeof(EndOfDayReportScreen), "CloseScreen")]

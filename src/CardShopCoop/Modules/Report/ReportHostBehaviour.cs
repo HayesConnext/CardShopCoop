@@ -132,6 +132,25 @@ namespace CardShopCoop.Modules.Report
             }
         }
 
+        /// <summary>Runs the game's complete End Day path on the authoritative peer when a fully
+        /// joined guest presses the key. Its report-open patch then publishes the resulting recap
+        /// to every guest.</summary>
+        [MessageHandler(typeof(ReportEndDayRequestMessage))]
+        private void HandleEndDayRequest(MessageContext context, ReportEndDayRequestMessage message)
+        {
+            var connection = context?.Connection;
+            if (_shutdown || _context == null || !_context.InGame() || connection == null
+                || connection.State != ConnectionState.FullyJoined
+                || !_nextDayParticipants.Contains(connection.Id)
+                || !LightManager.GetHasDayEnded() || EndOfDayReportScreen.IsActive())
+            {
+                return;
+            }
+
+            var playerController = SceneRef<InteractionPlayerController>.Get();
+            playerController?.ShowGoNextDayScreen();
+        }
+
         /// <summary>A guest is ready for the day to roll. The host records it and advances only
         /// once every connected player has readied.</summary>
         [MessageHandler(typeof(ReportNextDayReadyMessage))]

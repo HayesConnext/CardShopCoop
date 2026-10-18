@@ -77,6 +77,9 @@ namespace CardShopCoop.Modules.World
         private static readonly FieldInfo ItemAmountToSpawnField =
             AccessTools.Field(typeof(InteractablePackagingBox_Item), "m_ItemAmountToSpawn");
 
+        private static readonly FieldInfo FirstOpenDoneField =
+            AccessTools.Field(typeof(InteractablePackagingBox_Item), "m_IsFirstOpenDone");
+
         private static readonly FieldInfo BoxOpenedField =
             AccessTools.Field(typeof(InteractablePackagingBox_Item), "m_IsBoxOpened");
 
@@ -2275,10 +2278,15 @@ namespace CardShopCoop.Modules.World
                 item.SetItemType(itemType);
             }
 
-            // Keep the pending-open population in step so a later close/reopen cannot restore a
-            // stale item count.
+            // Keep both halves of vanilla's one-time materialization contract in step. A closed
+            // rebuilt box has only a logical count and must spawn its live items on the next open;
+            // an open rebuilt box already has those live items and must not spawn them again.
+            // Leaving m_IsFirstOpenDone from the box's previous incarnation is what produced a
+            // correct closed-box count followed by an empty, unusable open box.
             ItemAmountToSpawnField?.SetValue(item, compartment.GetItemCount());
-            compartment.gameObject.SetActive(IsBoxOpen(item));
+            var isOpen = IsBoxOpen(item);
+            FirstOpenDoneField?.SetValue(item, isOpen);
+            compartment.gameObject.SetActive(isOpen);
             CoopPlugin.Log.LogInfo("[box-id] applied box contents id=" + item.name
                 + " type=" + itemType + " count=" + itemCount + ".");
         }

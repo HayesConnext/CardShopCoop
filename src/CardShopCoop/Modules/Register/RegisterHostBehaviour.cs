@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using CardShopCoop.Attributes;
 using CardShopCoop.Modules.Npc;
 using CardShopCoop.Modules.Prediction;
+using CardShopCoop.Modules.World;
 using CardShopCoop.Net;
 using CardShopCoop.Net.Connection;
 using CardShopCoop.Runtime;
@@ -72,6 +73,7 @@ namespace CardShopCoop.Modules.Register
             // Subscribe before patching: a failed Patch(...) throws out of OnEnable, and the
             // sceneLoaded subscription must survive so host scene reloads still reset stations.
             SceneManager.sceneLoaded += OnSceneLoaded;
+            PlacementApi.StructureChanged += OnPlacementStructureChanged;
             Patch(typeof(CounterAddedPatch));
             Patch(typeof(CounterRemovedPatch));
             Patch(typeof(CounterDestroyedPatch));
@@ -99,6 +101,28 @@ namespace CardShopCoop.Modules.Register
             if (!_shutdown)
             {
                 _stations.Clear();
+            }
+        }
+
+        /// <summary>A checkout can complete its customer arrival in the same frame its counter's
+        /// stable placement binding is rebuilt. Re-publish the game's actual current-customer
+        /// references after that binding event so an arrival that previously had no usable key is
+        /// not lost.</summary>
+        private void OnPlacementStructureChanged(int _)
+        {
+            if (_shutdown || _context == null || !_context.InGame())
+            {
+                return;
+            }
+
+            var counters = RegisterInterop.Counters;
+            for (var i = 0; counters != null && i < counters.Count; i++)
+            {
+                var counter = counters[i];
+                if (counter != null && counter.m_CurrentCustomer != null)
+                {
+                    PublishCustomerLifecycle(RegisterInterop.Key(counter));
+                }
             }
         }
 
@@ -949,6 +973,7 @@ namespace CardShopCoop.Modules.Register
             _shutdown = true;
             _context?.Messages.UnregisterAttributedHandlers(this);
             SceneManager.sceneLoaded -= OnSceneLoaded;
+            PlacementApi.StructureChanged -= OnPlacementStructureChanged;
             if (ReferenceEquals(_active, this))
             {
                 _active = null;
@@ -1127,9 +1152,16 @@ namespace CardShopCoop.Modules.Register
                     active._customerArrival = null;
                 }
 
-                if (__state.Counter != null)
+                // Use the customer's own authoritative counter reference as the exact fallback.
+                // This covers a build/mod ordering where the nested UpdateCurrentCustomer postfix
+                // was not observed, without scanning for a look-alike customer or assigning one
+                // heuristically.
+                var counter = __state.Counter ?? RegisterInterop.CounterFor(__state.Customer);
+                if (counter != null
+                    && ReferenceEquals(counter.m_CurrentCustomer, __state.Customer)
+                    && __state.Customer.m_CurrentState == ECustomerState.ReadyToPay)
                 {
-                    active.PublishCustomerLifecycle(RegisterInterop.Key(__state.Counter));
+                    active.PublishCustomerLifecycle(RegisterInterop.Key(counter));
                 }
             }
 
