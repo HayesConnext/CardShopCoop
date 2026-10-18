@@ -371,11 +371,21 @@ namespace CardShopCoop.Modules.World
         [HarmonyPatch(typeof(InteractablePackagingBox_Item), "SetOpenCloseBox")]
         private static class ItemBoxOpenStatePatch
         {
+            [HarmonyPrefix]
+            private static void Prefix(InteractablePackagingBox_Item __instance,
+                out BoxNetworkInteraction.ItemBoxContentsSnapshot __state)
+                => __state = BoxNetworkInteraction.CaptureItemBoxContents(__instance);
+
             [HarmonyPostfix]
-            private static void Postfix(InteractablePackagingBox_Item __instance, bool isPlayer)
+            private static void Postfix(InteractablePackagingBox_Item __instance, bool isPlayer,
+                BoxNetworkInteraction.ItemBoxContentsSnapshot __state)
             {
                 if (isPlayer)
                 {
+                    // A network-restored closed box can carry the right logical count while its
+                    // one-time-open latch still prevents vanilla from creating the live items.
+                    // Repair that split representation before publishing the opened state.
+                    BoxNetworkInteraction.EnsureOpenItemBoxContents(__instance, __state);
                     _instance?.PublishItemBoxState(__instance, false);
                 }
             }

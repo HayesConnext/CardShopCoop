@@ -471,11 +471,18 @@ namespace CardShopCoop.Modules.World
         [HarmonyPatch(typeof(InteractablePackagingBox_Item), "SetOpenCloseBox")]
         private static class HostItemBoxOpenStatePatch
         {
+            [HarmonyPrefix]
+            private static void Prefix(InteractablePackagingBox_Item __instance,
+                out BoxNetworkInteraction.ItemBoxContentsSnapshot __state)
+                => __state = BoxNetworkInteraction.CaptureItemBoxContents(__instance);
+
             [HarmonyPostfix]
-            private static void Postfix(InteractablePackagingBox_Item __instance, bool isPlayer)
+            private static void Postfix(InteractablePackagingBox_Item __instance, bool isPlayer,
+                BoxNetworkInteraction.ItemBoxContentsSnapshot __state)
             {
                 if (isPlayer)
                 {
+                    BoxNetworkInteraction.EnsureOpenItemBoxContents(__instance, __state);
                     _instance?.BroadcastItemBoxState(__instance);
                 }
             }

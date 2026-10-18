@@ -4,16 +4,12 @@ True co-op multiplayer for TCG Card Shop Simulator. Both players must run the
 **same version** — the join handshake enforces it.
 
 ## 2.1.2
-- Fixed the joining player's End Day key running day-end cleanup only on their machine, which could leave them stuck or corrupt the rollover. End Day is now requested from the host, who opens one shared report after running the game's shelf and worker cleanup once.
-- Fixed customers sometimes circling or standing next in line at a checkout forever for the joining player instead of putting their items down. Checkout arrival now follows the game's actual counter assignment, is replayed when that counter's stable binding becomes available, and no longer depends on a private state transition that differs between supported game builds.
-- Fixed a rare shelf update being lost when it arrived while that shelf's placed-object binding was being rebuilt. Deferred restocks now replay as soon as the exact shelf identity becomes available, so both players see the filled shelf.
-- Fixed a closed box showing the right item count but opening empty after its contents had been synchronized or restored from storage. Rebuilt boxes now reset the game's one-time opening state so their authoritative contents materialize exactly once, including newly delivered boxes.
-- Fixed item boxes appearing empty to the joining player even though the host could see their contents. Joining now initializes the box's live contents and product display even when the loaded save already reports the right item count.
-- Fixed stocking a shelf from a box sometimes leaving the joining player holding both the box and a loose item, which prevented any further pickups. A box-to-shelf move is now accepted or rejected as one action, and a rejected item goes back into its exact source box.
-- Fixed stored delivery boxes sometimes appearing on only the host's or joining player's warehouse shelf. Stores now follow the exact box that the game added, and a missing guest-side box is rebuilt from the host's stable box ID and authoritative contents.
-- Fixed open boxes sometimes showing items that the game then refused to stock with a "not enough items" message. Direct co-op item moves now keep the box's logical count, visible stack, and next-open count together, and authoritative updates repair all three.
-- Fixed the joining player being told "There is no one to play with" when right-clicking a play table with a customer visibly seated. Customer seat occupancy now accompanies the table visuals, so the guest's normal duel entry sees the same opponent as the host.
-- Fixed the joining player sometimes remaining stuck in the chair after leaving a customer card game early. The table match now stays protected until the game's own exit sequence has restored movement and player control, instead of releasing the seat while that sequence is still running.
+- End Day is now handled by the host when the joining player requests it, so cleanup and the day rollover run once and both players receive the same report.
+- Checkout customers now follow the counter the game actually assigned them. If that counter is still being synchronized, their arrival is retained and replayed instead of leaving them stuck at the front of the line.
+- Shelf stock updates that arrive while a placed shelf is being rebuilt are now retained and applied when that exact shelf becomes available.
+- Joining players now receive the seated customer's play-table state, allowing them to challenge the opponent they can see. Leaving a match early also keeps the table protected until the game restores movement and controls.
+- Reworked box-to-shelf restocking into one host-validated operation, including returning a rejected item to its original box instead of leaving the joining player holding both the box and a loose item.
+- Reworked warehouse store and take synchronization to follow each box's stable network ID and rebuild a missing joining-player copy from the host's authoritative box data.
 
 ## 2.1.1
 - Fixed: the option to host via Steam could disappear entirely, leaving only IP / LAN. Thanks @navsigda on Discord for the report!

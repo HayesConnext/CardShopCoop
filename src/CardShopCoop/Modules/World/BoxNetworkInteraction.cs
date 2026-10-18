@@ -162,6 +162,18 @@ namespace CardShopCoop.Modules.World
             internal readonly Queue<Guid> Ids = new();
         }
 
+        internal readonly struct ItemBoxContentsSnapshot
+        {
+            internal readonly EItemType ItemType;
+            internal readonly int ItemCount;
+
+            internal ItemBoxContentsSnapshot(EItemType itemType, int itemCount)
+            {
+                ItemType = itemType;
+                ItemCount = itemCount;
+            }
+        }
+
         /// <summary>An immutable capture of the host delivery mirror, taken before a purchase so a
         /// rolled-back game waiting list restores the ids that went with it.</summary>
         internal sealed class DeliveryQueueState
@@ -2195,6 +2207,75 @@ namespace CardShopCoop.Modules.World
             // the compartment has run out (or hide items that are still logically present).
             ItemAmountToSpawnField?.SetValue(item, count);
             item.SetItemType(type);
+        }
+
+        /// <summary>Repairs the game's split logical/live representation immediately after an
+        /// item box opens. A synchronized closed box deliberately owns only a logical count until
+        /// the first open. If the game's one-time-open latch was already set by the save object,
+        /// opening activates an empty compartment even though that logical count is nonzero. The
+        /// open event is the exact point at which the live list must exist, so validate it there
+        /// and rebuild it from the authoritative logical type/count when necessary.</summary>
+        internal static ItemBoxContentsSnapshot CaptureItemBoxContents(
+            InteractablePackagingBox_Item item)
+        {
+            var compartment = item?.m_ItemCompartment;
+            return new ItemBoxContentsSnapshot(
+                compartment == null ? EItemType.None : compartment.GetItemType(),
+                compartment == null ? 0 : compartment.GetItemCount());
+        }
+
+        internal static void EnsureOpenItemBoxContents(InteractablePackagingBox_Item item,
+            ItemBoxContentsSnapshot expected)
+        {
+            var compartment = item?.m_ItemCompartment;
+            if (compartment == null || !IsBoxOpen(item))
+            {
+                return;
+            }
+
+            // Capture happens before vanilla opens the box. That matters when a stale
+            // m_ItemAmountToSpawn makes SpawnItem(0) erase the logical count before this postfix
+            // gets a chance to repair the live list.
+            var expectedCount = expected.ItemCount;
+            var itemType = expected.ItemType;
+            var liveItems = CompartmentItemsField?.GetValue(compartment) as List<Item>;
+            var presentationMatches = compartment.GetItemType() == itemType
+                && compartment.GetItemCount() == expectedCount
+                && liveItems != null && liveItems.Count == expectedCount;
+            if (presentationMatches)
+            {
+                for (var i = 0; i < liveItems.Count; i++)
+                {
+                    if (liveItems[i] == null || !liveItems[i].gameObject.activeSelf)
+                    {
+                        presentationMatches = false;
+                        break;
+                    }
+                }
+            }
+
+            if (presentationMatches)
+            {
+                // Keep the two vanilla latches correct even when no rebuild is needed. The next
+                // close/reopen must preserve this already-materialized list rather than append a
+                // second copy.
+                ItemAmountToSpawnField?.SetValue(item, expectedCount);
+                FirstOpenDoneField?.SetValue(item, true);
+                compartment.gameObject.SetActive(true);
+                return;
+            }
+
+            if (expectedCount > 0 && itemType == EItemType.None)
+            {
+                CoopPlugin.Log.LogWarning("[box-id] open box " + item.name + " has count="
+                    + expectedCount + " but no item type; cannot materialize its contents.");
+                return;
+            }
+
+            var actualCount = liveItems?.Count ?? -1;
+            ApplyItemBoxContents(item, itemType, expectedCount);
+            CoopPlugin.Log.LogInfo("[box-id] repaired open box presentation id=" + item.name
+                + " expected=" + expectedCount + " live=" + actualCount + ".");
         }
 
         /// <summary>Mirrors an authoritative item-box open flag and contents onto a live box.
