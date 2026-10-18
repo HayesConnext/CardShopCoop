@@ -3,6 +3,14 @@
 True co-op multiplayer for TCG Card Shop Simulator. Both players must run the
 **same version** — the join handshake enforces it.
 
+## 2.1.2
+- Fixed customers sometimes circling a checkout forever for the joining player instead of arriving at the counter. Checkout arrival now follows the game's actual counter assignment and no longer depends on a private state transition that differs between supported game builds.
+- Fixed item boxes appearing empty to the joining player even though the host could see their contents. Joining now initializes the box's live contents and product display even when the loaded save already reports the right item count.
+- Fixed stocking a shelf from a box sometimes leaving the joining player holding both the box and a loose item, which prevented any further pickups. A box-to-shelf move is now accepted or rejected as one action, and a rejected item goes back into its exact source box.
+- Fixed stored delivery boxes sometimes appearing on only the host's or joining player's warehouse shelf. Stores now follow the exact box that the game added, and a missing guest-side box is rebuilt from the host's stable box ID and authoritative contents.
+- Fixed open boxes sometimes showing items that the game then refused to stock with a "not enough items" message. Direct co-op item moves now keep the box's logical count, visible stack, and next-open count together, and authoritative updates repair all three.
+- Fixed the joining player being told "There is no one to play with" when right-clicking a play table with a customer visibly seated. Customer seat occupancy now accompanies the table visuals, so the guest's normal duel entry sees the same opponent as the host.
+
 ## 2.1.1
 - Fixed: the option to host via Steam could disappear entirely, leaving only IP / LAN. Thanks @navsigda on Discord for the report!
 

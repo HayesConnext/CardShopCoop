@@ -253,6 +253,7 @@ namespace CardShopCoop.Modules.World
                 return null;
             }
 
+            BoxNetworkInteraction.SynchronizeItemBoxRuntimeState(item);
             var compartment = item.m_ItemCompartment;
             return new BoxStateMessage
             {

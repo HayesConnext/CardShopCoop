@@ -27,18 +27,22 @@ namespace CardShopCoop.Modules.Register
             public uint CustomerGeneration;
         }
 
+        private sealed class CustomerArrivalCapture
+        {
+            public Customer Customer;
+            public InteractableCashierCounter Counter;
+        }
+
         private CoopRuntimeContext _context;
         private Harmony _harmony;
         private bool _shutdown;
         private bool _buildingBaseline;
         private Guid _intentPredictionId;
-        // True while vanilla runs Customer.WaypointEndUpdate's paying-position block. Vanilla
-        // announces the customer (UpdateCurrentCustomer) before it registers the bag for scanning
-        // (RegisterScanItem), so a customer lifecycle built from the announcement reads every
-        // never-registered item as already scanned and every guest scanned the whole bag the
-        // moment the customer set it down. CustomerArrivalPatch suppresses that publish and owns
-        // the arrival publish instead, from after the registration loop has run.
-        private bool _insideCustomerArrival;
+        // Vanilla announces the customer (UpdateCurrentCustomer) before it registers the bag for
+        // scanning. Capture that exact announcement and publish it after WaypointEndUpdate instead
+        // of inferring arrival from a private paying-position flag whose transition is not stable
+        // across both supported game builds.
+        private CustomerArrivalCapture _customerArrival;
         private readonly Dictionary<int, Station> _stations = new();
 
         private void OnEnable()
@@ -1058,17 +1062,26 @@ namespace CardShopCoop.Modules.Register
         private static class CustomerPatch
         {
             [HarmonyPostfix]
-            private static void Postfix(InteractableCashierCounter __instance)
+            private static void Postfix(InteractableCashierCounter __instance, Customer __0)
             {
                 var active = _active;
-                // The one non-null announcement in vanilla is the customer's arrival, and it is
-                // always mid-block (before the bag is registered for scanning), so its lifecycle
-                // is owned by CustomerArrivalPatch. Only the customer-left and counter-reset
-                // announcements (null, no lines) publish from here.
-                if (active != null && !active._insideCustomerArrival)
+                if (active == null)
                 {
-                    active.PublishCustomerLifecycle(Key(__instance));
+                    return;
                 }
+
+                // Suppress only the exact successful non-null announcement made for the customer
+                // whose WaypointEndUpdate is on the stack. A null/reset or rejected assignment in
+                // the same call remains visible immediately instead of leaving a stale station.
+                var arrival = active._customerArrival;
+                if (arrival != null && ReferenceEquals(arrival.Customer, __0)
+                    && ReferenceEquals(__instance.m_CurrentCustomer, __0))
+                {
+                    arrival.Counter = __instance;
+                    return;
+                }
+
+                active.PublishCustomerLifecycle(Key(__instance));
             }
         }
 
@@ -1081,53 +1094,52 @@ namespace CardShopCoop.Modules.Register
             // scanned") for every line that was merely not-yet-registered, and guests scanned the
             // customer's whole bag the moment it was placed on the counter. Publish once the block
             // has run instead - at that point the bag is registered and "un-scanned" means the
-            // item is waiting on the counter, exactly what the guest must show. Gated on the
-            // paying-position transition (false -> true) so the frames where the method
-            // early-returns for a customer already at the counter publish nothing.
+            // item is waiting on the counter, exactly what the guest must show. The actual
+            // UpdateCurrentCustomer(customer) call is the event: relying on a reflected private
+            // flag transition could miss the arrival on one game build and strand the joining
+            // player's customer outside the checkout flow.
             [HarmonyPrefix]
             [HarmonyPriority(Priority.First)]
-            private static void Prefix(Customer __instance, out bool __state)
+            private static void Prefix(Customer __instance, out CustomerArrivalCapture __state)
             {
                 var active = _active;
                 if (active == null)
                 {
-                    __state = true;
+                    __state = null;
                     return;
                 }
 
-                __state = RegisterInterop.Read(__instance, "m_IsAtPayingPosition") is bool atPaying
-                    && atPaying;
-                active._insideCustomerArrival = true;
+                __state = new CustomerArrivalCapture { Customer = __instance };
+                active._customerArrival = __state;
             }
 
             [HarmonyPostfix]
-            private static void Postfix(Customer __instance, bool __state)
+            private static void Postfix(CustomerArrivalCapture __state)
             {
                 var active = _active;
-                if (active == null)
+                if (active == null || __state == null)
                 {
                     return;
                 }
 
-                active._insideCustomerArrival = false;
-                if (__state
-                    || !(RegisterInterop.Read(__instance, "m_IsAtPayingPosition") is bool atPaying
-                        && atPaying))
+                if (ReferenceEquals(active._customerArrival, __state))
                 {
-                    return;
+                    active._customerArrival = null;
                 }
 
-                active.PublishCustomerLifecycle(
-                    RegisterInterop.Key(RegisterInterop.CounterFor(__instance)));
+                if (__state.Counter != null)
+                {
+                    active.PublishCustomerLifecycle(RegisterInterop.Key(__state.Counter));
+                }
             }
 
             [HarmonyFinalizer]
-            private static void Finalizer()
+            private static void Finalizer(CustomerArrivalCapture __state)
             {
                 var active = _active;
-                if (active != null)
+                if (active != null && ReferenceEquals(active._customerArrival, __state))
                 {
-                    active._insideCustomerArrival = false;
+                    active._customerArrival = null;
                 }
             }
         }

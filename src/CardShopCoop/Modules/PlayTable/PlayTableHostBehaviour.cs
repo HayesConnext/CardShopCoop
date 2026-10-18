@@ -611,6 +611,7 @@ namespace CardShopCoop.Modules.PlayTable
                 entry.Seats.Add(new PlayTableSeatEntry
                 {
                     Active = active,
+                    Occupied = PlayTableInterop.IsSeatOccupied(table, seat),
                     PlayerSeat = PlayTableInterop.IsPlayerSeat(table, seat),
                     PlayMat = active && data != null ? data.playMatType : default,
                     DeckBox = active && data != null ? data.deckBoxType : default,
@@ -623,8 +624,9 @@ namespace CardShopCoop.Modules.PlayTable
 
         private static bool SameSeat(PlayTableSeatEntry left, PlayTableSeatEntry right)
             => left != null && right != null && left.Active == right.Active
-                && left.PlayerSeat == right.PlayerSeat && left.PlayMat == right.PlayMat
-                && left.DeckBox == right.DeckBox && left.Comic == right.Comic;
+                && left.Occupied == right.Occupied && left.PlayerSeat == right.PlayerSeat
+                && left.PlayMat == right.PlayMat && left.DeckBox == right.DeckBox
+                && left.Comic == right.Comic;
 
         private static List<PlayTableSeatEntry> CopySeats(List<PlayTableSeatEntry> source)
         {
@@ -641,6 +643,7 @@ namespace CardShopCoop.Modules.PlayTable
             => source == null ? null : new PlayTableSeatEntry
             {
                 Active = source.Active,
+                Occupied = source.Occupied,
                 PlayerSeat = source.PlayerSeat,
                 PlayMat = source.PlayMat,
                 DeckBox = source.DeckBox,

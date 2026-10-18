@@ -34,7 +34,7 @@ namespace CardShopCoop.Modules.World
             _boxNetworkInteraction = new BoxNetworkInteraction(false, _ => { }, SendWorldCommand);
             _playerBoxInteraction = new PlayerBoxInteraction(_boxNetworkInteraction,
                 SendWorldCommand);
-            _shelfInteraction = new ShelfInteraction(SendWorldCommand);
+            _shelfInteraction = new ShelfInteraction(SendWorldCommand, _boxNetworkInteraction);
             _warehouseShelfInteraction = new WarehouseShelfInteraction(false, _ => { },
                 SendWorldCommand, _boxNetworkInteraction, _playerBoxInteraction);
             _cardInteraction = new WorldCardInteraction(_context, false, _boxNetworkInteraction,

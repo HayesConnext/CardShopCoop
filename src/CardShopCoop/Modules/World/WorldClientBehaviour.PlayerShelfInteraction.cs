@@ -123,6 +123,19 @@ namespace CardShopCoop.Modules.World
             _shelfInteraction?.ExitPlayerMutation();
         }
 
+        private void EnterPlayerBoxShelfAdd(InteractablePackagingBox_Item source)
+        {
+            _shelfInteraction?.EnterPlayerBoxAddMutation(source);
+        }
+
+        private void ExitPlayerBoxShelfAdd()
+        {
+            _shelfInteraction?.ExitPlayerBoxAddMutation();
+        }
+
+        private bool OwnsPlayerBoxShelfAdd(InteractablePackagingBox_Item source)
+            => _shelfInteraction != null && _shelfInteraction.OwnsPlayerBoxAdd(source);
+
         [HarmonyPatch(typeof(ShelfCompartment), "AddItem")]
         private static class AddItemPatch
         {
@@ -207,12 +220,13 @@ namespace CardShopCoop.Modules.World
         private static class BoxAddToShelfScopePatch
         {
             [HarmonyPrefix]
-            private static void Prefix(bool isPlayer, out bool __state)
+            private static void Prefix(InteractablePackagingBox_Item __instance, bool isPlayer,
+                out bool __state)
             {
                 __state = isPlayer;
                 if (__state)
                 {
-                    _instance?.EnterPlayerShelfMutation();
+                    _instance?.EnterPlayerBoxShelfAdd(__instance);
                 }
             }
 
@@ -221,7 +235,7 @@ namespace CardShopCoop.Modules.World
             {
                 if (__state)
                 {
-                    _instance?.ExitPlayerShelfMutation();
+                    _instance?.ExitPlayerBoxShelfAdd();
                 }
             }
         }

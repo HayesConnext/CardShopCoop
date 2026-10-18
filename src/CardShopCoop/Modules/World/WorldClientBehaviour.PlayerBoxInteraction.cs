@@ -352,6 +352,11 @@ namespace CardShopCoop.Modules.World
                 return;
             }
 
+            if (contentsChanged)
+            {
+                BoxNetworkInteraction.SynchronizeItemBoxRuntimeState(item);
+            }
+
             var compartment = item.m_ItemCompartment;
             SendClientIntent(new BoxStateRequestMessage
             {
@@ -395,7 +400,11 @@ namespace CardShopCoop.Modules.World
                 if (isPlayer && __instance?.m_ItemCompartment != null
                     && __instance.m_ItemCompartment.GetItemCount() != __state)
                 {
-                    _instance?.PublishItemBoxState(__instance, true);
+                    var instance = _instance;
+                    if (instance != null && !instance.OwnsPlayerBoxShelfAdd(__instance))
+                    {
+                        instance.PublishItemBoxState(__instance, true);
+                    }
                 }
             }
         }

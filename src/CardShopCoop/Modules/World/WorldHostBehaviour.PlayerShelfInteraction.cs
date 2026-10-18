@@ -35,7 +35,32 @@ namespace CardShopCoop.Modules.World
 
             ExecuteWorldCommand(context, message, () =>
             {
-                if (!ApplyShelfAction(message))
+                InteractablePackagingBox_Item sourceBox = null;
+                if (message.SourceBoxNetworkId != Guid.Empty)
+                {
+                    if (_boxNetworkInteraction == null
+                        || !_boxNetworkInteraction.TryGetBox(message.SourceBoxNetworkId,
+                            out var source)
+                        || source is not InteractablePackagingBox_Item itemBox
+                        || _playerBoxInteraction == null
+                        || !_playerBoxInteraction.TryGetRemoteHolder(message.SourceBoxNetworkId,
+                            out var holder)
+                        || holder != context.ConnectionId)
+                    {
+                        CoopPlugin.Log.LogWarning("[shelf] rejected box-backed placement from conn="
+                            + context.ConnectionId + " source=" + message.SourceBoxNetworkId
+                            + ": sender is not the stable-id box holder.");
+                        RefreshRejectedShelfAction(context, message);
+                        return false;
+                    }
+
+                    sourceBox = itemBox;
+                }
+
+                var applied = sourceBox == null
+                    ? ApplyShelfAction(message)
+                    : _shelfInteraction != null && _shelfInteraction.ApplyBoxAdd(message, sourceBox);
+                if (!applied)
                 {
                     RefreshRejectedShelfAction(context, message);
                     return false;
@@ -49,6 +74,15 @@ namespace CardShopCoop.Modules.World
                     ItemType = message.ItemType,
                     ItemCount = message.ItemCount,
                 });
+                if (sourceBox != null)
+                {
+                    // The destination and source were committed together. Publish the resulting
+                    // absolute box state from the same handler to observers. The actor already
+                    // owns this exact optimistic result; echoing an absolute count back could
+                    // overwrite its next in-flight placement from the same box.
+                    RelayItemBoxState(sourceBox, context.ConnectionId);
+                }
+
                 return true;
             });
         }
@@ -393,6 +427,10 @@ namespace CardShopCoop.Modules.World
     [NetworkMessage]
     public sealed class ShelfItemAddRequestMessage : ShelfItemAddMessage
     {
+        /// <summary>The stable id of the held item box that supplied this placement, or empty when
+        /// the item came from the player's hand. A box-backed add is one inventory transaction:
+        /// authority validates and mutates this source together with the destination shelf.</summary>
+        public Guid SourceBoxNetworkId;
     }
 
     [NetworkMessage]
@@ -418,9 +456,8 @@ namespace CardShopCoop.Modules.World
 
     /// <summary>
     /// Standalone player-shelf action protocol. It resolves and rebuilds shelf compartments
-    /// directly through the game API, intentionally without a separate legacy sync layer,
-    /// transfer ledgers, or
-    /// hand/box escrow.
+    /// directly through the game API, with the stable-id source box included in a box-to-shelf
+    /// transaction and no separate legacy sync layer or transfer ledger.
     /// </summary>
     internal sealed class ShelfInteraction
     {
@@ -448,6 +485,12 @@ namespace CardShopCoop.Modules.World
         // item, so the clear must hand these back to the player first or the item is lost.
         private readonly Dictionary<Guid, Item> _pendingClientAddItems = new();
 
+        // Client only: a placement made from a held box returns to that exact stable-id source on
+        // rejection. Keeping the live object beside the prediction also lets a type-changing
+        // authoritative shelf delta preserve the item before it clears the destination.
+        private readonly Dictionary<Guid, InteractablePackagingBox_Item> _pendingClientAddSources =
+            new();
+
         private static readonly FieldInfo StoredItemsField =
             AccessTools.Field(typeof(ShelfCompartment), "m_StoredItemList");
 
@@ -466,9 +509,12 @@ namespace CardShopCoop.Modules.World
         private readonly Action<INetMessage> _broadcast;
         private readonly Action<int, INetMessage> _send;
         private readonly Func<bool> _inGame;
+        private readonly BoxNetworkInteraction _boxes;
         private readonly bool _host;
         private bool _applying;
         private int _playerMutationDepth;
+        private InteractablePackagingBox_Item _playerBoxAddSource;
+        private bool _capturedPlayerBoxAdd;
 
         internal struct LocalMutation
         {
@@ -496,7 +542,7 @@ namespace CardShopCoop.Modules.World
             _inGame = inGame;
         }
 
-        internal ShelfInteraction(Action<int, INetMessage> send)
+        internal ShelfInteraction(Action<int, INetMessage> send, BoxNetworkInteraction boxes)
         {
             if (send == null)
             {
@@ -504,6 +550,7 @@ namespace CardShopCoop.Modules.World
             }
 
             _send = send;
+            _boxes = boxes ?? throw new ArgumentNullException(nameof(boxes));
         }
 
         internal void Reset()
@@ -512,8 +559,11 @@ namespace CardShopCoop.Modules.World
             _pendingClientAddIds.Clear();
             _pendingClientRemoveIds.Clear();
             _pendingClientAddItems.Clear();
+            _pendingClientAddSources.Clear();
             _applying = false;
             _playerMutationDepth = 0;
+            _playerBoxAddSource = null;
+            _capturedPlayerBoxAdd = false;
         }
 
         internal void EnterPlayerMutation() => _playerMutationDepth++;
@@ -527,6 +577,29 @@ namespace CardShopCoop.Modules.World
 
             _playerMutationDepth--;
         }
+
+        /// <summary>Client: marks the exact held box whose vanilla left-click may feed a shelf.
+        /// The source is captured by object identity here and converted to its stable network id
+        /// only when AddItem proves that a shelf transfer actually occurred.</summary>
+        internal void EnterPlayerBoxAddMutation(InteractablePackagingBox_Item source)
+        {
+            EnterPlayerMutation();
+            _playerBoxAddSource = source;
+            _capturedPlayerBoxAdd = false;
+        }
+
+        internal void ExitPlayerBoxAddMutation()
+        {
+            _playerBoxAddSource = null;
+            _capturedPlayerBoxAdd = false;
+            ExitPlayerMutation();
+        }
+
+        /// <summary>True after this box's current dispense produced an atomic shelf request. Its
+        /// normal box-state postfix must then stay silent; sending a second independent source
+        /// mutation is what allowed one half of the move to be accepted without the other.</summary>
+        internal bool OwnsPlayerBoxAdd(InteractablePackagingBox_Item source)
+            => _capturedPlayerBoxAdd && ReferenceEquals(_playerBoxAddSource, source);
 
         internal LocalMutation CaptureLocalMutation(ShelfCompartment compartment, bool isAdd,
             EItemType requestedType, Item item)
@@ -563,6 +636,25 @@ namespace CardShopCoop.Modules.World
             message.ItemType = targetType;
             message.ItemCount = targetCount;
 
+            var boxSource = !_host && isAdd ? _playerBoxAddSource : null;
+            var atomicBoxAdd = false;
+            if (message is ShelfItemAddRequestMessage addRequest && boxSource != null)
+            {
+                if (_boxes != null && _boxes.TryGetId(boxSource, out var sourceId))
+                {
+                    addRequest.SourceBoxNetworkId = sourceId;
+                    atomicBoxAdd = true;
+                }
+                else
+                {
+                    // Stable identity is assigned at box creation/baseline. Do not invent a
+                    // position/name fallback if that invariant was broken; leave the existing
+                    // independent box-state publish enabled and make the failure diagnosable.
+                    CoopPlugin.Log.LogWarning("[shelf] held source box has no stable id; "
+                        + "placement cannot use the atomic box-to-shelf path.");
+                }
+            }
+
             // On the client, the game's own method performs the mutation: an add moves the real
             // item with AddItem (a rejected add hands that exact item back), and a remove is not
             // capacity-limited, so the game's method must run so the item actually reaches its
@@ -575,12 +667,22 @@ namespace CardShopCoop.Modules.World
                 // sends the intent) and remember its id as an outstanding optimistic placement;
                 // the pending count is derived from PredictionApi, not a parallel counter.
                 var predictionId = WorldPrediction.Predict(WorldPrediction.ShelvesScope, message,
-                    () => AddCapturedItem(compartment, item),
-                    () => ReturnCapturedItem(compartment, item));
+                    () => AddCapturedItem(compartment, item, boxSource),
+                    () => ReturnCapturedItem(compartment, item, boxSource));
                 RecordPendingAdd(ShelfKey(message), predictionId);
                 if (item != null)
                 {
                     _pendingClientAddItems[predictionId] = item;
+                }
+
+                if (boxSource != null)
+                {
+                    _pendingClientAddSources[predictionId] = boxSource;
+                }
+
+                if (atomicBoxAdd)
+                {
+                    _capturedPlayerBoxAdd = true;
                 }
             }
 
@@ -595,7 +697,8 @@ namespace CardShopCoop.Modules.World
             };
         }
 
-        private void AddCapturedItem(ShelfCompartment compartment, Item item)
+        private void AddCapturedItem(ShelfCompartment compartment, Item item,
+            InteractablePackagingBox_Item boxSource)
         {
             if (compartment == null || item == null)
             {
@@ -606,10 +709,44 @@ namespace CardShopCoop.Modules.World
             {
                 _applying = true;
                 var controller = SceneRef<InteractionPlayerController>.Get();
-                if (controller != null && HoldItemListField?.GetValue(controller) is List<Item> held
+                if (controller != null
+                    && HoldItemListField?.GetValue(controller) is List<Item> held
                     && held.Contains(item))
                 {
                     RemoveHoldItemMethod?.Invoke(controller, new object[] { item });
+                }
+
+                var hasBoxSource = !ReferenceEquals(boxSource, null);
+                if (hasBoxSource && boxSource == null)
+                {
+                    item.DisableItem();
+                    return;
+                }
+
+                var sourceCompartment = hasBoxSource ? boxSource.m_ItemCompartment : null;
+                if (hasBoxSource && sourceCompartment == null)
+                {
+                    item.DisableItem();
+                    return;
+                }
+
+                if (sourceCompartment != null)
+                {
+                    if (StoredItemsField?.GetValue(sourceCompartment) is not List<Item> sourceItems
+                        || !sourceItems.Contains(item))
+                    {
+                        item.DisableItem();
+                        return;
+                    }
+
+                    sourceCompartment.RemoveItem(item);
+                    if (sourceCompartment.GetItemCount() <= 0)
+                    {
+                        sourceCompartment.SetCompartmentItemType(EItemType.None);
+                    }
+
+                    BoxNetworkInteraction.SynchronizeItemBoxRuntimeState(boxSource);
+                    PositionStored(sourceCompartment);
                 }
 
                 if (compartment.GetItemCount() <= 0
@@ -628,7 +765,8 @@ namespace CardShopCoop.Modules.World
             }
         }
 
-        private void ReturnCapturedItem(ShelfCompartment compartment, Item item)
+        private void ReturnCapturedItem(ShelfCompartment compartment, Item item,
+            InteractablePackagingBox_Item boxSource)
         {
             if (compartment == null || item == null)
             {
@@ -645,15 +783,25 @@ namespace CardShopCoop.Modules.World
                 }
 
                 compartment.RemoveItem(item);
-                var controller = SceneRef<InteractionPlayerController>.Get();
-                if (controller != null)
+                if (!ReferenceEquals(boxSource, null))
                 {
-                    controller.AddHoldItemToFront(item);
+                    ReturnItemToBox(boxSource, item);
+                    CoopPlugin.Log.LogInfo("[shelf] rolled a rejected placement back into its "
+                        + "source box.");
+                }
+                else
+                {
+                    var controller = SceneRef<InteractionPlayerController>.Get();
+                    if (controller != null)
+                    {
+                        controller.AddHoldItemToFront(item);
+                    }
+
+                    CoopPlugin.Log.LogInfo("[shelf] rolled a rejected placement back to hand on "
+                        + compartment.name + ".");
                 }
 
                 PositionStored(compartment);
-                CoopPlugin.Log.LogInfo("[shelf] rolled a rejected placement back to hand on "
-                    + compartment.name + ".");
             }
             finally
             {
@@ -661,10 +809,60 @@ namespace CardShopCoop.Modules.World
             }
         }
 
-        /// <summary>Client: before an authoritative type change clears a compartment, hand any item
-        /// still owned by a live pending placement back to the local player. The placement is about
-        /// to be rejected (the authority moved to a different type), and the clear would pool the
-        /// item before the placement's undo could return it.</summary>
+        /// <summary>Returns one optimistic placement item to its exact packaging-box source. If
+        /// that live source vanished, the item is an unowned optimistic duplicate (authority kept
+        /// its own source item), so pool it instead of putting an item beside a still-held box.</summary>
+        private static void ReturnItemToBox(InteractablePackagingBox_Item boxSource, Item item)
+        {
+            if (ReferenceEquals(item, null) || item == null)
+            {
+                return;
+            }
+
+            if (ReferenceEquals(boxSource, null) || boxSource == null
+                || boxSource.m_ItemCompartment == null)
+            {
+                item.DisableItem();
+                return;
+            }
+
+            var source = boxSource.m_ItemCompartment;
+
+            var controller = SceneRef<InteractionPlayerController>.Get();
+            if (controller != null
+                && HoldItemListField?.GetValue(controller) is List<Item> held
+                && held.Contains(item))
+            {
+                RemoveHoldItemMethod?.Invoke(controller, new object[] { item });
+            }
+
+            if (StoredItemsField?.GetValue(source) is List<Item> existing
+                && existing.Contains(item))
+            {
+                BoxNetworkInteraction.SynchronizeItemBoxRuntimeState(boxSource);
+                PositionStored(source);
+                return;
+            }
+
+            if (source.GetItemCount() <= 0 || source.GetItemType() == EItemType.None)
+            {
+                source.SetCompartmentItemType(item.GetItemType());
+                source.CalculatePositionList();
+            }
+            else if (source.GetItemType() != item.GetItemType())
+            {
+                item.DisableItem();
+                return;
+            }
+
+            source.AddItem(item, addToFront: false);
+            BoxNetworkInteraction.SynchronizeItemBoxRuntimeState(boxSource);
+            PositionStored(source);
+        }
+
+        /// <summary>Client: before an authoritative type change clears a compartment, return any
+        /// item still owned by a live pending placement to its original destination (source box or
+        /// hand). The clear would otherwise pool it before the placement's undo can run.</summary>
         private void ReturnPendingItems(ShelfCompartment compartment)
         {
             if (_host || compartment == null || _pendingClientAddItems.Count == 0)
@@ -677,7 +875,6 @@ namespace CardShopCoop.Modules.World
                 return;
             }
 
-            var controller = SceneRef<InteractionPlayerController>.Get();
             for (var i = stored.Count - 1; i >= 0; i--)
             {
                 var item = stored[i];
@@ -703,9 +900,18 @@ namespace CardShopCoop.Modules.World
 
                 _pendingClientAddItems.Remove(owner);
                 compartment.RemoveItem(item);
-                if (controller != null)
+                if (_pendingClientAddSources.TryGetValue(owner, out var boxSource))
                 {
-                    controller.AddHoldItemToFront(item);
+                    _pendingClientAddSources.Remove(owner);
+                    ReturnItemToBox(boxSource, item);
+                }
+                else
+                {
+                    var controller = SceneRef<InteractionPlayerController>.Get();
+                    if (controller != null)
+                    {
+                        controller.AddHoldItemToFront(item);
+                    }
                 }
 
                 CoopPlugin.Log.LogInfo("[shelf] returned a pending placement item on "
@@ -719,7 +925,7 @@ namespace CardShopCoop.Modules.World
         /// <summary>Drops the bookkeeping for placements whose prediction already resolved.</summary>
         private void PrunePendingAddItems()
         {
-            if (_pendingClientAddItems.Count == 0)
+            if (_pendingClientAddItems.Count == 0 && _pendingClientAddSources.Count == 0)
             {
                 return;
             }
@@ -733,9 +939,18 @@ namespace CardShopCoop.Modules.World
                 }
             }
 
+            foreach (var pair in _pendingClientAddSources)
+            {
+                if (!PredictionApi.IsPending(pair.Key) && !stale.Contains(pair.Key))
+                {
+                    stale.Add(pair.Key);
+                }
+            }
+
             for (var i = 0; i < stale.Count; i++)
             {
                 _pendingClientAddItems.Remove(stale[i]);
+                _pendingClientAddSources.Remove(stale[i]);
             }
         }
 
@@ -894,6 +1109,127 @@ namespace CardShopCoop.Modules.World
                 ShelfKey = shelfKey,
                 Compartment = compartmentIndex,
             };
+        }
+
+        /// <summary>Host: commits one item from the requester's stable-id held box into the
+        /// addressed shelf as a single transaction. Both inventories are validated before the
+        /// exact live item moves; any failed game-path mutation is reversed before rejection.</summary>
+        internal bool ApplyBoxAdd(ShelfItemAddRequestMessage message,
+            InteractablePackagingBox_Item sourceBox)
+        {
+            if (!_host || sourceBox == null || !Validate(message)
+                || !BoxNetworkInteraction.IsBoxOpen(sourceBox))
+            {
+                return false;
+            }
+
+            var destination = ResolveCompartment(message.ShelfKey, message.Compartment);
+            var source = sourceBox.m_ItemCompartment;
+            if (destination == null || source == null || source.GetItemCount() <= 0)
+            {
+                return false;
+            }
+
+            var item = source.GetLastItem();
+            var itemType = item == null ? EItemType.None : item.GetItemType();
+            if (item == null || itemType == EItemType.None || source.GetItemType() != itemType
+                || message.ItemType != itemType)
+            {
+                return false;
+            }
+
+            var destinationCount = destination.GetItemCount();
+            var destinationType = destination.GetItemType();
+            var sourceCount = source.GetItemCount();
+            if (destinationCount > 0 && destinationType != itemType)
+            {
+                return false;
+            }
+
+            var changedDestinationType = destinationCount <= 0 && destinationType != itemType;
+            try
+            {
+                _applying = true;
+                if (changedDestinationType)
+                {
+                    destination.SetCompartmentItemType(itemType);
+                    destination.CalculatePositionList();
+                }
+                else if (destination.GetItemPosListCount() == 0)
+                {
+                    destination.CalculatePositionList();
+                }
+
+                var capacity = Mathf.Max(destination.GetMaxItemCount(),
+                    destination.GetItemPosListCount());
+                if (capacity > 0 && destinationCount >= capacity)
+                {
+                    RestoreEmptyDestinationType(destination, destinationCount, destinationType,
+                        changedDestinationType);
+                    return false;
+                }
+
+                source.RemoveItem(item);
+                destination.AddItem(item, addToFront: false);
+                var sourceItems = StoredItemsField?.GetValue(source) as List<Item>;
+                var destinationItems = StoredItemsField?.GetValue(destination) as List<Item>;
+                if (source.GetItemCount() != sourceCount - 1
+                    || (sourceItems != null && sourceItems.Contains(item))
+                    || destination.GetItemCount() != destinationCount + 1
+                    || (destinationItems != null && !destinationItems.Contains(item)))
+                {
+                    throw new InvalidOperationException("The game did not complete the item move.");
+                }
+
+                if (source.GetItemCount() <= 0)
+                {
+                    source.SetCompartmentItemType(EItemType.None);
+                }
+
+                BoxNetworkInteraction.SynchronizeItemBoxRuntimeState(sourceBox);
+                PositionStored(source);
+                PositionStored(destination);
+                message.ItemType = itemType;
+                message.ItemCount = destination.GetItemCount();
+                return true;
+            }
+            catch (Exception exception)
+            {
+                // Restore the exact item, never a spawned substitute, so a rejected request leaves
+                // the host inventories byte-for-byte equivalent to their pre-request ownership.
+                if (StoredItemsField?.GetValue(destination) is List<Item> destinationItems
+                    && destinationItems.Contains(item))
+                {
+                    destination.RemoveItem(item);
+                }
+
+                if (StoredItemsField?.GetValue(source) is not List<Item> sourceItems
+                    || !sourceItems.Contains(item))
+                {
+                    ReturnItemToBox(sourceBox, item);
+                }
+
+                RestoreEmptyDestinationType(destination, destinationCount, destinationType,
+                    changedDestinationType);
+                PositionStored(destination);
+                CoopPlugin.Log.LogWarning("[shelf] box-backed placement rolled back on host: "
+                    + exception.Message);
+                return false;
+            }
+            finally
+            {
+                _applying = false;
+            }
+        }
+
+        private static void RestoreEmptyDestinationType(ShelfCompartment destination,
+            int previousCount, EItemType previousType, bool changedType)
+        {
+            if (changedType && previousCount <= 0 && destination.GetItemCount() <= 0)
+            {
+                destination.SetCompartmentItemType(previousType);
+                destination.CalculatePositionList();
+            }
         }
 
         internal bool ApplyIncoming(ShelfInteractionMessage message)

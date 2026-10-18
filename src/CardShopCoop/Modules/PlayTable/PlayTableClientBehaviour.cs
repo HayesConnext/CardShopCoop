@@ -44,6 +44,7 @@ namespace CardShopCoop.Modules.PlayTable
         private struct SeatState
         {
             internal bool Active;
+            internal bool Occupied;
             internal bool PlayerSeat;
             internal int PlayMat;
             internal int DeckBox;
@@ -325,6 +326,12 @@ namespace CardShopCoop.Modules.PlayTable
 
                 ReconcileLaunches();
             });
+
+            // A live lease deliberately protects its seat roster from later visual refreshes.
+            // Once a release removes that protection, immediately fold the already-received
+            // authoritative seat state back into the table; otherwise an observer can retain the
+            // departed player's occupied bit and be unable to start the next duel.
+            ApplyVisualMirrors();
         }
 
         internal bool HasActiveMatch(int tableKey) => _matchByTable.ContainsKey(tableKey);
@@ -637,6 +644,7 @@ namespace CardShopCoop.Modules.PlayTable
                     ApplySeat(pair.Key, seat, table, sets[seat], new SeatState
                     {
                         Active = seats[seat].Active,
+                        Occupied = seats[seat].Occupied,
                         PlayerSeat = seats[seat].PlayerSeat,
                         PlayMat = (int)seats[seat].PlayMat,
                         DeckBox = (int)seats[seat].DeckBox,
@@ -673,18 +681,19 @@ namespace CardShopCoop.Modules.PlayTable
                 set.gameObject.SetActive(false);
             }
 
-            ApplyPlayerSeat(table, seat, want.PlayerSeat);
+            ApplySeatRoster(table, seat, want.Occupied, want.PlayerSeat);
             _applied[visualKey] = new AppliedVisual { Table = table, Set = set, State = want };
         }
 
-        private void ApplyPlayerSeat(InteractablePlayTable table, int seat, bool playerSeat)
+        private void ApplySeatRoster(InteractablePlayTable table, int seat, bool occupied,
+            bool playerSeat)
         {
             if (PlayTableInterop.IsRosterManaged(table, HasActiveMatch, HasLocalLaunch))
             {
                 return;
             }
 
-            table.m_IsPlayerSeat[seat] = playerSeat;
+            PlayTableInterop.ApplyMirroredSeatRoster(table, seat, occupied, playerSeat);
         }
 
         private void ClearMirrors()
@@ -768,6 +777,7 @@ namespace CardShopCoop.Modules.PlayTable
                 entry.Seats.Add(new PlayTableSeatEntry
                 {
                     Active = active,
+                    Occupied = PlayTableInterop.IsSeatOccupied(table, i),
                     PlayerSeat = PlayTableInterop.IsPlayerSeat(table, i),
                     PlayMat = active && data != null ? data.playMatType : default,
                     DeckBox = active && data != null ? data.deckBoxType : default,
@@ -814,10 +824,8 @@ namespace CardShopCoop.Modules.PlayTable
                 }
 
                 set.gameObject.SetActive(seat.Active);
-                if (i < table.m_IsPlayerSeat.Count)
-                {
-                    table.m_IsPlayerSeat[i] = seat.PlayerSeat;
-                }
+                PlayTableInterop.ApplyMirroredSeatRoster(table, i, seat.Occupied,
+                    seat.PlayerSeat);
             }
 
             _visualEntries[entry.TableKey] = CopyEntry(entry);
@@ -860,6 +868,7 @@ namespace CardShopCoop.Modules.PlayTable
             => source == null ? null : new PlayTableSeatEntry
             {
                 Active = source.Active,
+                Occupied = source.Occupied,
                 PlayerSeat = source.PlayerSeat,
                 PlayMat = source.PlayMat,
                 DeckBox = source.DeckBox,

@@ -5,7 +5,7 @@ using CardShopCoop.Net;
 
 namespace CardShopCoop.Modules.PlayTable
 {
-    /// <summary>Complete table visuals and live match leases for a joining peer.</summary>
+    /// <summary>Complete table visuals, seat roster, and live match leases for a joining peer.</summary>
     [NetworkMessage]
     public sealed class PlayTableBaselineMessage : INetMessage
     {
@@ -13,7 +13,7 @@ namespace CardShopCoop.Modules.PlayTable
         public List<PlayTableMatchEntry> Matches = new();
     }
 
-    /// <summary>A table-level or single-seat visual change.</summary>
+    /// <summary>A table-level or single-seat state change.</summary>
     [NetworkMessage]
     public sealed class PlayTableVisualDeltaMessage : IPredictedMessage
     {
@@ -104,6 +104,9 @@ namespace CardShopCoop.Modules.PlayTable
     public sealed class PlayTableSeatEntry
     {
         public bool Active;
+        /// <summary>The host's game-owned occupancy bit. This is distinct from the item-set visual:
+        /// vanilla reads it to decide whether the opposite customer exists for a duel.</summary>
+        public bool Occupied;
         public bool PlayerSeat;
         public EItemType PlayMat;
         public EItemType DeckBox;

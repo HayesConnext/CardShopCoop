@@ -739,7 +739,7 @@ namespace CardShopCoop.Modules.World
             if (_pendingClientDescriptors.TryGetValue(id, out var pending))
             {
                 _pendingClientDescriptors.Remove(id);
-                ApplyCreatedToBox(box, pending);
+                ApplyCreatedToBox(box, pending, initializeItemPresentation: false);
             }
 
             return id;
@@ -957,11 +957,12 @@ namespace CardShopCoop.Modules.World
             _broadcast(CreateMessage(id, box));
         }
 
-        /// <summary>Applies a client-reported item-box state to the host's live box. Unchanged
-        /// contents are left alone; only the open flag is touched when contents did not change.
-        /// Returns false when a contents change carries an invalid payload, so the caller can
-        /// reject the intent. <see cref="ApplyItemState"/> would otherwise spawn as many items as
-        /// the client asked for; the count is bounded by <see cref="MaxItemCount"/>.</summary>
+        /// <summary>Applies a client-reported item-box state to the host's live box. A declared
+        /// contents change rebuilds the runtime representation even when its logical count already
+        /// matches, while an open-only request preserves contents. Returns false when a contents
+        /// change carries an invalid payload, so the caller can reject the intent.
+        /// <see cref="ApplyItemState"/> would otherwise spawn as many items as the client asked for;
+        /// the count is bounded by <see cref="MaxItemCount"/>.</summary>
         internal bool ApplyHostBoxState(InteractablePackagingBox_Item item,
             BoxStateRequestMessage message)
         {
@@ -989,7 +990,7 @@ namespace CardShopCoop.Modules.World
                 ItemType = applyContents ? message.ItemType : compartment.GetItemType(),
                 ItemCount = applyContents ? message.ItemCount : compartment.GetItemCount(),
                 IsBoxOpened = message.IsBoxOpened,
-            });
+            }, forceContents: applyContents);
             return true;
         }
 
@@ -1008,7 +1009,7 @@ namespace CardShopCoop.Modules.World
                 ItemType = message.ItemType,
                 ItemCount = message.ItemCount,
                 IsBoxOpened = message.IsBoxOpened,
-            });
+            }, forceContents: message.ContentsChanged);
         }
 
         internal BoxNetworkState DescribeAuthoritative(Guid id)
@@ -1123,6 +1124,17 @@ namespace CardShopCoop.Modules.World
 
             // A stored box is not simulated: the game leaves it frozen from the held state, but a
             // box materialized for the network arrives with physics on and would sag or fall.
+            // The live backend stores the physical object itself, so its locally carried contents
+            // can be stale even when the stable id is right. Repair both the logical compartment
+            // and its deferred/open-box presentation from the warehouse authority before binding.
+            ApplyItemState(box, new BoxNetworkState
+            {
+                Kind = BoxNetworkKind.Item,
+                ItemType = state.ItemType,
+                ItemCount = state.Amount,
+                IsBig = state.IsBig,
+                IsBoxOpened = IsBoxOpen(box),
+            }, forceContents: true);
             box.SetPhysicsEnabled(false);
             Bind(id, box);
         }
@@ -1161,7 +1173,24 @@ namespace CardShopCoop.Modules.World
                     return false;
                 }
 
-                return true;
+                if (box.m_IsBigBox == isBig)
+                {
+                    ApplyItemState(box, new BoxNetworkState
+                    {
+                        Kind = BoxNetworkKind.Item,
+                        ItemType = itemType,
+                        ItemCount = amount,
+                        IsBig = isBig,
+                        IsBoxOpened = IsBoxOpen(box),
+                    }, forceContents: true);
+                    return true;
+                }
+
+                // The id is authoritative but its local prefab size is not. Retire this exact
+                // representation and let the descriptor below create the correct package.
+                Unbind(id, box);
+                DestroyWithoutNotification(box);
+                box = null;
             }
 
             var descriptor = ItemDescriptor(id, itemType, amount, isBig, Vector3.zero,
@@ -1387,7 +1416,7 @@ namespace CardShopCoop.Modules.World
 
             if (TryGetBox(state.BoxNetworkId, out var existing))
             {
-                ApplyCreatedToBox(existing, message);
+                ApplyCreatedToBox(existing, message, initializeItemPresentation: false);
                 CoopPlugin.Log.LogInfo("[box-id] refreshed authoritative box id="
                     + state.BoxNetworkId + " kind=" + state.Kind + ".");
                 return;
@@ -1437,13 +1466,18 @@ namespace CardShopCoop.Modules.World
             CoopPlugin.Log.LogInfo("[box-id] bound authoritative box id=" + state.BoxNetworkId
                 + " kind=" + state.Kind + " slot=" + message.SnapshotSlot + " object=" + box.name
                 + ".");
-            ApplyCreatedToBox(box, message);
+            // A save-loaded slot can already report the descriptor's logical type/count while its
+            // runtime item list and the packaging's product presentation have not been built on
+            // this peer. Creation is the one point where matching values are not proof that the
+            // live presentation is initialized, so rebuild it once for a newly-bound box.
+            ApplyCreatedToBox(box, message, initializeItemPresentation: true);
         }
 
         /// <summary>Applies a creation descriptor to a box already bound to its id: adopts the
         /// host's placement identity for boxed furniture, then mirrors pose (unless the box is
         /// held) and contents.</summary>
-        private void ApplyCreatedToBox(InteractablePackagingBox box, BoxCreatedMessage message)
+        private void ApplyCreatedToBox(InteractablePackagingBox box, BoxCreatedMessage message,
+            bool initializeItemPresentation)
         {
             var state = message.Box;
             // The descriptor names the host's placement entity for the furniture inside one of
@@ -1455,7 +1489,7 @@ namespace CardShopCoop.Modules.World
 
             if (box is InteractablePackagingBox_Item itemBox)
             {
-                ApplyItemState(itemBox, state);
+                ApplyItemState(itemBox, state, initializeItemPresentation);
             }
 
             if (identityBound)
@@ -2134,10 +2168,38 @@ namespace CardShopCoop.Modules.World
             return BoxOpenedField?.GetValue(item) is bool open ? open : item.IsBoxOpened();
         }
 
+        /// <summary>Keeps the game's deferred item count and the package presentation in step
+        /// after the co-op transaction code moves a live item directly between compartments.
+        /// Vanilla normally does this inside <c>DispenseItem</c>; atomic prediction/authority
+        /// moves deliberately bypass that method so both inventories can commit together.</summary>
+        internal static void SynchronizeItemBoxRuntimeState(InteractablePackagingBox_Item item)
+        {
+            var compartment = item?.m_ItemCompartment;
+            if (compartment == null)
+            {
+                return;
+            }
+
+            var count = compartment.GetItemCount();
+            var type = count > 0 ? compartment.GetItemType() : EItemType.None;
+            if (count <= 0 && compartment.GetItemType() != EItemType.None)
+            {
+                compartment.SetCompartmentItemType(EItemType.None);
+            }
+
+            // m_ItemAmountToSpawn is what a later open/reopen uses to create the visible stack.
+            // Leaving it at the pre-transaction value makes the visuals claim items exist after
+            // the compartment has run out (or hide items that are still logically present).
+            ItemAmountToSpawnField?.SetValue(item, count);
+            item.SetItemType(type);
+        }
+
         /// <summary>Mirrors an authoritative item-box open flag and contents onto a live box.
-        /// Contents are only rebuilt when they actually differ so a pose/refresh of an already
-        /// matching box is a no-op.</summary>
-        private static void ApplyItemState(InteractablePackagingBox_Item item, BoxNetworkState state)
+        /// Ordinary descriptors rebuild only when values differ; a newly bound save slot or an
+        /// explicit contents mutation can force a repair because matching logical values do not
+        /// prove the runtime item list, deferred count, or product presentation agrees.</summary>
+        private static void ApplyItemState(InteractablePackagingBox_Item item, BoxNetworkState state,
+            bool forceContents = false)
         {
             var compartment = item.m_ItemCompartment;
             if (compartment == null)
@@ -2148,7 +2210,7 @@ namespace CardShopCoop.Modules.World
             var contentsDiffer = compartment.GetItemType() != state.ItemType
                 || compartment.GetItemCount() != state.ItemCount;
             var openDiffers = IsBoxOpen(item) != state.IsBoxOpened;
-            if (!contentsDiffer && !openDiffers)
+            if (!contentsDiffer && !openDiffers && !forceContents)
             {
                 return;
             }
@@ -2158,7 +2220,7 @@ namespace CardShopCoop.Modules.World
                 item.ForceSetOpenCloseInstant(state.IsBoxOpened);
             }
 
-            if (contentsDiffer || (openDiffers && state.IsBoxOpened))
+            if (forceContents || contentsDiffer || (openDiffers && state.IsBoxOpened))
             {
                 ApplyItemBoxContents(item, state.ItemType, state.ItemCount);
             }

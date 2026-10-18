@@ -64,6 +64,33 @@ namespace CardShopCoop.Modules.PlayTable
             return list != null && seat >= 0 && seat < list.Count && list[seat];
         }
 
+        internal static bool IsSeatOccupied(InteractablePlayTable table, int seat)
+        {
+            var list = table?.m_IsSeatOccupied;
+            return list != null && seat >= 0 && seat < list.Count && list[seat];
+        }
+
+        /// <summary>Applies the authoritative seat facts vanilla itself reads before starting a
+        /// duel. These are game-owned table fields, not a parallel co-op roster.</summary>
+        internal static void ApplyMirroredSeatRoster(InteractablePlayTable table, int seat,
+            bool occupied, bool playerSeat)
+        {
+            if (table == null || seat < 0)
+            {
+                return;
+            }
+
+            if (table.m_IsSeatOccupied != null && seat < table.m_IsSeatOccupied.Count)
+            {
+                table.m_IsSeatOccupied[seat] = occupied;
+            }
+
+            if (table.m_IsPlayerSeat != null && seat < table.m_IsPlayerSeat.Count)
+            {
+                table.m_IsPlayerSeat[seat] = playerSeat;
+            }
+        }
+
         internal static bool IsRosterManaged(InteractablePlayTable table,
             Func<int, bool> hasActiveMatch, Func<int, bool> hasLocalLaunch)
         {
