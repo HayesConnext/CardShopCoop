@@ -33,6 +33,8 @@ namespace CardShopCoop.Modules.PlayTable
         private int _applyingState;
         private int _applyingPrediction;
         private bool _suppressEndGameGift;
+        private int _leavingTableKey;
+        private string _leavingMatchId;
 
         private sealed class AppliedVisual
         {
@@ -371,9 +373,30 @@ namespace CardShopCoop.Modules.PlayTable
             }
         }
 
-        private void HandleFinishLeave(PlayTableGame game)
+        private void HandleFinishLeaveStarted(PlayTableGame game)
         {
             if (!TryGetLaunch(game, out var launch))
+            {
+                return;
+            }
+
+            // FinishLeaveGame only starts vanilla's DelayExit coroutine. The player remains
+            // seated, collision-disabled, and movement-locked until that coroutine eventually
+            // calls InteractionPlayerController.OnExitPlayTableGameMode. Keep the lease and its
+            // mirror protection alive until then, addressed by the stable ids already on the
+            // network match rather than trying to rediscover a table after vanilla clears it.
+            _leavingTableKey = launch.Match.TableKey;
+            _leavingMatchId = launch.Match.MatchId;
+        }
+
+        private void HandleLocalPlayerExited()
+        {
+            var tableKey = _leavingTableKey;
+            var matchId = _leavingMatchId;
+            ClearLeavingMatch();
+            if (string.IsNullOrEmpty(matchId)
+                || !_launches.TryGetValue(tableKey, out var launch)
+                || launch.Match.MatchId != matchId)
             {
                 return;
             }
@@ -388,8 +411,8 @@ namespace CardShopCoop.Modules.PlayTable
                 return;
             }
 
-            // Vanilla already finished leaving the table; drop the local lease now and record the
-            // one release it performed.
+            // Vanilla restored normal player control; drop the local lease now and record the one
+            // release it performed.
             var tableKey = launch.Match.TableKey;
             PredictionApi.Predict(
                 PredictionScope,
@@ -585,10 +608,21 @@ namespace CardShopCoop.Modules.PlayTable
             }
 
             _launches.Remove(tableKey);
+            if (_leavingTableKey == tableKey && _leavingMatchId == launch.Match.MatchId)
+            {
+                ClearLeavingMatch();
+            }
+
             if (!launch.Entered)
             {
                 PlayTableInterop.RestoreSeat(launch.Table, launch.Before, launch.Match.Seat);
             }
+        }
+
+        private void ClearLeavingMatch()
+        {
+            _leavingTableKey = 0;
+            _leavingMatchId = null;
         }
 
         private void RestoreLaunch(LaunchState launch)
@@ -757,6 +791,7 @@ namespace CardShopCoop.Modules.PlayTable
                 RemoveLaunchLocal(pair);
             }
 
+            ClearLeavingMatch();
             ClearMirrors();
         }
 
@@ -895,7 +930,10 @@ namespace CardShopCoop.Modules.PlayTable
                 new HarmonyMethod(typeof(BoxPatch), nameof(BoxPatch.Prefix)),
                 new HarmonyMethod(typeof(BoxPatch), nameof(BoxPatch.Postfix)));
             Patch(AccessTools.Method(typeof(PlayTableGame), "FinishLeaveGame", new[] { typeof(bool) }),
-                null, new HarmonyMethod(typeof(FinishLeavePatch), nameof(FinishLeavePatch.Postfix)));
+                new HarmonyMethod(typeof(FinishLeavePatch), nameof(FinishLeavePatch.Prefix)), null);
+            Patch(AccessTools.Method(typeof(InteractionPlayerController),
+                    "OnExitPlayTableGameMode"), null,
+                new HarmonyMethod(typeof(PlayerExitPatch), nameof(PlayerExitPatch.Postfix)));
             Patch(AccessTools.Method(typeof(PlayTableGame), "EvaluateEndGameGift"),
                 new HarmonyMethod(typeof(EndGameGiftPatch), nameof(EndGameGiftPatch.Prefix)), null);
             Patch(AccessTools.Method(typeof(InteractablePlayTable), "OnRightMouseButtonUp"),
@@ -1008,8 +1046,14 @@ namespace CardShopCoop.Modules.PlayTable
 
         private static class FinishLeavePatch
         {
-            internal static void Postfix(PlayTableGame __instance)
-                => _active?.HandleFinishLeave(__instance);
+            internal static void Prefix(PlayTableGame __instance)
+                => _active?.HandleFinishLeaveStarted(__instance);
+        }
+
+        private static class PlayerExitPatch
+        {
+            internal static void Postfix()
+                => _active?.HandleLocalPlayerExited();
         }
 
         /// <summary>Skips the end-game reward only while the client is unwinding a rejected entry
@@ -1087,6 +1131,7 @@ namespace CardShopCoop.Modules.PlayTable
             _occupied.Clear();
             _matchesById.Clear();
             _matchByTable.Clear();
+            ClearLeavingMatch();
             ClearPendingVisuals();
             if (ReferenceEquals(_active, this))
             {

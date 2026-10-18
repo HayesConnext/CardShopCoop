@@ -11,7 +11,7 @@ only apply here.
 
 ## Installs
 
-- **Real game install** (`GamePath`): `Z:\SteamLibrary\steamapps\common\TCG Card Shop Simulator`
+- **Real game install** (`GamePath`): `E:\SteamLibrary\steamapps\common\TCG Card Shop Simulator`
   — the Steam **public** branch (buildid `25381942`), currently game `1.02` on Unity
   `2021.3.38f1` (the legacy build). `Directory.Build.user.props` pins `GamePath` to it, so a plain
   `-p:Deploy=true` build deploys here and nowhere else. This is the only Deploy target.
@@ -66,7 +66,7 @@ only apply here.
   environment variable never applies on this machine — a CLI `-p:` global property is the only
   override that wins.)
 - Host log (either install): `<install>\BepInEx\LogOutput.log` — i.e.
-  `Z:\SteamLibrary\steamapps\common\TCG Card Shop Simulator\BepInEx\LogOutput.log` for Steam, or
+  `E:\SteamLibrary\steamapps\common\TCG Card Shop Simulator\BepInEx\LogOutput.log` for Steam, or
   `Z:\XboxApps\TCG Card Shop Simulator\Content\BepInEx\LogOutput.log` for Game Pass.
 - Unity `Player.log` and `Application.persistentDataPath`:
   `%USERPROFILE%\AppData\LocalLow\OPNeonGames\Card Shop Simulator\`. The Game Pass package disables
